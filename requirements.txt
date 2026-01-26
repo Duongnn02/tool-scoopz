@@ -1,0 +1,24 @@
+# Core Web Scraping & Automation
+selenium>=4.40.0
+pywinauto>=0.6.9
+requests>=2.32.5
+beautifulsoup4>=4.14.3
+yt-dlp>=2025.12.8
+pyperclip>=1.8.2
+
+# Data Processing
+openpyxl>=3.1.5
+
+# System & Network
+pywin32>=311
+PySocks>=1.7.1
+
+# Dependencies (auto-installed with above)
+# bs4 (0.0.2) - wrapper for beautifulsoup4
+# certifi - SSL certificates
+# charset-normalizer - charset detection
+# idna - international domain names
+# urllib3 - HTTP client
+# websocket-client - WebSocket support
+# attrs, exceptiongroup - selenium dependencies
+# packaging, importlib_metadata - package utilities
