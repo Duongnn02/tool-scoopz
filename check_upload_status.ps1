@@ -37,11 +37,11 @@ Get-ChildItem "$videoPath\*\shorts.csv" | ForEach-Object {
         $percentUploaded = if ($total -gt 0) { [Math]::Round(($uploaded / $total) * 100, 1) } else { 0 }
         
         $emailStats += @{
-            Email = $emailName
+            Email    = $emailName
             Uploaded = $uploaded
-            Failed = $failed
-            Total = $total
-            Percent = $percentUploaded
+            Failed   = $failed
+            Total    = $total
+            Percent  = $percentUploaded
         }
         
         $totalEmails += 1

@@ -53,7 +53,7 @@
     từ IP 1.1.1.1              từ IP 2.2.2.2
          ⬇️                            ⬇️
     YouTube: "Wait..."
-    Session A từ IP 1.1.1.1? 
+    Session A từ IP 1.1.1.1?
     Nhưng request từ IP 2.2.2.2?
     ❌ BLOCK / RATE LIMIT
 ```
@@ -79,10 +79,10 @@
          ⬇️                            ⬇️
     YouTube: Session A ✅
     IP 1.1.1.1 match!
-    
+
     YouTube: Session B ✅
     IP 2.2.2.2 match!
-    
+
     ✅ UPLOAD OK (Both)
 ```
 
@@ -161,6 +161,7 @@ MÁYMỚI
 ```
 
 **Timeline for máy mới:**
+
 - Copy cookies từ máy cũ (Day 1-29): ✅ Dùng OK
 - Copy cookies từ máy cũ (Day 60+): ❌ Expired
 - Delete + Generate mới: ✅ Reset, dùng OK
@@ -246,6 +247,7 @@ CSV not updating            | Permission or lock   | Close Excel + retry
 ## 📊 Cost Comparison
 
 ### Approach A: Copy Exe + cookies.txt
+
 ```
 Setup Time: 2 min
 Disk Space: 28 MB
@@ -255,6 +257,7 @@ Risk: LOW
 ```
 
 ### Approach B: Copy Source + Generate Cookie
+
 ```
 Setup Time: 10 min (install Python + venv)
 Disk Space: 500 MB (Python)
@@ -270,6 +273,7 @@ Risk: LOW (safer if old machine expired)
 ## 🎓 Why Multiple Machines Need Separate Cookies
 
 **YouTube Session Security:**
+
 ```
 YouTube không cho phép:
 1 session token (cookie) → được dùng từ 2 IPs khác nhau cùng lúc
@@ -311,6 +315,7 @@ Fix:
 ---
 
 **Bottom Line:**
+
 - ✅ Copy exe + toàn bộ folder → Chạy ngay (Approach A)
 - ✅ Nếu 2+ máy chạy → Delete cookies.txt trên máy mới (generate riêng)
 - ✅ Không bao giờ copy 1 cookies.txt dùng trên 2+ máy cùng lúc

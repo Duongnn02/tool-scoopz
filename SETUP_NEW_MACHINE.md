@@ -3,6 +3,7 @@
 ## ⚠️ LỖI: pip is not recognized
 
 **Lỗi này xảy ra khi:**
+
 - Python chưa cài đặt
 - Python chưa được thêm vào PATH
 - Cần dùng `python -m pip` thay vì `pip`
@@ -28,9 +29,11 @@ python -m pip install -r requirements.txt
 ### **CÁCH 2: Dùng Script Setup (AUTO - RECOMMENDED)**
 
 **Tải file này về cùng folder dist:**
+
 - `setup_install.ps1` (script PowerShell auto-install)
 
 **Cách chạy:**
+
 ```powershell
 # 1. Right-click vào folder tool_rewrite
 # 2. Chọn "Open PowerShell window here"
@@ -39,6 +42,7 @@ python -m pip install -r requirements.txt
 ```
 
 **Script sẽ tự động:**
+
 - ✅ Check Python installed
 - ✅ Check pip available
 - ✅ Install all requirements
@@ -69,14 +73,17 @@ python --version
 ```
 
 **Output tốt:**
+
 ```
 Python 3.10.6
 ```
 
 **Output lỗi:**
+
 ```
 python : The term 'python' is not recognized...
 ```
+
 → Python chưa cài hoặc PATH sai
 
 ---
@@ -88,6 +95,7 @@ python -m pip --version
 ```
 
 **Output tốt:**
+
 ```
 pip 25.3 from C:\Python310\lib\site-packages\pip (python 3.10)
 ```
@@ -97,11 +105,13 @@ pip 25.3 from C:\Python310\lib\site-packages\pip (python 3.10)
 ### **Bước 3: Install Requirements**
 
 **Option A - Dùng python -m pip:**
+
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
 **Option B - Dùng setup script:**
+
 ```powershell
 .\setup_install.ps1
 ```
@@ -137,6 +147,7 @@ python -c "import selenium; import pywinauto; import requests; import yt_dlp; pr
 ```
 
 **Output:**
+
 ```
 ✅ All libraries installed!
 ```
@@ -161,11 +172,11 @@ tool_rewrite/
 
 ## 🎯 CHỌN CÁCH NHANH NHẤT
 
-| Cách | Lệnh | Tốc độ | Khó độ |
-|---|---|---|---|
-| **Cách 1** | `python -m pip install -r requirements.txt` | ⚡ Nhanh | ⭐ Dễ |
-| **Cách 2** | `.\setup_install.ps1` | ⚡⚡ Siêu nhanh | ⭐⭐ Rất dễ |
-| **Cách 3** | Cài Python mới + pip | 🐢 Chậm | ⭐⭐⭐ Khó |
+| Cách       | Lệnh                                        | Tốc độ          | Khó độ      |
+| ---------- | ------------------------------------------- | --------------- | ----------- |
+| **Cách 1** | `python -m pip install -r requirements.txt` | ⚡ Nhanh        | ⭐ Dễ       |
+| **Cách 2** | `.\setup_install.ps1`                       | ⚡⚡ Siêu nhanh | ⭐⭐ Rất dễ |
+| **Cách 3** | Cài Python mới + pip                        | 🐢 Chậm         | ⭐⭐⭐ Khó  |
 
 ---
 
@@ -201,8 +212,8 @@ Get-Process | Where-Object {$_.Name -like "*python*"} | Stop-Process
 ## 📞 CONTACT IF ISSUES
 
 Nếu vẫn lỗi, check:
+
 1. Python version >= 3.8
 2. Internet connection (download packages)
 3. Administrator privileges
 4. Antivirus không block pip
-

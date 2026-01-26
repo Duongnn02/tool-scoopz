@@ -3,6 +3,7 @@
 ## 🚀 Bắt Đầu Nhanh
 
 ### 1. Chạy Tool
+
 ```powershell
 # Windows
 .\dist\ScoopzTool.exe
@@ -12,6 +13,7 @@ python gui_app.py
 ```
 
 ### 2. Kiểm Tra Upload Status
+
 ```powershell
 # Tóm tắt tất cả emails
 powershell -ExecutionPolicy Bypass -File check_upload_status.ps1 -Summary
@@ -21,8 +23,9 @@ powershell -ExecutionPolicy Bypass -File check_upload_status.ps1 -Details
 ```
 
 ### 3. Xem CSV File Upload Details
+
 - Mở: `video/[email]/shorts.csv` bằng Excel
-- Xem cột `status`: 
+- Xem cột `status`:
   - `true` = Uploaded ✅
   - `false` = Not uploaded ❌
 
@@ -59,6 +62,7 @@ Failed: 197,011 videos (❌ 97.6%)
 ```
 
 **Top Remaining (need to upload):**
+
 - koraaadaeze_at_hotmail_com: 9,989 videos
 - ribadalapiza_at_hotmail_com: 9,785 videos
 - caletserab15_at_hotmail_com: 4,509 videos
@@ -70,10 +74,12 @@ Failed: 197,011 videos (❌ 97.6%)
 ### Sử Dụng Cookies
 
 **Trên máy cùng:**
+
 - Tool tự động dùng file `cookies.txt`
 - Không cần config gì
 
 **Trên máy khác:**
+
 ```powershell
 # Copy file từ máy cũ
 Copy-Item "cookies.txt" -Destination "C:\new_machine\tool_rewrite\"
@@ -101,6 +107,7 @@ oD1x982lMD4,,https://www.youtube.com/shorts/oD1x982lMD4,false
 ```
 
 **Cột:**
+
 - `video_id`: YouTube short ID
 - `title`: Video title (empty if not downloaded)
 - `url`: YouTube URL
@@ -111,6 +118,7 @@ oD1x982lMD4,,https://www.youtube.com/shorts/oD1x982lMD4,false
 ## 🎯 Workflow
 
 ### 1. Upload Mode (Recommended)
+
 ```
 1. Tool reads video/[email]/shorts.csv
 2. Finds all videos with status=false
@@ -121,6 +129,7 @@ oD1x982lMD4,,https://www.youtube.com/shorts/oD1x982lMD4,false
 ```
 
 ### 2. Join Circles Mode
+
 ```
 1. Creates GPM profile for each account
 2. Logs in to Scoopz
@@ -131,6 +140,7 @@ oD1x982lMD4,,https://www.youtube.com/shorts/oD1x982lMD4,false
 ```
 
 ### 3. Interact Mode
+
 ```
 1. Reads URL list from text area
 2. For each URL:
@@ -146,11 +156,13 @@ oD1x982lMD4,,https://www.youtube.com/shorts/oD1x982lMD4,false
 ## 🔍 Checking Upload Success
 
 ### Method 1: PowerShell Script
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File check_upload_status.ps1 -Summary
 ```
 
 ### Method 2: Manual Check
+
 ```powershell
 # Open specific email's CSV
 Start-Process "video\abodmotsis_at_hotmail_com\shorts.csv"
@@ -161,6 +173,7 @@ Start-Process "video\abodmotsis_at_hotmail_com\shorts.csv"
 ```
 
 ### Method 3: Check Logs
+
 ```powershell
 # View upload logs
 Get-Content "logs\*.log" | tail -50
@@ -171,20 +184,24 @@ Get-Content "logs\*.log" | tail -50
 ## 🛠️ Troubleshooting
 
 ### Issue: Videos uploaded to wrong circle?
+
 - Check `CIRCLE_SELECTION_GUIDE.md` for keywords
 - Manually set circle in form (dropdown selection)
 
 ### Issue: Upload fails with rate limit?
+
 - Delete `cookies.txt`
 - Wait 1-2 hours
 - Run tool again (new cookie generated)
 
 ### Issue: CSV shows wrong status?
+
 - Open file in Excel
 - Make sure encoding is UTF-8
 - Save and refresh tool
 
 ### Issue: Tool won't start?
+
 - Check Python version: `python --version` (need 3.10+)
 - Reinstall requirements: `pip install -r requirements.txt`
 
@@ -214,6 +231,7 @@ Get-Content "logs\*.log" -Tail 50
 ## 📚 Full Documentation
 
 See `USAGE_GUIDE.md` for detailed documentation on:
+
 - Folder structure and purpose
 - CSV file format and tracking
 - Cookie management for multi-machine

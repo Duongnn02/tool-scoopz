@@ -7,7 +7,9 @@
 ## What Was Fixed
 
 ### The Problem
+
 When uploading 5-10+ accounts simultaneously:
+
 - File dialogs opened **too fast** (multiple concurrent dialogs)
 - User **missed timing** to interact with dialog
 - User clicked **outside dialog** (lost focus)
@@ -15,10 +17,13 @@ When uploading 5-10+ accounts simultaneously:
 - Account marked as **FAILED/SKIPPED**
 
 ### Root Cause
+
 Multiple threads opening file dialogs simultaneously = **RACING CONDITION** 🏁
 
 ### The Solution
+
 **Serial Dialog Handling**: Only 1 dialog at a time, with 15 seconds for user interaction
+
 - Used `threading.BoundedSemaphore(1)` to enforce single dialog
 - Increased timeout from 3s → 15s
 - Guaranteed semaphore release in finally block
@@ -28,6 +33,7 @@ Multiple threads opening file dialogs simultaneously = **RACING CONDITION** 🏁
 ## Implementation Summary
 
 ### Files Modified
+
 1. **gui_app.py**
    - Line 72: Added `file_dialog_semaphore = threading.BoundedSemaphore(1)`
    - Line 1943: Pass semaphore to first upload_prepare() call
@@ -42,6 +48,7 @@ Multiple threads opening file dialogs simultaneously = **RACING CONDITION** 🏁
    - Line 888: Pass semaphore to `_select_file_in_dialog()` call
 
 ### Validation Result
+
 ```
 [PASS] VALIDATION PASSED - All components integrated correctly!
 
@@ -85,27 +92,29 @@ Thread 1: release_semaphore()
 
 ## Key Improvements
 
-| Metric | Before | After |
-|--------|--------|-------|
-| Concurrent Dialogs | 5-10 | **1** |
-| Dialog Timeout | 3 seconds | **15 seconds** |
-| User Success Rate | 70-80% | **>95%** |
-| Missed Uploads | 20-30% | **<5%** |
-| Deadlock Risk | High | **None** |
+| Metric             | Before    | After          |
+| ------------------ | --------- | -------------- |
+| Concurrent Dialogs | 5-10      | **1**          |
+| Dialog Timeout     | 3 seconds | **15 seconds** |
+| User Success Rate  | 70-80%    | **>95%**       |
+| Missed Uploads     | 20-30%    | **<5%**        |
+| Deadlock Risk      | High      | **None**       |
 
 ---
 
 ## Testing Guide
 
 ### Quick Test (Single Account)
+
 ```
 Expected: Works as before
 Result: ✅ PASS
 ```
 
 ### Medium Test (3 Accounts Parallel)
+
 ```
-Expected: 
+Expected:
   - Dialog opens for Account 1
   - User selects file
   - Dialog closes
@@ -115,6 +124,7 @@ Result: ✅ Should see dialogs appear sequentially
 ```
 
 ### Stress Test (10+ Accounts Rapid)
+
 ```
 Expected:
   - All dialogs appear one by one
@@ -129,6 +139,7 @@ Result: ✅ Should handle batch upload smoothly
 ## Log Output Examples
 
 ### Successful Dialog Flow
+
 ```
 [UPLOAD-DIALOG] Waiting for dialog slot (semaphore)...
 [UPLOAD-DIALOG] ✓ Got dialog slot, proceeding...
@@ -137,6 +148,7 @@ Result: ✅ Should handle batch upload smoothly
 ```
 
 ### When Another Thread is Using Dialog
+
 ```
 [UPLOAD-DIALOG] Waiting for dialog slot (semaphore)...
 [UPLOAD-DIALOG] (waiting for other thread...)
@@ -148,6 +160,7 @@ Result: ✅ Should handle batch upload smoothly
 ## Backward Compatibility
 
 ✅ **100% Backward Compatible**
+
 - All parameters are optional (default = None)
 - Code without semaphore still works
 - No breaking changes
@@ -162,6 +175,7 @@ Result: ✅ Should handle batch upload smoothly
    - No errors
 
 2. **🔄 Build Executable**
+
    ```
    pyinstaller --onefile --windowed --name ScoopzTool gui_app.py
    ```
@@ -181,28 +195,31 @@ Result: ✅ Should handle batch upload smoothly
 ## Technical Details
 
 ### Semaphore Mechanism
+
 - **Type**: `threading.BoundedSemaphore(1)`
 - **Purpose**: Only 1 thread can acquire at a time
 - **Timeout**: 17 seconds (15s dialog + 2s buffer)
 - **Release**: Guaranteed by finally block
 
 ### Dialog Timeout
+
 - **Previous**: 3 seconds (too short)
 - **Current**: 15 seconds (user has time)
-- **Rationale**: 
+- **Rationale**:
   - Typical user interaction: 3-5 seconds
   - Slow file browser: 8-10 seconds
   - Buffer: 15 seconds covers 99% of cases
 
 ### Thread Safety
+
 ```python
 try:
     acquired = semaphore.acquire(timeout=17)
     if not acquired:
         return False  # Couldn't get slot, timeout
-    
+
     # ... open dialog & wait for user ...
-    
+
 finally:
     if acquired:
         semaphore.release()  # Always release

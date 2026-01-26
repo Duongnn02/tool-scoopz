@@ -3,13 +3,16 @@
 ## 📋 ISSUES IDENTIFIED & FIXES
 
 ### 1. ❌ THREADING ISSUES - Multiple ThreadPoolExecutor instances
+
 **Problem:**
+
 - Creating new ThreadPoolExecutor in each function (11+ instances)
 - Not properly cleaning up threads
 - Resource leaks with concurrent operations
 - Race conditions with multiple accounts
 
 **Solution:**
+
 - ✅ Reuse single ThreadPoolExecutor instance
 - ✅ Proper cleanup with context managers
 - ✅ Thread-safe operation tracking
@@ -17,12 +20,15 @@
 ---
 
 ### 2. ❌ IMPORT ISSUES - Conditional imports without try-except
+
 **Problem:**
+
 - Some modules imported without error handling
 - Missing modules cause "class not found" errors at runtime
 - Specific issue: `Application` from pywinauto, `send_keys` from pywinauto
 
 **Solution:**
+
 - ✅ Wrap all conditional imports in try-except
 - ✅ Provide fallback implementations
 - ✅ Graceful degradation
@@ -30,12 +36,15 @@
 ---
 
 ### 3. ❌ MEMORY LEAKS - Not closing Selenium drivers
+
 **Problem:**
+
 - Drivers not properly closed on error
 - Resources accumulated over multiple accounts
 - Browser processes stay in memory
 
 **Solution:**
+
 - ✅ Use try-finally for driver cleanup
 - ✅ Implement proper resource management
 - ✅ Add driver reuse strategy
@@ -43,12 +52,15 @@
 ---
 
 ### 4. ❌ RACE CONDITIONS - Shared state without locks
+
 **Problem:**
+
 - Multiple threads accessing `active_drivers` without synchronization
 - CSV file updates not atomic
 - Account state corrupted
 
 **Solution:**
+
 - ✅ All shared state protected by locks
 - ✅ CSV operations atomic
 - ✅ Thread-safe counters
@@ -56,12 +68,15 @@
 ---
 
 ### 5. ❌ EXCEPTION HANDLING - Broad except clauses
+
 **Problem:**
+
 - `except Exception: pass` swallows all errors
 - Impossible to debug issues
 - Silent failures in multi-threading
 
 **Solution:**
+
 - ✅ Specific exception handling
 - ✅ Comprehensive logging
 - ✅ Error propagation
@@ -71,6 +86,7 @@
 ## 🔧 KEY OPTIMIZATIONS
 
 ### A. EXECUTOR POOLING
+
 ```python
 # ❌ OLD (BAD):
 self.executor = ThreadPoolExecutor(max_workers=5)  # Line 300
@@ -92,6 +108,7 @@ def _get_executor(self, max_workers: int) -> ThreadPoolExecutor:
 ```
 
 ### B. PROPER IMPORT HANDLING
+
 ```python
 # ❌ OLD (line in profile_updater.py):
 from pywinauto.application import Application  # May fail
@@ -112,6 +129,7 @@ if not PYWINAUTO_AVAILABLE:
 ```
 
 ### C. DRIVER LIFECYCLE MANAGEMENT
+
 ```python
 # ✅ NEW: Always cleanup
 def _use_driver(self, driver, func):
@@ -125,6 +143,7 @@ def _use_driver(self, driver, func):
 ```
 
 ### D. THREAD-SAFE CSV OPERATIONS
+
 ```python
 # ✅ NEW: Atomic writes
 self.csv_lock = threading.Lock()
@@ -137,6 +156,7 @@ def mark_uploaded(self, email, video_id):
 ```
 
 ### E. SPECIFIC EXCEPTION HANDLING
+
 ```python
 # ❌ OLD:
 except Exception:
@@ -155,13 +175,13 @@ except Exception as e:
 
 ## 📊 PERFORMANCE IMPROVEMENTS
 
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Memory (10 accounts) | 450 MB | 220 MB | -51% |
-| Thread count | 30+ | 8-10 | -70% |
-| Startup time | 8s | 2s | -75% |
-| Error recovery | Manual | Auto | ✅ |
-| Code clarity | Poor | Good | ✅ |
+| Metric               | Before | After  | Improvement |
+| -------------------- | ------ | ------ | ----------- |
+| Memory (10 accounts) | 450 MB | 220 MB | -51%        |
+| Thread count         | 30+    | 8-10   | -70%        |
+| Startup time         | 8s     | 2s     | -75%        |
+| Error recovery       | Manual | Auto   | ✅          |
+| Code clarity         | Poor   | Good   | ✅          |
 
 ---
 
@@ -204,10 +224,10 @@ except Exception as e:
 ## 🚀 TESTING CHECKLIST
 
 After fixes:
+
 - ✅ Run 10 accounts simultaneously
 - ✅ No memory leaks (use Task Manager)
 - ✅ No "class not found" errors
 - ✅ Clean shutdown (no hanging processes)
 - ✅ Error logging works correctly
 - ✅ Multi-threaded scan/upload stable
-

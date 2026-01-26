@@ -18,6 +18,7 @@ When uploading multiple accounts simultaneously (5-10+ accounts in parallel):
 ## Solution Implemented: Serial Dialog Handling
 
 ### Core Strategy
+
 - **BoundedSemaphore(1)**: Only ONE thread can open a file dialog at any given time
 - **Increased Timeout**: 3s → 15s (gives user time to interact)
 - **Guaranteed Cleanup**: Finally block ensures semaphore is ALWAYS released
@@ -29,12 +30,14 @@ When uploading multiple accounts simultaneously (5-10+ accounts in parallel):
 ### 1. **gui_app.py** - Main Application ✅
 
 #### Added Semaphore (Line 72)
+
 ```python
 # Only 1 dialog at a time (prevent racing condition)
 self.file_dialog_semaphore = threading.BoundedSemaphore(1)
 ```
 
 #### Updated upload_prepare() Call #1 (Line ~1934)
+
 ```python
 ok_p, drv, up_status, up_msg = upload_prepare(
     driver_path,
@@ -50,6 +53,7 @@ ok_p, drv, up_status, up_msg = upload_prepare(
 ```
 
 #### Updated upload_prepare() Call #2 (Line ~2515)
+
 ```python
 with self.dialog_lock_pool.acquire(driver_key, timeout=60):
     ok_p, drv, up_status, up_msg = upload_prepare(
@@ -70,6 +74,7 @@ with self.dialog_lock_pool.acquire(driver_key, timeout=60):
 ### 2. **scoopz_uploader.py** - Upload Orchestration ✅
 
 #### Updated Function Signature (Line 760)
+
 ```python
 def upload_prepare(
     driver_path: str,
@@ -85,19 +90,21 @@ def upload_prepare(
 ) -> Tuple[bool, Optional[object], str, str]:
 ```
 
-#### Modified _select_file_in_dialog() Function (Line 158)
+#### Modified \_select_file_in_dialog() Function (Line 158)
 
 **Function Signature**:
+
 ```python
 def _select_file_in_dialog(
-    video_path: str, 
-    logger: Logger, 
+    video_path: str,
+    logger: Logger,
     timeout: int = 15,  # ⭐ Increased from 3s to 15s
     semaphore: Optional[threading.BoundedSemaphore] = None  # ⭐ NEW
 ) -> bool:
 ```
 
 **Serial Dialog Logic**:
+
 ```python
 # ⭐ SERIAL DIALOG HANDLING: Only 1 thread can open dialog at a time
 acquired = False
@@ -119,6 +126,7 @@ finally:
 ```
 
 #### Dialog Call with Semaphore (Line 888)
+
 ```python
 ok = _select_file_in_dialog(video_path, logger, timeout=15, semaphore=file_dialog_semaphore)
 ```
@@ -166,6 +174,7 @@ Thread 1 (Account A)         Thread 2 (Account B)         Thread 3 (Account C)
 ## Timeout & User Interaction
 
 ### Before (3 seconds - TOO SHORT ❌)
+
 - Dialog opens
 - User reaction time: ~0.5-1s
 - User moves mouse: ~0.3-0.5s
@@ -174,6 +183,7 @@ Thread 1 (Account A)         Thread 2 (Account B)         Thread 3 (Account C)
 - 3s timeout: User BARELY makes it, often times out ❌
 
 ### After (15 seconds - SAFE ✅)
+
 - Dialog opens
 - User has 15 seconds to:
   - Notice the dialog
@@ -186,29 +196,31 @@ Thread 1 (Account A)         Thread 2 (Account B)         Thread 3 (Account C)
 
 ## Key Improvements
 
-| Aspect | Before | After |
-|--------|--------|-------|
-| **Concurrent Dialogs** | 5-10 simultaneous | 1 at a time |
-| **Dialog Timeout** | 3 seconds | 15 seconds |
-| **User Interaction** | Often missed | Always succeeds |
-| **Threading Deadlock** | Frequent | None |
-| **Account Failures** | 20-30% | <5% |
-| **Semaphore Control** | None | BoundedSemaphore(1) |
-| **Resource Cleanup** | Partial | 100% guaranteed |
+| Aspect                 | Before            | After               |
+| ---------------------- | ----------------- | ------------------- |
+| **Concurrent Dialogs** | 5-10 simultaneous | 1 at a time         |
+| **Dialog Timeout**     | 3 seconds         | 15 seconds          |
+| **User Interaction**   | Often missed      | Always succeeds     |
+| **Threading Deadlock** | Frequent          | None                |
+| **Account Failures**   | 20-30%            | <5%                 |
+| **Semaphore Control**  | None              | BoundedSemaphore(1) |
+| **Resource Cleanup**   | Partial           | 100% guaranteed     |
 
 ---
 
 ## Testing Recommendations
 
 ### Test Case 1: Single Account Upload
+
 ```
 Expected: Dialog opens, user selects file, uploads successfully
 Result: ✅ Should work as before
 ```
 
 ### Test Case 2: 3 Accounts Parallel Upload
+
 ```
-Expected: 
+Expected:
   - Dialog 1 opens for Account A (0-4s)
   - Dialog 2 opens for Account B (5-9s)
   - Dialog 3 opens for Account C (10-14s)
@@ -216,6 +228,7 @@ Result: ✅ Should see dialogs open sequentially, one at a time
 ```
 
 ### Test Case 3: 10+ Accounts Rapid Upload
+
 ```
 Expected:
   - All 10+ dialogs open sequentially (15s each)
@@ -226,6 +239,7 @@ Result: ✅ Should handle large batch uploads smoothly
 ```
 
 ### Test Case 4: User Slow Interaction
+
 ```
 Expected: 15s timeout is enough time for user to interact
 Scenario:
@@ -241,18 +255,21 @@ Result: ✅ All interactions complete within timeout
 ## Logging Output
 
 ### When Dialog Waiting (Semaphore Acquired)
+
 ```
 [UPLOAD-DIALOG] Waiting for dialog slot (semaphore)...
 [UPLOAD-DIALOG] ✓ Got dialog slot, proceeding...
 ```
 
 ### When Semaphore Timeout
+
 ```
 [UPLOAD-DIALOG] Waiting for dialog slot (semaphore)...
 [UPLOAD-DIALOG] ✗ Timeout waiting for dialog slot (17s) - other thread using dialog
 ```
 
 ### When Dialog Released
+
 ```
 [UPLOAD-DIALOG] ✓ Released dialog slot (next thread can proceed)
 ```
@@ -262,6 +279,7 @@ Result: ✅ All interactions complete within timeout
 ## Backward Compatibility
 
 ✅ **Fully backward compatible**
+
 - All parameters are optional (default: `None`)
 - If `file_dialog_semaphore=None`, code works as before (no semaphore)
 - Existing code without semaphore still works
@@ -271,14 +289,14 @@ Result: ✅ All interactions complete within timeout
 
 ## File Changes Summary
 
-| File | Lines | Change |
-|------|-------|--------|
-| gui_app.py | 72 | Added `file_dialog_semaphore` initialization |
-| gui_app.py | 1943 | Added `file_dialog_semaphore=self.file_dialog_semaphore` param |
-| gui_app.py | 2524 | Added `file_dialog_semaphore=self.file_dialog_semaphore` param |
-| scoopz_uploader.py | 158 | Updated `_select_file_in_dialog()` signature with semaphore param |
-| scoopz_uploader.py | 760 | Added `file_dialog_semaphore` param to `upload_prepare()` |
-| scoopz_uploader.py | 166-278 | Added serial dialog handling logic with try/finally |
+| File               | Lines   | Change                                                            |
+| ------------------ | ------- | ----------------------------------------------------------------- |
+| gui_app.py         | 72      | Added `file_dialog_semaphore` initialization                      |
+| gui_app.py         | 1943    | Added `file_dialog_semaphore=self.file_dialog_semaphore` param    |
+| gui_app.py         | 2524    | Added `file_dialog_semaphore=self.file_dialog_semaphore` param    |
+| scoopz_uploader.py | 158     | Updated `_select_file_in_dialog()` signature with semaphore param |
+| scoopz_uploader.py | 760     | Added `file_dialog_semaphore` param to `upload_prepare()`         |
+| scoopz_uploader.py | 166-278 | Added serial dialog handling logic with try/finally               |
 
 ---
 
@@ -295,11 +313,13 @@ Result: ✅ All interactions complete within timeout
 ## Quick Reference
 
 ### Semaphore States
+
 - **`available`**: No thread holding the dialog slot
 - **`acquired`**: One thread currently opening/using dialog (others wait)
 - **`released`**: Thread finished, slot becomes available
 
 ### Thread Behavior
+
 1. Thread calls `semaphore.acquire(timeout=17)` (15s dialog + 2s buffer)
 2. If successful: Opens dialog, gets 15s window
 3. User interacts with dialog
@@ -307,8 +327,9 @@ Result: ✅ All interactions complete within timeout
 5. Next waiting thread: Acquires semaphore, opens its dialog
 
 ### Critical Code Path
+
 ```
-gui_app.py (line 1943) 
+gui_app.py (line 1943)
   → upload_prepare(..., file_dialog_semaphore=self.file_dialog_semaphore)
     → _select_file_in_dialog(..., semaphore=file_dialog_semaphore)
       → acquired = semaphore.acquire(timeout=17)

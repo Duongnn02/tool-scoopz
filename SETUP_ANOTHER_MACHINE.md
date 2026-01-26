@@ -5,6 +5,7 @@
 ### Bước 1: Thu Gom Dữ Liệu Cần Copy
 
 **Folder/File BẮT BUỘC copy:**
+
 ```
 tool_rewrite/
 ├── dist/ScoopzTool.exe          ← EXE (hoặc source code)
@@ -22,6 +23,7 @@ tool_rewrite/
 ```
 
 **Folder/File KHÔNG cần copy:**
+
 ```
 logs/                    ← Log files (old, không cần)
 profile_images/         ← Profile pictures (auto download lại)
@@ -47,6 +49,7 @@ Compress-Archive -Path "tool_rewrite" -DestinationPath "tool_rewrite_backup.zip"
 ### Phương Án A: Copy Exe (DỄ NHẤT) ✅ Khuyến Nghị
 
 **Bước 1: Copy folder tool_rewrite**
+
 ```powershell
 # Copy từ USB/network
 Copy-Item "D:\tool_rewrite" -Destination "C:\laragon\www\tool scoopz\" -Recurse
@@ -56,6 +59,7 @@ Expand-Archive "tool_rewrite_backup.zip" -DestinationPath "C:\laragon\www\tool s
 ```
 
 **Bước 2: Kiểm tra file cần thiết**
+
 ```powershell
 cd "C:\laragon\www\tool scoopz\tool_rewrite"
 
@@ -67,11 +71,13 @@ Test-Path "cookies.txt"  # Should return TRUE
 ```
 
 **Bước 3: Chạy tool**
+
 ```powershell
 .\dist\ScoopzTool.exe
 ```
 
 **Lợi ích:**
+
 - ✅ Không cần cài Python
 - ✅ Không cần setup venv
 - ✅ Dùng cookies.txt cũ (vẫn hợp lệ)
@@ -82,11 +88,13 @@ Test-Path "cookies.txt"  # Should return TRUE
 ### Phương Án B: Chạy Từ Source Code
 
 **Bước 1: Copy toàn bộ folder**
+
 ```powershell
 Copy-Item "tool_rewrite" -Destination "C:\laragon\www\tool scoopz\" -Recurse
 ```
 
 **Bước 2: Cài Python (nếu chưa có)**
+
 ```powershell
 # Kiểm tra Python
 python --version  # Should be 3.10+
@@ -95,6 +103,7 @@ python --version  # Should be 3.10+
 ```
 
 **Bước 3: Tạo Virtual Environment**
+
 ```powershell
 cd "C:\laragon\www\tool scoopz\tool_rewrite"
 
@@ -109,6 +118,7 @@ pip install -r requirements.txt
 ```
 
 **Bước 4: Chạy tool**
+
 ```powershell
 python gui_app.py
 ```
@@ -130,6 +140,7 @@ Nếu để lâu:    ❌ Cookie hết hạn → cần mới
 **Cách làm:**
 
 **Option A: Copy cookies.txt từ máy cũ** (Nếu <7 ngày)
+
 ```powershell
 # Trên máy cũ
 Copy-Item "cookies.txt" -Destination "C:\USB\backup\"
@@ -141,6 +152,7 @@ Copy-Item "C:\USB\backup\cookies.txt" -Destination "C:\laragon\www\tool scoopz\t
 ```
 
 **Option B: Để tool generate cookie mới** (Nếu >7 ngày)
+
 ```powershell
 # Trên máy mới: Xoá file cookies.txt cũ
 Remove-Item "cookies.txt" -Force
@@ -160,6 +172,7 @@ Remove-Item "cookies.txt" -Force
 ### Trường Hợp 2: Chạy Trên Nhiều Máy Cùng Lúc (QUAN TRỌNG)
 
 **Vấn đề có thể xảy ra:**
+
 ```
 Máy A (IP 1) + Cookie cũ = OK ✅
 Máy B (IP 2) + Cookie cũ = ❌ EXPIRED (vì IP khác)
@@ -187,6 +200,7 @@ Remove-Item "cookies.txt" -Force
 ```
 
 **❌ KHÔNG NÊN LÀM:**
+
 ```
 Copy cookies.txt từ Máy A → Máy B
 Cả 2 máy dùng cùng 1 cookie
@@ -199,6 +213,7 @@ Cả 2 máy dùng cùng 1 cookie
 ### Trường Hợp 3: Máy Cũ Vẫn Dùng, Máy Mới Cũng Dùng
 
 **Setup:**
+
 ```
 Máy Cũ (IP 1): ← Cookie 1
 Máy Mới (IP 2): ← Cookie 2 (generate riêng)
@@ -223,6 +238,7 @@ Remove-Item "cookies.txt"
 ```
 
 **Result:**
+
 ```
 Máy A (192.168.1.100): uploads 100/ngày
 Máy B (192.168.1.101): uploads 100/ngày
@@ -236,6 +252,7 @@ Tổng: 200/ngày (không conflict)
 ### Scenario: Copy Tool Từ Máy Cũ → Máy Mới
 
 **Bước 1: Trên Máy Cũ**
+
 ```powershell
 cd "C:\laragon\www\tool scoopz\tool_rewrite"
 
@@ -248,6 +265,7 @@ Copy-Item "cookies.txt" "D:\USB\"  # Optional, để dùng cookie cũ
 ```
 
 **Bước 2: Trên Máy Mới**
+
 ```powershell
 # Unzip
 Expand-Archive "D:\USB\tool_backup.zip" -DestinationPath "C:\laragon\www\tool scoopz\tool_rewrite"
@@ -261,6 +279,7 @@ Test-Path "dist\ScoopzTool.exe"
 **Bước 3: Cookie Strategy (Chọn 1)**
 
 **A. Nếu copy cookies.txt từ Máy Cũ (máy cũ không dùng nữa):**
+
 ```powershell
 # Máy cũ không hoạt động → Dùng cookie cũ an toàn
 # Tool chạy ngay lập tức
@@ -268,6 +287,7 @@ Test-Path "dist\ScoopzTool.exe"
 ```
 
 **B. Nếu Máy Cũ vẫn hoạt động (KHUYÊN):**
+
 ```powershell
 # Xoá cookies.txt cũ
 Remove-Item "cookies.txt" -Force
@@ -279,6 +299,7 @@ Remove-Item "cookies.txt" -Force
 ```
 
 **Bước 4: Kiểm Tra Upload**
+
 ```powershell
 # Check status
 powershell -File check_upload_status.ps1 -Summary
@@ -294,11 +315,13 @@ video/[email]/shorts.csv  # Xem status (true/false)
 ### Vấn Đề 1: "Download fails" / "Rate limited"
 
 **Nguyên nhân:**
+
 - Cookie expire
 - Cookie từ IP khác
 - YouTube block
 
 **Fix:**
+
 ```powershell
 # Bước 1: Xoá cookie cũ
 Remove-Item "cookies.txt" -Force
@@ -314,16 +337,19 @@ Start-Sleep -Seconds 3600
 ### Vấn Đề 2: 2 Máy Upload Conflict
 
 **Triệu chứng:**
+
 ```
 Máy A: Upload OK
 Máy B: Rate limited / Download fail
 ```
 
 **Nguyên nhân:**
+
 - Cả 2 dùng 1 cookies.txt → YouTube detect
 - 1 IP dùng 2 session → Block
 
 **Fix:**
+
 ```powershell
 # Máy B: Generate cookie riêng
 Remove-Item "cookies.txt"
@@ -333,10 +359,12 @@ Remove-Item "cookies.txt"
 ### Vấn đề 3: CSV File Không Update
 
 **Nguyên nhân:**
+
 - File bị lock (Excel đang mở)
 - Permission error
 
 **Fix:**
+
 ```powershell
 # Đóng Excel
 # Kiểm tra permission
@@ -374,15 +402,15 @@ icacls "video\*\shorts.csv" /grant:r "%USERNAME%":F
 
 ## 7. 💡 Best Practices
 
-| Tình Huống | Làm Gì |
-|-----------|--------|
-| Máy mới, máy cũ không dùng | Copy cookies.txt từ máy cũ |
-| Máy mới, máy cũ vẫn dùng | Delete cookies.txt, generate mới |
-| 3+ máy chạy | Mỗi máy xoá cookies.txt, generate riêng |
-| Cookie expire | Delete + đợi 1-2h + generate mới |
-| Rate limit | Delete + đợi 2-4h + generate mới |
-| Nhiều account, 1 máy | Dùng 1 cookies.txt chung (normal) |
-| Nhiều máy, 1 account | Mỗi máy cookie riêng (important!) |
+| Tình Huống                 | Làm Gì                                  |
+| -------------------------- | --------------------------------------- |
+| Máy mới, máy cũ không dùng | Copy cookies.txt từ máy cũ              |
+| Máy mới, máy cũ vẫn dùng   | Delete cookies.txt, generate mới        |
+| 3+ máy chạy                | Mỗi máy xoá cookies.txt, generate riêng |
+| Cookie expire              | Delete + đợi 1-2h + generate mới        |
+| Rate limit                 | Delete + đợi 2-4h + generate mới        |
+| Nhiều account, 1 máy       | Dùng 1 cookies.txt chung (normal)       |
+| Nhiều máy, 1 account       | Mỗi máy cookie riêng (important!)       |
 
 ---
 
@@ -410,6 +438,7 @@ Remove-Item "cookies.txt"
 ---
 
 **Điểm quan trọng nhất:**
+
 - ✅ Copy exe + toàn bộ folder video → Chạy ngay
 - ✅ Nếu máy khác có IP khác → Delete cookies.txt để generate mới
 - ✅ Không copy cookies.txt khi 2+ máy dùng cùng lúc

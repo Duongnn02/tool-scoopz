@@ -194,26 +194,20 @@ def _select_file_in_dialog(video_path: str, logger: Logger, timeout: int = 15, s
             dlg = None
             start = time.time()
             attempt = 0
-            first_attempt = True
-            # Loop chờ dialog mở
+            # Loop chờ dialog mở - aggressive retry
             while time.time() - start < timeout:
                 attempt += 1
-                # ⭐ First attempt: pre-wait 0.8s để dialog chắc chắn đã mở từ OS
-                if first_attempt:
-                    _log(logger, f"[UPLOAD-DIALOG] {backend}: Pre-wait 0.8s for dialog to fully open...")
-                    time.sleep(0.8)
-                    first_attempt = False
                 try:
-                    _log(logger, f"[UPLOAD-DIALOG] {backend} attempt #{attempt}: connect(timeout=0.3)...")
-                    app = Application(backend=backend).connect(title_re=title_re, timeout=0.3)  # ⭐ Further reduced to 0.3s
+                    _log(logger, f"[UPLOAD-DIALOG] {backend} attempt #{attempt}: connect(timeout=0.5)...")
+                    app = Application(backend=backend).connect(title_re=title_re, timeout=0.5)
                     dlg = app.window(title_re=title_re)
                     elapsed = time.time() - start
                     _log(logger, f"[UPLOAD-DIALOG] ✓ {backend}: Dialog found after {elapsed:.2f}s (attempt #{attempt})")
                     break
                 except Exception as e:
                     elapsed = time.time() - start
-                    _log(logger, f"[UPLOAD-DIALOG] {backend} attempt #{attempt} failed ({elapsed:.2f}s): {str(e)[:80]}")
-                    time.sleep(0.05)  # Retry sleep 0.05s
+                    _log(logger, f"[UPLOAD-DIALOG] {backend} attempt #{attempt} ({elapsed:.2f}s): {str(e)[:50]}")
+                    time.sleep(0.05)  # Retry every 50ms
 
             if dlg is None:
                 _log(logger, f"[UPLOAD-DIALOG] ✗ {backend}: Dialog not found after {timeout}s ({attempt} attempts)")

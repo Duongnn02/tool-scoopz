@@ -652,3 +652,7 @@ Symbols not available. Dumping unresolved backtrace:
 2026-01-26 15:39:14 | ERROR    | errors | UPLOAD: [sltakito@hotmail.com] Video: J_GJNb0ldIA.mp4 | Error: Account blocked
 2026-01-26 15:40:06 | ERROR    | errors | UPLOAD: [sltakito@hotmail.com] Video: J_GJNb0ldIA.mp4 | Error: Account blocked
 2026-01-26 15:40:55 | ERROR    | errors | UPLOAD: [sltakito@hotmail.com] Video: J_GJNb0ldIA.mp4 | Error: Account blocked
+2026-01-26 16:39:53 | ERROR    | errors | UPLOAD: [mbuzodrikc@hotmail.com] Video: ujDjzN08kXg.mp4 | Error: Upload prepare error: HTTPConnectionPool(host='localhost', port=61711): Read timed out. (read timeout=120)
+2026-01-26 16:46:03 | ERROR    | errors | UPLOAD: [reborisulich@hotmail.com] Video: JHDdXY3Bw_w.mp4 | Error: Open dialog failed
+2026-01-26 16:46:46 | ERROR    | errors | UPLOAD: [pulokdluis@hotmail.com] Video: d5fddXIK0uA.mp4 | Error: Open dialog failed
+2026-01-26 16:47:24 | ERROR    | errors | UPLOAD: [doolceirdne@hotmail.com] Video: YFtErASvzng.mp4 | Error: Open dialog failed

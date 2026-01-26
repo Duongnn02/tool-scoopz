@@ -3,6 +3,7 @@
 ## Vấn Đề Được Fix
 
 Khi upload nhiều video cùng lúc (5-10+ tài khoản song song):
+
 - Nút POST được nhấn **đồng thời** bởi nhiều threads (racing condition)
 - Một vài tài khoản **đầu tiên không nhấn được** nút POST
 - **Upload thất bại** cho các tài khoản bị miss
@@ -15,6 +16,7 @@ Khi upload nhiều video cùng lúc (5-10+ tài khoản song song):
 ## Giải Pháp: Serial POST Button Handling
 
 ### Chiến Lược
+
 - **BoundedSemaphore(1)**: Chỉ 1 thread có thể click POST button tại một thời điểm
 - **Timeout 30 giây**: Đủ thời gian cho YouTube xử lý click
 - **Guaranteed Release**: Finally block đảm bảo semaphore luôn được release
@@ -26,6 +28,7 @@ Khi upload nhiều video cùng lúc (5-10+ tài khoản song song):
 ### 1. **gui_app.py** - Ứng dụng chính ✅
 
 #### Thêm Semaphore (Line 73)
+
 ```python
 # Only 1 POST button click at a time (prevent racing condition)
 self.post_button_semaphore = threading.BoundedSemaphore(1)
@@ -34,17 +37,19 @@ self.post_button_semaphore = threading.BoundedSemaphore(1)
 #### Update 2 lần gọi upload_post_async()
 
 **Gọi #1** (Line ~1957):
+
 ```python
 st, msg, purl, foll = upload_post_async(
-    drv, self._log, max_total_s=180, 
+    drv, self._log, max_total_s=180,
     post_button_semaphore=self.post_button_semaphore  # ⭐ NEW
 )
 ```
 
 **Gọi #2** (Line ~2577):
+
 ```python
 st, msg, purl, foll = upload_post_async(
-    drv, self._log, max_total_s=180, 
+    drv, self._log, max_total_s=180,
     post_button_semaphore=self.post_button_semaphore  # ⭐ NEW
 )
 ```
@@ -54,16 +59,18 @@ st, msg, purl, foll = upload_post_async(
 ### 2. **scoopz_uploader.py** - Upload orchestration ✅
 
 #### Update Function Signature (Line 955)
+
 ```python
 def upload_post_async(
-    driver, 
-    logger: Logger, 
+    driver,
+    logger: Logger,
     max_total_s: int = 180,
     post_button_semaphore: Optional[threading.BoundedSemaphore] = None  # ⭐ NEW
 ) -> Tuple[str, str, str, int | None]:
 ```
 
 #### Thêm Serial POST Button Logic (Lines 978-1003)
+
 ```python
 # ⭐ SERIAL POST BUTTON HANDLING: Only 1 thread clicks POST at a time
 acquired = False
@@ -115,6 +122,7 @@ Thread 3-10: acquire_semaphore() → CHỜ...
 ## Logs Output
 
 ### Khi Có Semaphore (Multiple Accounts)
+
 ```
 [UPLOAD-POST] Waiting for POST button slot (semaphore)...
 [UPLOAD-POST] ✓ Got POST button slot, proceeding...
@@ -128,6 +136,7 @@ Thread 3-10: acquire_semaphore() → CHỜ...
 ```
 
 ### Khi Bị Timeout (Nếu Có Vấn Đề)
+
 ```
 [UPLOAD-POST] Waiting for POST button slot (semaphore)...
 [UPLOAD-POST] ✗ Timeout waiting for POST button slot (30s) - other thread using button
@@ -138,11 +147,13 @@ Thread 3-10: acquire_semaphore() → CHỜ...
 ## Timeout Giải Thích
 
 ### Trước (Không có lock)
+
 - Multiple threads click POST cùng lúc = confused state
 - YouTube backend: không biết POST từ account nào
 - Kết quả: một vài account không POST được
 
 ### Sau (Avec Semaphore, 30s timeout)
+
 - Click POST → YouTube xử lý → thành công
 - Next thread chờ 30s là đủ vì YouTube nhanh
 - Kết quả: TẤT CẢ accounts POST được thành công ✅
@@ -151,42 +162,45 @@ Thread 3-10: acquire_semaphore() → CHỜ...
 
 ## Thống Kê Cải Thiện
 
-| Chỉ Số | Trước | Sau |
-|--------|-------|-----|
-| **Click POST Đồng Thời** | 5-10 | **1** |
-| **Timeout POST** | 3-5s (N/A) | **30s** |
-| **Success Rate** | 70-80% | **>95%** |
-| **Failed POST** | 20-30% | **<5%** |
-| **Racing Condition** | Thường xuyên | **Không bao giờ** |
+| Chỉ Số                   | Trước        | Sau               |
+| ------------------------ | ------------ | ----------------- |
+| **Click POST Đồng Thời** | 5-10         | **1**             |
+| **Timeout POST**         | 3-5s (N/A)   | **30s**           |
+| **Success Rate**         | 70-80%       | **>95%**          |
+| **Failed POST**          | 20-30%       | **<5%**           |
+| **Racing Condition**     | Thường xuyên | **Không bao giờ** |
 
 ---
 
 ## Hướng Dẫn Test
 
 ### Test 1: Single Account
+
 ```
 Kết quả: Hoạt động như trước (no change)
 Status: ✅ PASS
 ```
 
 ### Test 2: 3 Accounts Upload Parallel
+
 ```
 Kết Quả:
   - Account 1 click POST (thành công)
   - Account 2 click POST (thành công)
   - Account 3 click POST (thành công)
-  
+
 Kỳ Vọng: Thấy logs [UPLOAD-POST] từng cái một
 Status: ✅ Should see POST slots acquired sequentially
 ```
 
 ### Test 3: 10 Accounts Rapid Batch Upload
+
 ```
 Kết Quả:
   - Tất cả 10 accounts POST thành công
   - Không có failed POST
   - Không có deadlock
-  
+
 Status: ✅ All POST buttons clicked successfully
 ```
 
@@ -195,6 +209,7 @@ Status: ✅ All POST buttons clicked successfully
 ## Backward Compatibility
 
 ✅ **100% Compatible**
+
 - Parameter `post_button_semaphore=None` mặc định
 - Code cũ không có semaphore vẫn hoạt động
 - Không có breaking changes
