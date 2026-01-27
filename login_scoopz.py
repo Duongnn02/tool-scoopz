@@ -86,9 +86,9 @@ def login_scoopz(
             def _log(msg: str) -> None:
                 try:
                     if logger:
-                        logger(msg)
+                        logger(f"[T:{threading.current_thread().name}] {msg}")
                     else:
-                        print(msg)
+                        print(f"[T:{threading.current_thread().name}] {msg}")
                 except Exception:
                     pass
             options = _webdriver.ChromeOptions()
@@ -320,13 +320,13 @@ def open_profile_in_scoopz(
             continue
 
         try:
-            wait = _WebDriverWait(driver, 15)
+            wait = _WebDriverWait(driver, 20)
             try:
                 wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
             except Exception:
                 pass
 
-            time.sleep(0.5)
+            time.sleep(0.2)
             _log("[PROFILE] Looking for profile link...")
 
             def _open_menu() -> None:
@@ -338,7 +338,7 @@ def open_profile_in_scoopz(
                         menu_btn.click()
                     except Exception:
                         driver.execute_script("arguments[0].click();", menu_btn)
-                    time.sleep(0.4)
+                    time.sleep(0.2)
                 except Exception:
                     pass
 
@@ -369,7 +369,7 @@ def open_profile_in_scoopz(
                 return True
 
             profile_clicked = False
-            for attempt in range(1, 7):
+            for attempt in range(1, 6):
                 try:
                     cur_url = driver.current_url or ""
                 except Exception:
@@ -382,7 +382,7 @@ def open_profile_in_scoopz(
                 plink = _find_profile_link()
                 if _click_profile_link(plink):
                     _log(f"[PROFILE] Profile clicked (attempt {attempt})")
-                    time.sleep(0.8)
+                    time.sleep(0.4)
                     profile_clicked = True
                     break
                 _log(f"[PROFILE] Profile link not found (attempt {attempt})")
@@ -390,7 +390,7 @@ def open_profile_in_scoopz(
                     driver.refresh()
                 except Exception:
                     pass
-                time.sleep(1.0)
+                time.sleep(0.4)
 
             if not profile_clicked:
                 return False, "Profile link not found"
@@ -398,7 +398,7 @@ def open_profile_in_scoopz(
             # Wait for profile page to load (Edit Profile visible)
             _log("[PROFILE] Waiting for profile page to load...")
             try:
-                _WebDriverWait(driver, 25).until(
+                _WebDriverWait(driver, 18).until(
                     _EC.element_to_be_clickable((_By.XPATH, "//button[normalize-space()='Edit Profile']"))
                 )
             except TimeoutException:
@@ -409,9 +409,9 @@ def open_profile_in_scoopz(
                     plink = _find_profile_link()
                     if _click_profile_link(plink):
                         _log(f"[PROFILE] Profile re-clicked (attempt {attempt})")
-                        time.sleep(1.0)
+                        time.sleep(0.4)
                         try:
-                            _WebDriverWait(driver, 20).until(
+                            _WebDriverWait(driver, 15).until(
                                 _EC.element_to_be_clickable((_By.XPATH, "//button[normalize-space()='Edit Profile']"))
                             )
                             profile_clicked = True

@@ -771,6 +771,19 @@ class App:
             self.profile_tree.item(item_id, tags=())
 
     def _log(self, msg: str) -> None:
+        def _is_noisy(m: str) -> bool:
+            text = (m or "").strip()
+            if text.startswith("[DL]"):
+                return True
+            if text.startswith("[LOGIN]") and not any(k in text for k in ("ERR", "OK")):
+                return True
+            if text.startswith("[PROFILE]") and not any(k in text for k in ("ERR", "OK", "UPDATED", "OPENED", "CHANGE")):
+                return True
+            return False
+
+        if _is_noisy(msg):
+            return
+
         def _append():
             self.log_box.configure(state="normal")
             self.log_box.insert(tk.END, msg + "\n")
@@ -2150,6 +2163,14 @@ class App:
                 self._log(f"[{acc['uid']}] UPLOAD OK")
                 self._delete_uploaded_video(path_or_err, acc["uid"])
                 success_count += 1
+                try:
+                    followers, profile_url = fetch_followers(driver_path, remote, self._log)
+                    if followers is not None:
+                        self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                        self._set_profile_info(item_id, profile_url, followers)
+                except Exception as e:
+                    self._log(f"[{acc['uid']}] FOLLOW ERR: {e}")
+                time.sleep(10.0)
             else:
                 err_text = msg or st
                 status_text = "UPLOAD LOI" if "Select video not found" in (err_text or "") else f"UPLOAD ERR: {err_text}"
