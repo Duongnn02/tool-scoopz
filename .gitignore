@@ -1,6 +1,7 @@
 # Large files and folders
 video/
 accounts_cache.json
+cookies.txt
 
 # Python
 __pycache__/
