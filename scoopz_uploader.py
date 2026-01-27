@@ -199,8 +199,19 @@ def _select_file_in_dialog(video_path: str, logger: Logger, timeout: int = 15, s
                 attempt += 1
                 try:
                     _log(logger, f"[UPLOAD-DIALOG] {backend} attempt #{attempt}: connect(timeout=0.5)...")
-                    app = Application(backend=backend).connect(title_re=title_re, timeout=0.5)
-                    dlg = app.window(title_re=title_re)
+                    # ⭐ Try to connect with regex, but if multiple matches, get all and pick the "Open" dialog (most recent)
+                    try:
+                        app = Application(backend=backend).connect(title_re=title_re, timeout=0.5)
+                        dlg = app.window(title_re=title_re)
+                    except Exception as e:
+                        if "2 elements" in str(e) or "multiple" in str(e).lower():
+                            # Multiple dialogs match - try to get the main "Open" one
+                            _log(logger, f"[UPLOAD-DIALOG] {backend}: Multiple dialogs found, selecting 'Open'...")
+                            app = Application(backend=backend).connect(title_re="Open", timeout=0.5)
+                            dlg = app.window(title_re="Open")
+                        else:
+                            raise
+                    
                     elapsed = time.time() - start
                     _log(logger, f"[UPLOAD-DIALOG] ✓ {backend}: Dialog found after {elapsed:.2f}s (attempt #{attempt})")
                     break
