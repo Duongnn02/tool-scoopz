@@ -25,7 +25,7 @@ class InputDelay(Enum):
     """Configurable delays for user input simulation."""
     # Format: (char_delay_ms, field_delay_ms, button_delay_ms)
     
-    CONSERVATIVE = (0.15, 1.0, 0.5)    # 150ms per char, 1s after field, 0.5s before button
+    CONSERVATIVE = (0.20, 1.5, 0.8)    # 200ms per char, 1.5s after field, 0.8s before button
     BALANCED = (0.10, 0.7, 0.3)        # 100ms per char, 0.7s after field, 0.3s before button
     AGGRESSIVE = (0.05, 0.3, 0.1)      # 50ms per char, 0.3s after field, 0.1s before button
     
@@ -172,7 +172,7 @@ class OperationOrchestrator:
     def wait_between_downloads(self, account: str, is_error: bool = False):
         """Wait between consecutive downloads."""
         if self.download_strategy == DownloadStrategy.SEQUENTIAL:
-            wait_time = 3.0 if not is_error else 6.0
+            wait_time = 5.0 if not is_error else 10.0
             self._log(f"[{account}] Waiting {wait_time:.1f}s before next download (error={is_error})...")
             time.sleep(wait_time)
     
@@ -240,7 +240,7 @@ class OperationOrchestrator:
     def wait_between_uploads(self, account: str):
         """Wait between consecutive uploads."""
         if self.upload_strategy == UploadStrategy.SERIAL:
-            wait_time = 2.0
+            wait_time = 4.0
             self._log(f"[{account}] Waiting {wait_time:.1f}s before next upload...")
             time.sleep(wait_time)
     

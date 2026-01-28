@@ -261,7 +261,7 @@ def _select_file_in_dialog(video_path: str, logger: Logger, timeout: int = 15, s
                     # Focus lại bằng Alt+N (Filename field)
                     _log(logger, f"[UPLOAD-DIALOG] {backend}: Sending Alt+N...")
                     send_keys("%n")
-                    time.sleep(0.1)  # ⭐ Reduced from 0.2s to 0.1s
+                    time.sleep(0.02)  # ⭐ Reduced from 0.2s to 0.02s
                     _log(logger, f"[UPLOAD-DIALOG] {backend}: Alt+N sent, pasting...")
                     
                     # ⭐ FAST METHOD: Use clipboard + paste instead of typing each character
@@ -275,13 +275,13 @@ def _select_file_in_dialog(video_path: str, logger: Logger, timeout: int = 15, s
                         except Exception as e:
                             _log(logger, f"[UPLOAD-DIALOG] {backend}: clipboard paste failed - {e}, falling back to typing...")
                             # Fallback to typing if clipboard doesn't work
-                            _log(logger, f"[UPLOAD-DIALOG] {backend}: Typing path ({len(safe_path)} chars, pause=0.005s - ULTRA FAST)...")
-                            send_keys(safe_path, with_spaces=True, pause=0.005)  # ⭐ Reduced from 0.01s to 0.005s
+                            _log(logger, f"[UPLOAD-DIALOG] {backend}: Typing path ({len(safe_path)} chars, pause=0.001s - ULTRA FAST)...")
+                            send_keys(safe_path, with_spaces=True, pause=0.001)
                             input_set = True
                     else:
                         # pyperclip not available, use faster typing
-                        _log(logger, f"[UPLOAD-DIALOG] {backend}: Typing path ({len(safe_path)} chars, pause=0.005s - ULTRA FAST)...")
-                        send_keys(safe_path, with_spaces=True, pause=0.005)  # ⭐ Reduced from 0.01s to 0.005s
+                        _log(logger, f"[UPLOAD-DIALOG] {backend}: Typing path ({len(safe_path)} chars, pause=0.001s - ULTRA FAST)...")
+                        send_keys(safe_path, with_spaces=True, pause=0.001)
                         input_set = True
                     _log(logger, f"[UPLOAD-DIALOG] ✓ {backend}: Path input complete")
                 
@@ -894,6 +894,8 @@ def upload_prepare(
 
             # Click the button with Selenium
             try:
+                # Wait a bit before clicking Select video
+                time.sleep(1.0)
                 # Verify button is really clickable before attempting click
                 try:
                     btn_text = select_btn.text or select_btn.get_attribute("innerText") or ""

@@ -6,6 +6,7 @@ import threading
 import json
 import csv
 import subprocess
+import shutil
 import time
 import math
 import re
@@ -23,7 +24,7 @@ if _BASE_DIR not in sys.path:
 
 from gpm_client import create_profile, start_profile, close_profile, delete_profile, extract_driver_info
 from login_scoopz import login_scoopz, login_scoopz_profile, open_profile_in_scoopz
-from config import SCOOPZ_URL, SCOOPZ_UPLOAD_URL, COOKIES_FILE
+from config import SCOOPZ_URL, SCOOPZ_UPLOAD_URL, COOKIES_FILE, COOKIES_FILE_FALLBACK
 from yt_simple_download import download_one
 from shorts_csv_store import get_next_unuploaded, mark_uploaded, update_title_if_empty
 from scoopz_uploader import upload_prepare, upload_post_async
@@ -37,6 +38,32 @@ from operation_orchestrator import initialize_orchestrator
 
 
 ACCOUNTS = []
+FIXED_SCAN_FOLDERS = {
+    "alfreorasoly26_at_hotmail_com",
+    "driterlaruu_at_hotmail_com",
+    "dwengahuiju_at_hotmail_com",
+    "eduanyadzia_at_hotmail_com",
+    "janioanshaa11_at_hotmail_com",
+    "opendauria_at_hotmail_com",
+    "shueybrwamo_at_hotmail_com",
+    "jassornivar_at_hotmail_com",
+    "navudagishan_at_hotmail_com",
+    "ussmanentang_at_hotmail_com",
+    "yhamirchhaya_at_hotmail_com",
+    "kaisynadena_at_hotmail_com",
+    "nkhusikpatsa_at_hotmail_com",
+    "tybenduviol_at_hotmail_com",
+    "adlaheok_at_hotmail_com",
+    "norbilagami_at_hotmail_com",
+    "tekanalenart_at_hotmail_com",
+    "utasirme_at_hotmail_com",
+    "ibadetmorsin9684_at_hotmail_com",
+    "csutatabong_at_hotmail_com",
+    "curagariba_at_hotmail_com",
+}
+FIXED_SCAN_EMAILS = {
+    f.replace("_at_", "@").replace("_", ".") for f in FIXED_SCAN_FOLDERS
+}
 
 
 class App:
@@ -52,12 +79,12 @@ class App:
         self.error_logger = initialize_logger(log_dir)
         self.error_logger.log_info("SYSTEM", "START", "Application started")
         
-        # Initialize orchestrator with BALANCED mode
+        # Initialize orchestrator with CONSERVATIVE mode
         # This coordinates all operations: login delays, sequential downloads, serial uploads
-        self.orchestrator = initialize_orchestrator("balanced", logger=self.error_logger.main_logger.info)
+        self.orchestrator = initialize_orchestrator("conservative", logger=self.error_logger.main_logger.info)
         
-        # Initialize rate limiter with balanced strategy
-        initialize_rate_limiting("balanced")
+        # Initialize rate limiter with conservative strategy
+        initialize_rate_limiting("conservative")
         self.operation_delayer = get_operation_delayer()
 
         self.stop_event = threading.Event()
@@ -77,7 +104,17 @@ class App:
         self.active_drivers_lock = threading.Lock()
         self.profile_active_drivers = {}
         self.profile_active_drivers_lock = threading.Lock()
+        self.profile_paths = {}
+        self.profile_paths_lock = threading.Lock()
+        self.profile_paths_used = set()
+        self._gpm_cleanup_count = 0
+        self._gpm_cleanup_lock = threading.Lock()
+        self._gpm_cleanup_running = False
         self.profile_created_profiles = set()
+        self._upload_queue_lock = threading.Lock()
+        self._upload_queue_cond = threading.Condition(self._upload_queue_lock)
+        self._upload_queue = []
+        self._upload_queue_seq = 0
         self.profile_semaphore = None
         self.profile_update_lock = threading.Lock()
         self.csv_lock = threading.Lock()  # CSV atomic operations
@@ -102,6 +139,21 @@ class App:
         self._repeat_delay_sec = 0
         self._retry_round = 0
         self._profile_retry_round = 0
+        self._count_var = tk.StringVar(value="Total: 0")
+        self._profile_count_var = tk.StringVar(value="Total Profile: 0")
+        self._follow_sort_after_id = None
+        self._job_item_email_map = {}
+        self._job_item_email_lock = threading.Lock()
+        self._transient_statuses = {
+            "START...",
+            "STARTED",
+            "STARTED (no debug)",
+            "DOWNLOAD...",
+            "DOWNLOAD OK",
+            "POSTING...",
+            "LOGIN...",
+            "RESTART...",
+        }
 
         self._build_ui()
         self.accounts = self._load_accounts_cache() or ACCOUNTS
@@ -130,6 +182,32 @@ class App:
         self.entry_repeat_delay = ttk.Entry(top, width=6)
         self.entry_repeat_delay.insert(0, "5")
         self.entry_repeat_delay.pack(side="left", padx=(5, 15))
+
+        top2 = ttk.Frame(self.root)
+        top2.pack(fill="x", padx=8, pady=(0, 6))
+
+        ttk.Label(top2, text="GPM Path:").pack(side="left")
+        self.entry_gpm_path = ttk.Entry(top2, width=24)
+        self.entry_gpm_path.insert(0, r"C:\GPM")
+        self.entry_gpm_path.pack(side="left", padx=(5, 15))
+
+        self._search_placeholder = "Tìm email..."
+        self.entry_search_email = ttk.Entry(top2, width=28)
+        self.entry_search_email.insert(0, self._search_placeholder)
+        self.entry_search_email.pack(side="left", padx=(0, 6))
+        try:
+            self.entry_search_email.configure(foreground="gray")
+        except Exception:
+            pass
+        self.entry_search_email.bind("<FocusIn>", self._search_focus_in)
+        self.entry_search_email.bind("<FocusOut>", self._search_focus_out)
+        self.btn_search_email = ttk.Button(top2, text="FIND", command=self._search_email)
+        self.btn_search_email.pack(side="left", padx=(0, 12))
+
+        self.lbl_total = ttk.Label(top2, textvariable=self._count_var)
+        self.lbl_total.pack(side="left", padx=(0, 10))
+        self.lbl_profile_total = ttk.Label(top2, textvariable=self._profile_count_var)
+        self.lbl_profile_total.pack(side="left")
 
         self.btn_start = ttk.Button(top, text="START", command=self.start_jobs)
         self.btn_start.pack(side="left", padx=(0, 8))
@@ -161,8 +239,10 @@ class App:
         ttk.Button(btn_frame_upload, text="Select All", command=self._select_all_accounts).pack(side="left", padx=(0, 4))
         ttk.Button(btn_frame_upload, text="Deselect All", command=self._deselect_all_accounts).pack(side="left")
 
+        upload_table = ttk.Frame(self.tab_upload)
+        upload_table.pack(fill="both", expand=True, padx=8, pady=8)
         self.tree = ttk.Treeview(
-            self.tab_upload,
+            upload_table,
             columns=("chk", "stt", "email", "pass", "proxy", "status", "followers", "profile_url", "profile_id"),
             show="headings",
             selectmode="extended",
@@ -179,14 +259,19 @@ class App:
         self.tree.column("proxy", width=260)
         self.tree.heading("status", text="TRẠNG THÁI")
         self.tree.column("status", width=200)
-        self.tree.heading("followers", text="FOLLOWERS", command=self._sort_followers_desc)
+        self.tree.heading("followers", text="FOLLOWERS")
         self.tree.column("followers", width=90, anchor="center")
         self.tree.heading("profile_url", text="PROFILE URL")
         self.tree.column("profile_url", width=260)
         self.tree.heading("profile_id", text="PROFILE ID")
         self.tree.column("profile_id", width=240)
 
-        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
+        upload_scroll = ttk.Scrollbar(upload_table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=upload_scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        upload_scroll.grid(row=0, column=1, sticky="ns")
+        upload_table.grid_rowconfigure(0, weight=1)
+        upload_table.grid_columnconfigure(0, weight=1)
         self.tree.tag_configure("status_ok", foreground="green")
         self.tree.tag_configure("status_err", foreground="red")
 
@@ -195,8 +280,10 @@ class App:
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
         self.tree.bind("<Button-3>", self._on_tree_right_click)
 
+        profile_table = ttk.Frame(self.tab_profile)
+        profile_table.pack(fill="both", expand=True, padx=8, pady=8)
         self.profile_tree = ttk.Treeview(
-            self.tab_profile,
+            profile_table,
             columns=("chk", "stt", "email", "pass", "proxy", "youtube", "status"),
             show="headings",
             selectmode="extended",
@@ -216,7 +303,12 @@ class App:
         self.profile_tree.heading("status", text="TRẠNG THÁI")
         self.profile_tree.column("status", width=200)
 
-        self.profile_tree.pack(fill="both", expand=True, padx=8, pady=8)
+        profile_scroll = ttk.Scrollbar(profile_table, orient="vertical", command=self.profile_tree.yview)
+        self.profile_tree.configure(yscrollcommand=profile_scroll.set)
+        self.profile_tree.grid(row=0, column=0, sticky="nsew")
+        profile_scroll.grid(row=0, column=1, sticky="ns")
+        profile_table.grid_rowconfigure(0, weight=1)
+        profile_table.grid_columnconfigure(0, weight=1)
         self.profile_tree.tag_configure("status_ok", foreground="green")
         self.profile_tree.tag_configure("status_err", foreground="red")
 
@@ -392,6 +484,7 @@ class App:
                 self._set_status(item_id, "NO PROFILE ID")
                 self._record_failed(item_id, acc, "NO PROFILE ID")
                 return
+            self._remember_profile_path(profile_id, data_c)
             self.created_profiles.add(profile_id)
 
             self._set_status(item_id, "START...", profile_id=profile_id)
@@ -559,6 +652,14 @@ class App:
             except Exception:
                 pass
             try:
+                if profile_id:
+                    self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            if profile_id:
+                self._delete_profile_path(profile_id)
+                self._track_profile_cleanup()
+            try:
                 with self.active_lock:
                     self.active_profiles.pop(item_id, None)
             except Exception:
@@ -584,6 +685,7 @@ class App:
                     row.get("profile_id", ""),
                 ),
             )
+        self._update_counts()
 
     def _load_profile_rows(self) -> None:
         self.profile_tree.delete(*self.profile_tree.get_children())
@@ -602,13 +704,138 @@ class App:
                     row.get("status", "READY"),
                 ),
             )
+        self._update_counts()
+
+    def _update_counts(self) -> None:
+        try:
+            self._count_var.set(f"Total: {len(self.accounts)}")
+        except Exception:
+            pass
+        try:
+            self._profile_count_var.set(f"Total Profile: {len(self.profile_accounts)}")
+        except Exception:
+            pass
+
+    def _search_email(self) -> None:
+        q = (self.entry_search_email.get() or "").strip()
+        if not q or q == self._search_placeholder:
+            return
+        q = q.lower()
+        if not q:
+            return
+        tree = self.profile_tree if self._is_profile_tab() else self.tree
+        rows = self.profile_accounts if self._is_profile_tab() else self.accounts
+        matches = []
+        for idx, row in enumerate(rows, start=1):
+            email = (row.get("uid") or "").strip().lower()
+            if q in email:
+                matches.append(str(idx))
+        if not matches:
+            self._log(f"[SEARCH] No match: {q}")
+            return
+        try:
+            tree.selection_remove(tree.selection())
+        except Exception:
+            pass
+        for item_id in matches:
+            try:
+                tree.selection_add(item_id)
+            except Exception:
+                pass
+        try:
+            tree.see(matches[0])
+        except Exception:
+            pass
+        self._log(f"[SEARCH] Found {len(matches)} match(es) for: {q}")
+
+    def _bind_item_email(self, item_id: str, email: str) -> None:
+        if not item_id or not email:
+            return
+        with self._job_item_email_lock:
+            self._job_item_email_map[item_id] = email
+
+    def _lookup_item_email(self, item_id: str) -> str:
+        with self._job_item_email_lock:
+            return self._job_item_email_map.get(item_id, "")
+
+    def _resolve_upload_item_id(self, item_id: str) -> str:
+        email = self._lookup_item_email(item_id)
+        if not email:
+            try:
+                email = self.tree.set(item_id, "email")
+            except Exception:
+                email = ""
+        if not email:
+            return item_id
+        try:
+            for iid in self.tree.get_children():
+                if self.tree.set(iid, "email") == email:
+                    return iid
+        except Exception:
+            pass
+        return item_id
+
+    def _get_acc_by_email(self, email: str) -> dict | None:
+        if not email:
+            return None
+        for acc in self.accounts:
+            if acc.get("uid") == email:
+                return acc
+        return None
+
+    def _collect_transient_failures(self) -> list:
+        items = []
+        try:
+            for iid in self.tree.get_children():
+                status = (self.tree.set(iid, "status") or "").strip()
+                if status not in self._transient_statuses:
+                    continue
+                email = self.tree.set(iid, "email")
+                acc = self._get_acc_by_email(email)
+                if not acc:
+                    continue
+                self._set_status(iid, "INCOMPLETE")
+                items.append((iid, acc))
+        except Exception:
+            pass
+        return items
+
+    def _search_focus_in(self, _evt=None) -> None:
+        try:
+            if self.entry_search_email.get() == self._search_placeholder:
+                self.entry_search_email.delete(0, tk.END)
+                self.entry_search_email.configure(foreground="black")
+        except Exception:
+            pass
+
+    def _search_focus_out(self, _evt=None) -> None:
+        try:
+            if not self.entry_search_email.get().strip():
+                self.entry_search_email.delete(0, tk.END)
+                self.entry_search_email.insert(0, self._search_placeholder)
+                self.entry_search_email.configure(foreground="gray")
+        except Exception:
+            pass
 
     def _set_status(self, item_id: str, status: str, profile_id: str = "") -> None:
         def _update():
+            resolved_id = self._resolve_upload_item_id(item_id)
             if profile_id:
-                self.tree.set(item_id, "profile_id", profile_id)
-            self.tree.set(item_id, "status", status)
-            self._apply_status_tag(item_id, status)
+                self.tree.set(resolved_id, "profile_id", profile_id)
+            self.tree.set(resolved_id, "status", status)
+            self._apply_status_tag(resolved_id, status)
+            try:
+                email = self.tree.set(resolved_id, "email")
+                if email:
+                    for acc in self.accounts:
+                        if acc.get("uid") == email:
+                            acc["status"] = status
+                            if profile_id:
+                                acc["profile_id"] = profile_id
+                            break
+                self._save_accounts_cache()
+            except Exception:
+                pass
 
         self.root.after(0, _update)
 
@@ -616,6 +843,10 @@ class App:
         def _update():
             self.profile_tree.set(item_id, "status", status)
             self._apply_profile_status_tag(item_id, status)
+            try:
+                self.profile_tree.see(item_id)
+            except Exception:
+                pass
 
         self.root.after(0, _update)
 
@@ -698,8 +929,8 @@ class App:
             cached = state.get(email, {})
             followers = cached.get("followers", row.get("followers", ""))
             profile_url = cached.get("profile_url", row.get("profile_url", ""))
-            status = cached.get("status", "READY")
-            chk = cached.get("chk", "v")
+            status = row.get("status") or cached.get("status", "READY")
+            chk = "v" if email in FIXED_SCAN_EMAILS else cached.get("chk", "v")
             tags = cached.get("tags", ())
             self.tree.insert(
                 "",
@@ -720,13 +951,57 @@ class App:
             )
 
     def _sort_followers_desc(self) -> None:
-        follower_map = {}
-        for iid in self.tree.get_children():
-            email = self.tree.set(iid, "email")
-            followers = self.tree.set(iid, "followers")
-            if email:
-                follower_map[email] = followers
+        return
 
+    def _enqueue_upload_turn(self) -> int:
+        with self._upload_queue_cond:
+            self._upload_queue_seq += 1
+            token = self._upload_queue_seq
+            self._upload_queue.append(token)
+            self._upload_queue_cond.notify_all()
+            return token
+
+    def _wait_upload_turn(self, token: int) -> bool:
+        with self._upload_queue_cond:
+            while True:
+                if self.stop_event.is_set():
+                    if token in self._upload_queue:
+                        try:
+                            self._upload_queue.remove(token)
+                        except Exception:
+                            pass
+                    self._upload_queue_cond.notify_all()
+                    return False
+                if self._upload_queue and self._upload_queue[0] == token:
+                    return True
+                self._upload_queue_cond.wait(timeout=0.5)
+
+    def _release_upload_turn(self, token: int) -> None:
+        with self._upload_queue_cond:
+            if self._upload_queue and self._upload_queue[0] == token:
+                self._upload_queue.pop(0)
+            else:
+                try:
+                    self._upload_queue.remove(token)
+                except Exception:
+                    pass
+            self._upload_queue_cond.notify_all()
+
+    def _schedule_follow_sort(self) -> None:
+        if self._follow_sort_after_id:
+            try:
+                self.root.after_cancel(self._follow_sort_after_id)
+            except Exception:
+                pass
+            self._follow_sort_after_id = None
+
+        def _run():
+            self._follow_sort_after_id = None
+            self._apply_follow_sort()
+
+        self._follow_sort_after_id = self.root.after(300, _run)
+
+    def _apply_follow_sort(self) -> None:
         def _to_num(val) -> int:
             if val is None or val == "":
                 return -1
@@ -741,16 +1016,15 @@ class App:
             except Exception:
                 return -1
 
-        self.accounts.sort(
-            key=lambda acc: _to_num(
-                # Check followers field first, then fallback to tree map using email
-                acc.get("followers")
-                if acc.get("followers") is not None
-                else follower_map.get(acc.get("email", ""), "")
-            ),
-            reverse=True,
-        )
-        self._rebuild_tree_from_accounts()
+        try:
+            self.accounts.sort(
+                key=lambda acc: _to_num(acc.get("followers")),
+                reverse=True,
+            )
+            self._rebuild_tree_from_accounts()
+            self._save_accounts_cache()
+        except Exception:
+            pass
 
     def _apply_status_tag(self, item_id: str, status: str) -> None:
         status_upper = (status or "").upper()
@@ -769,6 +1043,13 @@ class App:
             self.profile_tree.item(item_id, tags=("status_ok",))
         else:
             self.profile_tree.item(item_id, tags=())
+
+    def _clear_status_tags(self) -> None:
+        try:
+            for iid in self.tree.get_children():
+                self.tree.item(iid, tags=())
+        except Exception:
+            pass
 
     def _log(self, msg: str) -> None:
         def _is_noisy(m: str) -> bool:
@@ -825,19 +1106,30 @@ class App:
 
     def _set_profile_info(self, item_id: str, profile_url: str, followers) -> None:
         def _update():
+            resolved_id = self._resolve_upload_item_id(item_id)
             if profile_url:
-                self.tree.set(item_id, "profile_url", profile_url)
+                self.tree.set(resolved_id, "profile_url", profile_url)
             if followers is not None:
-                self.tree.set(item_id, "followers", str(followers))
+                self.tree.set(resolved_id, "followers", str(followers))
         self.root.after(0, _update)
         try:
-            idx = int(item_id) - 1
-            if 0 <= idx < len(self.accounts):
-                if profile_url:
-                    self.accounts[idx]["profile_url"] = profile_url
-                if followers is not None:
-                    self.accounts[idx]["followers"] = followers
+            email = self._lookup_item_email(item_id)
+            if not email:
+                try:
+                    email = self.tree.set(item_id, "email")
+                except Exception:
+                    email = ""
+            if email:
+                for acc in self.accounts:
+                    if acc.get("uid") == email:
+                        if profile_url:
+                            acc["profile_url"] = profile_url
+                        if followers is not None:
+                            acc["followers"] = followers
+                        break
                 self._save_accounts_cache()
+                if followers is not None:
+                    self._schedule_follow_sort()
         except Exception:
             pass
 
@@ -1188,6 +1480,7 @@ class App:
         max_threads = max(1, int(self.entry_threads.get() or 1))
         pool = ThreadPoolExecutor(max_workers=max_threads)
         for item_id, acc in selected:
+            self._bind_item_email(item_id, acc.get("uid", ""))
             pool.submit(self._login_only_worker, item_id, acc)
 
     def menu_upload_selected(self) -> None:
@@ -1200,6 +1493,7 @@ class App:
         max_threads = max(1, int(self.entry_threads.get() or 1))
         pool = ThreadPoolExecutor(max_workers=max_threads)
         for item_id, acc in selected:
+            self._bind_item_email(item_id, acc.get("uid", ""))
             pool.submit(self._upload_only_worker, item_id, acc)
 
     def menu_follow_selected(self) -> None:
@@ -1212,6 +1506,7 @@ class App:
         max_threads = max(1, int(self.entry_threads.get() or 1))
         pool = ThreadPoolExecutor(max_workers=max_threads)
         for item_id, acc in selected:
+            self._bind_item_email(item_id, acc.get("uid", ""))
             pool.submit(self._follow_only_worker, item_id, acc)
 
     def menu_profile_selected(self) -> None:
@@ -1539,6 +1834,7 @@ class App:
             return
 
         self.stop_event.clear()
+        self._clear_status_tags()
         self._retry_round = 0
         # Clear failed accounts list at start of new cycle
         with self.failed_accounts_lock:
@@ -1604,6 +1900,7 @@ class App:
             item_id = str(idx)
             if item_id not in checked_items:
                 continue
+            self._bind_item_email(item_id, acc.get("uid", ""))
             pos = slot_idx % max_slots
             col = pos % cols
             row = pos // cols
@@ -1625,6 +1922,10 @@ class App:
             with self.failed_accounts_lock:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
+            try:
+                failed_list.extend(self._collect_transient_failures())
+            except Exception:
+                pass
             
             self.executor = None
             
@@ -1632,10 +1933,11 @@ class App:
             if failed_list and not self.stop_event.is_set():
                 if self._retry_round < 3:
                     self._retry_round += 1
-                self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
-                # Don't use the last loop's win_pos/win_size; let _retry_failed_accounts calculate its own layout
-                self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
-                return
+                    self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
+                    # Don't use the last loop's win_pos/win_size; let _retry_failed_accounts calculate its own layout
+                    self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
+                    return
+                self._log(f"[RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             
             if self._repeat_enabled and not self.stop_event.is_set():
@@ -1673,6 +1975,7 @@ class App:
 
         # Clear executor state
         self.stop_event.clear()
+        self._clear_status_tags()
         self._retry_round = 0
         with self.failed_accounts_lock:
             self.failed_accounts = []
@@ -1722,6 +2025,7 @@ class App:
             item_id = str(idx)
             if item_id not in checked_items:
                 continue
+            self._bind_item_email(item_id, acc.get("uid", ""))
             
             # Reset status to prepare for new cycle
             self.tree.set(item_id, "status", "WAIT")
@@ -1746,6 +2050,10 @@ class App:
             with self.failed_accounts_lock:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
+            try:
+                failed_list.extend(self._collect_transient_failures())
+            except Exception:
+                pass
 
             self.executor = None
 
@@ -1753,9 +2061,10 @@ class App:
             if failed_list and not self.stop_event.is_set():
                 if self._retry_round < 3:
                     self._retry_round += 1
-                self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
-                self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
-                return
+                    self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
+                    self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
+                    return
+                self._log(f"[RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
 
             self._clear_failed_log()
 
@@ -1837,6 +2146,12 @@ class App:
             return
         
         self._log(f"[RETRY] Retrying {len(failed_accounts)} failed accounts (max {max_threads} threads)...")
+        self._clear_status_tags()
+        try:
+            for item_id, _acc in failed_accounts:
+                self._set_status(item_id, f"RETRY {self._retry_round}/3")
+        except Exception:
+            pass
         
         self.executor = ThreadPoolExecutor(max_workers=max_threads)
         futures = []
@@ -1869,6 +2184,7 @@ class App:
         for idx, (item_id, acc) in enumerate(failed_accounts):
             if self.stop_event.is_set():
                 break
+            self._bind_item_email(item_id, acc.get("uid", ""))
             pos = idx % (cols * rows_layout)
             col = pos % cols
             row = pos // cols
@@ -1889,13 +2205,17 @@ class App:
             with self.failed_accounts_lock:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
+            try:
+                failed_list.extend(self._collect_transient_failures())
+            except Exception:
+                pass
             if failed_list and not self.stop_event.is_set():
                 if self._retry_round < 3:
                     self._retry_round += 1
-                if self._retry_round <= 3:
                     self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
+                self._log(f"[RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = int(self._repeat_delay_sec * 1000)
@@ -2005,6 +2325,7 @@ class App:
         if not profile_id:
             self._set_status(item_id, "NO PROFILE ID")
             return None, None, None
+        self._remember_profile_path(profile_id, data_c)
         self.created_profiles.add(profile_id)
 
         self._set_status(item_id, "START...", profile_id=profile_id)
@@ -2013,11 +2334,31 @@ class App:
             self._set_status(item_id, f"START ERR: {msg_s}")
             self._log(f"[{acc['uid']}] START ERR: {msg_s}")
             self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+            try:
+                close_profile(profile_id, 3)
+                delete_profile(profile_id, 10)
+            except Exception:
+                pass
+            try:
+                self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            self._delete_profile_path(profile_id)
             return None, None, None
 
         driver_path, remote = extract_driver_info(data_s)
         if not driver_path or not remote:
             self._set_status(item_id, "STARTED (no debug)")
+            try:
+                close_profile(profile_id, 3)
+                delete_profile(profile_id, 10)
+            except Exception:
+                pass
+            try:
+                self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            self._delete_profile_path(profile_id)
             return None, None, None
 
         self._set_status(item_id, "LOGIN...")
@@ -2035,6 +2376,16 @@ class App:
             self._set_status(item_id, status)
             self._log(f"[{acc['uid']}] {status}")
             self._record_failed(item_id, acc, status)
+            try:
+                close_profile(profile_id, 3)
+                delete_profile(profile_id, 10)
+            except Exception:
+                pass
+            try:
+                self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            self._delete_profile_path(profile_id)
             return None, None, None
 
         self._set_status(item_id, "LOGIN OK")
@@ -2048,152 +2399,363 @@ class App:
             }
         return driver_path, remote, profile_id
 
+    def _cleanup_profile_session(self, item_id: str = None, profile_id: str = None) -> None:
+        info = None
+        if item_id is not None:
+            with self.active_drivers_lock:
+                info = self.active_drivers.pop(item_id, None)
+        if info and not profile_id:
+            profile_id = info.get("profile_id")
+        try:
+            if info and "close_func" in info:
+                info["close_func"]()
+        except Exception:
+            pass
+        if profile_id:
+            try:
+                close_profile(profile_id, 3)
+                delete_profile(profile_id, 10)
+            except Exception:
+                pass
+            try:
+                self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            self._delete_profile_path(profile_id)
+            self._track_profile_cleanup()
+
+    def _extract_profile_path(self, data: dict) -> str:
+        payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+        if not isinstance(payload, dict):
+            return ""
+        for key in (
+            "profile_path",
+            "profilePath",
+            "profile_dir",
+            "profileDir",
+            "path",
+            "folder",
+            "local_path",
+            "localPath",
+        ):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+
+    def _get_gpm_root(self) -> str:
+        try:
+            raw = self.entry_gpm_path.get().strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            return ""
+        try:
+            return os.path.abspath(os.path.expanduser(raw))
+        except Exception:
+            return raw
+
+    def _guess_profile_path(self) -> str:
+        gpm_root = self._get_gpm_root()
+        if not gpm_root or not os.path.isdir(gpm_root):
+            return ""
+        try:
+            entries = []
+            for name in os.listdir(gpm_root):
+                if name.lower() == "profile_data.db":
+                    continue
+                path = os.path.join(gpm_root, name)
+                if not os.path.isdir(path):
+                    continue
+                if path in self.profile_paths_used:
+                    continue
+                try:
+                    mtime = os.path.getmtime(path)
+                except Exception:
+                    mtime = 0
+                entries.append((mtime, path))
+            if not entries:
+                return ""
+            entries.sort(key=lambda x: x[0], reverse=True)
+            return entries[0][1]
+        except Exception:
+            return ""
+
+    def _remember_profile_path(self, profile_id: str, data: dict) -> None:
+        if not profile_id:
+            return
+        path = self._extract_profile_path(data or {})
+        if not path:
+            path = self._guess_profile_path()
+            if not path:
+                try:
+                    self._log(f"[GPM] profile_path missing for {profile_id}")
+                except Exception:
+                    pass
+                return
+            try:
+                self._log(f"[GPM] profile_path guessed for {profile_id}: {path}")
+            except Exception:
+                pass
+        with self.profile_paths_lock:
+            self.profile_paths[profile_id] = path
+            self.profile_paths_used.add(path)
+        try:
+            self._log(f"[GPM] profile_path for {profile_id}: {path}")
+        except Exception:
+            pass
+
+    def _delete_profile_path(self, profile_id: str) -> None:
+        if not profile_id:
+            return
+        with self.profile_paths_lock:
+            path = self.profile_paths.pop(profile_id, None)
+            if path:
+                self.profile_paths_used.discard(path)
+        if not path:
+            return
+        try:
+            abs_path = os.path.abspath(path)
+            if os.path.isdir(abs_path):
+                shutil.rmtree(abs_path, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _track_profile_cleanup(self) -> None:
+        with self._gpm_cleanup_lock:
+            self._gpm_cleanup_count += 1
+            count = self._gpm_cleanup_count
+        if count >= 10:
+            self._cleanup_gpm_root_if_needed()
+
+    def _cleanup_gpm_root_if_needed(self) -> None:
+        with self._gpm_cleanup_lock:
+            if self._gpm_cleanup_running:
+                return
+            self._gpm_cleanup_running = True
+        try:
+            self._cleanup_gpm_root(force=False)
+        finally:
+            with self._gpm_cleanup_lock:
+                self._gpm_cleanup_count = 0
+                self._gpm_cleanup_running = False
+
+    def _cleanup_gpm_root(self, force: bool = False) -> None:
+        gpm_root = self._get_gpm_root()
+        if not gpm_root or not os.path.isdir(gpm_root):
+            return
+        try:
+            if force:
+                self._log(f"[GPM] Cleaning all profile folders in {gpm_root} (force)")
+            else:
+                self._log(f"[GPM] Cleaning profile folders in {gpm_root}")
+        except Exception:
+            pass
+        try:
+            for name in os.listdir(gpm_root):
+                if name.lower() == "profile_data.db":
+                    continue
+                path = os.path.join(gpm_root, name)
+                if not os.path.isdir(path):
+                    continue
+                if not force and path in self.profile_paths_used:
+                    continue
+                try:
+                    shutil.rmtree(path, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _login_only_worker(self, item_id: str, acc: dict) -> None:
         if self.stop_event.is_set():
             return
-        self._ensure_logged_in(item_id, acc)
+        try:
+            self._ensure_logged_in(item_id, acc)
+            self._set_status(item_id, "LOGIN OK (HOLD)")
+            self._log(f"[{acc['uid']}] LOGIN OK (HOLD) - will close on STOP")
+        except Exception:
+            pass
 
     def _upload_only_worker(self, item_id: str, acc: dict) -> None:
         if self.stop_event.is_set():
             return
-        driver_path, remote, _ = self._ensure_logged_in(item_id, acc)
-        if not driver_path or not remote:
-            return
-        download_started = threading.Event()
-        def _idle_watchdog():
-            if download_started.wait(timeout=30):
+        profile_id = None
+        try:
+            driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc)
+            if not driver_path or not remote:
                 return
-            if self.stop_event.is_set():
-                return
-            self._set_status(item_id, "LOGIN OK (IDLE)")
-            self._log(f"[{acc['uid']}] LOGIN OK (IDLE) - no download started")
-            self._record_failed(item_id, acc, "LOGIN OK (IDLE)")
-        threading.Thread(target=_idle_watchdog, daemon=True).start()
-        success_count = 0
-        safety_guard = 0
-        max_videos = 1
-        while success_count < max_videos:
-            if self.stop_event.is_set():
-                return
-            safety_guard += 1
-            if safety_guard > max_videos * 5:
-                self._log(f"[{acc['uid']}] Too many skips, stop loop")
-                return
+            download_started = threading.Event()
 
-            ok_next, row = get_next_unuploaded(acc["uid"])
-            if not ok_next:
-                self._log(f"[{acc['uid']}] {row.get('msg', 'No URL in CSV')}")
-                return
-            row_url = (row.get("url") or "").strip()
-            row_id = (row.get("video_id") or "").strip()
-            if not row_url:
-                if row_id.startswith("http"):
-                    row_url = row_id
-                elif row_id:
-                    row_url = f"https://www.youtube.com/shorts/{row_id}"
-            if not row_url:
-                self._log(f"[{acc['uid']}] No URL in CSV row")
-                return
+            def _idle_watchdog():
+                if download_started.wait(timeout=30):
+                    return
+                if self.stop_event.is_set():
+                    return
+                ok_next, row = get_next_unuploaded(acc["uid"])
+                if not ok_next:
+                    self._set_status(item_id, "H?T VIDEO")
+                    self._log(f"[{acc['uid']}] H?T VIDEO: {row.get('msg', 'No URL in CSV')}")
+                    return
+                self._set_status(item_id, "LOGIN OK (IDLE)")
+                self._log(f"[{acc['uid']}] LOGIN OK (IDLE) - no download started")
 
-            self._set_status(item_id, "DOWNLOAD...")
-            download_started.set()
-            self._log(f"[{acc['uid']}] NEXT VIDEO: {row_id} | {row_url}")
-            ok_dl, path_or_err, vid_id, title = download_one(
-                acc["uid"],
-                row_url,
-                self._log_progress,
-                cookie_path=COOKIES_FILE,
-                timeout_s=300,
-            )
-            mark_id = vid_id or row_id
-            if not ok_dl:
-                err_text = str(path_or_err)
-                lower = err_text.lower()
-                is_skipped = (
-                    "video skipped" in lower
-                    or "private video" in lower
-                    or "sign in if you've been granted access" in lower
-                    or "sign in to confirm your age" in lower
-                    or "age-restricted" in lower
-                    or "age restricted" in lower
+            threading.Thread(target=_idle_watchdog, daemon=True).start()
+            success_count = 0
+            safety_guard = 0
+            max_videos = 1
+            while success_count < max_videos:
+                if self.stop_event.is_set():
+                    return
+                safety_guard += 1
+                if safety_guard > max_videos * 5:
+                    self._log(f"[{acc['uid']}] Too many skips, stop loop")
+                    return
+
+                ok_next, row = get_next_unuploaded(acc["uid"])
+                if not ok_next:
+                    self._set_status(item_id, "H?T VIDEO")
+                    self._log(f"[{acc['uid']}] H?T VIDEO: {row.get('msg', 'No URL in CSV')}")
+                    return
+                row_url = (row.get("url") or "").strip()
+                row_id = (row.get("video_id") or "").strip()
+                if not row_url:
+                    if row_id.startswith("http"):
+                        row_url = row_id
+                    elif row_id:
+                        row_url = f"https://www.youtube.com/shorts/{row_id}"
+                if not row_url:
+                    self._log(f"[{acc['uid']}] No URL in CSV row")
+                    return
+
+                self._set_status(item_id, "DOWNLOAD...")
+                download_started.set()
+                self._log(f"[{acc['uid']}] NEXT VIDEO: {row_id} | {row_url}")
+                ok_dl, path_or_err, vid_id, title = download_one(
+                    acc["uid"],
+                    row_url,
+                    self._log_progress,
+                    cookie_path=COOKIES_FILE,
+                    fallback_cookie_path=COOKIES_FILE_FALLBACK,
+                    timeout_s=300,
                 )
-                if is_skipped:
-                    self._log(f"[{acc['uid']}] VIDEO UNAVAILABLE - AUTO SKIP")
+                mark_id = vid_id or row_id
+                if not ok_dl:
+                    err_text = str(path_or_err)
+                    lower = err_text.lower()
+                    is_skipped = (
+                        "video skipped" in lower
+                        or "private video" in lower
+                        or "sign in if you've been granted access" in lower
+                        or "sign in to confirm your age" in lower
+                        or "age-restricted" in lower
+                        or "age restricted" in lower
+                    )
+                    if is_skipped:
+                        self._log(f"[{acc['uid']}] VIDEO UNAVAILABLE - AUTO SKIP")
+                        try:
+                            mark_uploaded(acc["uid"], mark_id)
+                        except Exception:
+                            pass
+                        continue
+                    self._log(f"[{acc['uid']}] DOWNLOAD ERR: {err_text}")
+                    if "timeout" in lower or "timed out" in lower:
+                        self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
+                    return
+
+                caption = title or ""
+                token = self._enqueue_upload_turn()
+                if not self._wait_upload_turn(token):
+                    return
+                try:
+                    ok_p = False
+                    drv = None
+                    up_status = ""
+                    up_msg = ""
+                    retry_reopen = {"caption_error", "dialog_error", "timeout", "unexpected_error", "error"}
+                    for attempt in range(3):
+                        ok_p, drv, up_status, up_msg = upload_prepare(
+                            driver_path,
+                            remote,
+                            path_or_err,
+                            caption,
+                            lambda: self.stop_event.is_set(),
+                            self._log,
+                            acc.get("uid", ""),
+                            max_total_s=360,
+                            file_dialog_semaphore=self.file_dialog_semaphore,
+                        )
+                        if ok_p:
+                            break
+                        if up_status in retry_reopen and attempt < 2:
+                            wait_s = 2 + attempt
+                            self._log(f"[{acc['uid']}] Upload page retry {attempt+1}/2 in {wait_s}s (status={up_status})")
+                            time.sleep(wait_s)
+                            continue
+                        break
+                finally:
+                    self._release_upload_turn(token)
+                if not ok_p:
+                    status_text = f"UPLOAD LOI: {up_status}" if up_status in ("select_not_found", "select_click_error") else f"UPLOAD ERR: {up_msg or up_status}"
+                    self._set_status(item_id, status_text)
+                    self._log(f"[{acc['uid']}] {status_text}")
+                    if up_status in ("select_not_found", "select_click_error"):
+                        self._record_failed(item_id, acc, f"UPLOAD {up_status}")
+                    elif up_status == "timeout":
+                        self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
+                    return
+
+                self._set_status(item_id, "POSTING...")
+                st, msg, purl, foll = upload_post_async(drv, self._log, max_total_s=180, post_button_semaphore=self.post_button_semaphore)
+                if st == "success":
                     try:
                         mark_uploaded(acc["uid"], mark_id)
                     except Exception:
                         pass
-                    continue
-                self._log(f"[{acc['uid']}] DOWNLOAD ERR: {err_text}")
-                if "timeout" in lower or "timed out" in lower:
-                    self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
-                return
-
-            caption = title or ""
-            ok_p, drv, up_status, up_msg = upload_prepare(
-                driver_path,
-                remote,
-                path_or_err,
-                caption,
-                lambda: self.stop_event.is_set(),
-                self._log,
-                acc.get("uid", ""),
-                max_total_s=360,
-                file_dialog_semaphore=self.file_dialog_semaphore,
-            )
-            if not ok_p:
-                status_text = f"UPLOAD LOI: {up_status}" if up_status in ("select_not_found", "select_click_error") else f"UPLOAD ERR: {up_msg or up_status}"
-                self._set_status(item_id, status_text)
-                self._log(f"[{acc['uid']}] {status_text}")
-                if up_status in ("select_not_found", "select_click_error"):
-                    self._record_failed(item_id, acc, f"UPLOAD {up_status}")
-                elif up_status == "timeout":
-                    self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
-                return
-
-            self._set_status(item_id, "POSTING...")
-            st, msg, purl, foll = upload_post_async(drv, self._log, max_total_s=180, post_button_semaphore=self.post_button_semaphore)
-            if st == "success":
-                try:
-                    mark_uploaded(acc["uid"], mark_id)
-                except Exception:
-                    pass
-                self._set_profile_info(item_id, purl, foll)
-                self._set_status(item_id, "UPLOAD OK")
-                self._log(f"[{acc['uid']}] UPLOAD OK")
-                self._delete_uploaded_video(path_or_err, acc["uid"])
-                success_count += 1
-                try:
-                    followers, profile_url = fetch_followers(driver_path, remote, self._log)
-                    if followers is not None:
-                        self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
-                        self._set_profile_info(item_id, profile_url, followers)
-                except Exception as e:
-                    self._log(f"[{acc['uid']}] FOLLOW ERR: {e}")
-                time.sleep(10.0)
-            else:
-                err_text = msg or st
-                status_text = "UPLOAD LOI" if "Select video not found" in (err_text or "") else f"UPLOAD ERR: {err_text}"
-                self._set_status(item_id, status_text)
-                self._log(f"[{acc['uid']}] UPLOAD ERR: {err_text}")
-                if st == "timeout":
-                    self._record_failed(item_id, acc, f"POST ERR: {err_text}")
-                return
+                    self._set_profile_info(item_id, purl, foll)
+                    self._set_status(item_id, "UPLOAD OK")
+                    self._log(f"[{acc['uid']}] UPLOAD OK")
+                    self._delete_uploaded_video(path_or_err, acc["uid"])
+                    success_count += 1
+                    try:
+                        followers, profile_url = fetch_followers(driver_path, remote, self._log)
+                        if followers is not None:
+                            self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                            self._set_profile_info(item_id, profile_url, followers)
+                    except Exception as e:
+                        self._log(f"[{acc['uid']}] FOLLOW ERR: {e}")
+                    time.sleep(10.0)
+                else:
+                    err_text = msg or st
+                    status_text = "UPLOAD LOI" if "Select video not found" in (err_text or "") else f"UPLOAD ERR: {err_text}"
+                    self._set_status(item_id, status_text)
+                    self._log(f"[{acc['uid']}] UPLOAD ERR: {err_text}")
+                    if st == "timeout":
+                        self._record_failed(item_id, acc, f"POST ERR: {err_text}")
+                    return
+        finally:
+            if profile_id:
+                self._cleanup_profile_session(item_id, profile_id)
 
     def _follow_only_worker(self, item_id: str, acc: dict) -> None:
         if self.stop_event.is_set():
             return
-        driver_path, remote, _ = self._ensure_logged_in(item_id, acc)
-        if not driver_path or not remote:
-            return
-        followers, profile_url = fetch_followers(driver_path, remote, self._log)
-        if followers is not None:
-            self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
-            self._set_profile_info(item_id, profile_url, followers)
-            self._set_status(item_id, "FOLLOW OK")
-        else:
-            self._set_status(item_id, "FOLLOW ERR")
-            self._log(f"[{acc['uid']}] FOLLOW ERR")
+        profile_id = None
+        try:
+            driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc)
+            if not driver_path or not remote:
+                return
+            followers, profile_url = fetch_followers(driver_path, remote, self._log)
+            if followers is not None:
+                self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                self._set_profile_info(item_id, profile_url, followers)
+                self._set_status(item_id, "FOLLOW OK")
+            else:
+                self._set_status(item_id, "FOLLOW ERR")
+                self._log(f"[{acc['uid']}] FOLLOW ERR")
+        finally:
+            if profile_id:
+                self._cleanup_profile_session(item_id, profile_id)
 
     def _profile_open_worker(self, item_id: str, acc: dict, win_pos: str, win_size: str) -> None:
         sem = self.profile_semaphore
@@ -2258,6 +2820,7 @@ class App:
                 self._log(f"[{acc['uid']}] NO PROFILE ID")
                 self._record_profile_failed(item_id, acc, "NO PROFILE ID")
                 return
+            self._remember_profile_path(profile_id, data_c)
             self.profile_created_profiles.add(profile_id)
 
             self._set_profile_status(item_id, "START...")
@@ -2393,6 +2956,8 @@ class App:
                     self.profile_created_profiles.discard(profile_id)
                 except Exception:
                     pass
+                self._delete_profile_path(profile_id)
+                self._track_profile_cleanup()
             if sem:
                 sem.release()
 
@@ -2445,9 +3010,13 @@ class App:
         ids = list({pid for pid in ids if pid})
         for pid in ids:
             threading.Thread(
-                target=lambda p=pid: (close_profile(p, 3), delete_profile(p, 10)),
+                target=lambda p=pid: self._cleanup_profile_session(None, p),
                 daemon=True,
             ).start()
+        try:
+            self._cleanup_gpm_root(force=True)
+        except Exception:
+            pass
 
     def reload_app(self) -> None:
         self.stop_jobs()
@@ -2546,6 +3115,7 @@ class App:
             self._log(f"[{acc['uid']}] NO PROFILE ID")
             self._record_failed(item_id, acc, "NO PROFILE ID")
             return
+        self._remember_profile_path(profile_id, data_c)
         self.created_profiles.add(profile_id)
 
         self._set_status(item_id, "START...", profile_id=profile_id)
@@ -2584,9 +3154,13 @@ class App:
                         return
                     if self.stop_event.is_set():
                         return
+                    ok_next, row = get_next_unuploaded(acc["uid"])
+                    if not ok_next:
+                        self._set_status(item_id, "HẾT VIDEO")
+                        self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
+                        return
                     self._set_status(item_id, "LOGIN OK (IDLE)")
                     self._log(f"[{acc['uid']}] LOGIN OK (IDLE) - no download started")
-                    self._record_failed(item_id, acc, "LOGIN OK (IDLE)")
                 threading.Thread(target=_idle_watchdog, daemon=True).start()
                 success_count = 0
                 safety_guard = 0
@@ -2604,7 +3178,8 @@ class App:
                     
                     ok_next, row = get_next_unuploaded(acc["uid"])
                     if not ok_next:
-                        self._log(f"[{acc['uid']}] {row.get('msg', 'No URL in CSV')}")
+                        self._set_status(item_id, "HẾT VIDEO")
+                        self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
                         break
                     row_url = (row.get("url") or "").strip()
                     row_id = (row.get("video_id") or "").strip()
@@ -2632,6 +3207,7 @@ class App:
                             row_url,
                             self._log_progress,
                             cookie_path=COOKIES_FILE,
+                            fallback_cookie_path=COOKIES_FILE_FALLBACK,
                             timeout_s=300,
                         )
                         if ok_dl:
@@ -2709,53 +3285,68 @@ class App:
                             drv = None
                             up_status = ""
                             up_msg = ""
-                            
-                            # Retry with exponential backoff
-                            for attempt in range(3):
-                                if self.stop_event.is_set():
-                                    break
-                                    
-                                # Use per-driver lock to prevent file dialog conflicts
-                                driver_key = f"{acc['uid']}_upload"
-                                try:
-                                    with self.dialog_lock_pool.acquire(driver_key, timeout=60):
-                                        ok_p, drv, up_status, up_msg = upload_prepare(
-                                            driver_path,
-                                            remote,
-                                            path_or_err,
-                                            caption,
-                                            lambda: self.stop_event.is_set(),
-                                            self._log,
-                                            acc.get("uid", ""),
-                                            max_total_s=360,
-                                            file_dialog_semaphore=self.file_dialog_semaphore,
-                                        )
-                                except Exception as e:
-                                    up_msg = f"Lock timeout: {e}"
-                                    self._log(f"[{acc['uid']}] Upload lock error: {e}")
-                                
-                                if ok_p:
-                                    break
-                                
-                                # Retry on dialog lock timeout
-                                if up_status == "dialog_lock_timeout":
-                                    if attempt < 2:
-                                        wait_time = 5  # Wait 5s before retrying dialog lock
-                                        self._log(f"[{acc['uid']}] Dialog lock timeout, retry in {wait_time}s...")
-                                        time.sleep(wait_time)
-                                        continue
-                                    else:
+                            token = self._enqueue_upload_turn()
+                            if not self._wait_upload_turn(token):
+                                return
+                            try:
+                                # Retry with exponential backoff
+                                for attempt in range(3):
+                                    if self.stop_event.is_set():
                                         break
-                                
-                                # Don't retry certain errors
-                                if up_status not in ("select_not_found", "select_click_error"):
-                                    break
-                                
-                                # Backoff before retry
-                                if attempt < 2:
-                                    wait_time = min(2 ** attempt, 10)  # 2s, 4s
-                                    self._log(f"[{acc['uid']}] Upload retry in {wait_time}s...")
-                                    time.sleep(wait_time)
+                                        
+                                    # Use per-driver lock to prevent file dialog conflicts
+                                    driver_key = f"{acc['uid']}_upload"
+                                    try:
+                                        with self.dialog_lock_pool.acquire(driver_key, timeout=60):
+                                            ok_p, drv, up_status, up_msg = upload_prepare(
+                                                driver_path,
+                                                remote,
+                                                path_or_err,
+                                                caption,
+                                                lambda: self.stop_event.is_set(),
+                                                self._log,
+                                                acc.get("uid", ""),
+                                                max_total_s=360,
+                                                file_dialog_semaphore=self.file_dialog_semaphore,
+                                            )
+                                    except Exception as e:
+                                        up_msg = f"Lock timeout: {e}"
+                                        self._log(f"[{acc['uid']}] Upload lock error: {e}")
+                                    
+                                    if ok_p:
+                                        break
+                                    
+                                    # Retry on dialog lock timeout
+                                    if up_status == "dialog_lock_timeout":
+                                        if attempt < 2:
+                                            wait_time = 5  # Wait 5s before retrying dialog lock
+                                            self._log(f"[{acc['uid']}] Dialog lock timeout, retry in {wait_time}s...")
+                                            time.sleep(wait_time)
+                                            continue
+                                        else:
+                                            break
+
+                                    # Retry by re-opening upload page on certain failures
+                                    if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error"):
+                                        if attempt < 2:
+                                            wait_time = 2 + attempt
+                                            self._log(f"[{acc['uid']}] Upload page retry {attempt+1}/2 in {wait_time}s (status={up_status})")
+                                            time.sleep(wait_time)
+                                            continue
+                                        else:
+                                            break
+                                    
+                                    # Don't retry certain errors
+                                    if up_status not in ("select_not_found", "select_click_error"):
+                                        break
+                                    
+                                    # Backoff before retry
+                                    if attempt < 2:
+                                        wait_time = min(2 ** attempt, 10)  # 2s, 4s
+                                        self._log(f"[{acc['uid']}] Upload retry in {wait_time}s...")
+                                        time.sleep(wait_time)
+                            finally:
+                                self._release_upload_turn(token)
                             
                             if not ok_p and up_status in ("select_not_found", "select_click_error"):
                                 # Upload select not found - add to retry queue and break
@@ -2839,6 +3430,14 @@ class App:
                     delete_profile(profile_id, 10)
             except Exception:
                 pass
+            try:
+                if profile_id:
+                    self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            if profile_id:
+                self._delete_profile_path(profile_id)
+                self._track_profile_cleanup()
         try:
             with self.active_lock:
                 self.active_profiles.pop(item_id, None)

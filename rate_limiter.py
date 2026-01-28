@@ -83,10 +83,10 @@ class OperationDelayer:
     def _configure_delays(self):
         """Configure delays based on strategy."""
         if self.strategy == self.STRATEGY_CONSERVATIVE:
-            self.delay_between_downloads = 5.0    # Wait 5s between downloads
-            self.delay_between_uploads = 8.0      # Wait 8s between uploads
-            self.delay_between_accounts = 3.0     # Wait 3s between switching accounts
-            self.delay_on_error = 10.0            # Wait 10s on error
+            self.delay_between_downloads = 8.0    # Wait 8s between downloads
+            self.delay_between_uploads = 12.0     # Wait 12s between uploads
+            self.delay_between_accounts = 4.0     # Wait 4s between switching accounts
+            self.delay_on_error = 15.0            # Wait 15s on error
         elif self.strategy == self.STRATEGY_AGGRESSIVE:
             self.delay_between_downloads = 1.0
             self.delay_between_uploads = 2.0
