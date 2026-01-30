@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 
 import os
-import time
 import shutil
 from typing import Callable, Tuple
 
@@ -38,6 +37,100 @@ def _safe_email(email: str) -> str:
     )
 
 
+def _make_progress_hook(logger=None, email: str = ""):
+    def _hook(d: dict) -> None:
+        if d.get("status") != "finished":
+            return
+        total = (d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "").strip()
+        speed = (d.get("_speed_str") or "").strip()
+        elapsed = (d.get("_elapsed_str") or "").strip()
+        prefix = f"[DL] {email} " if email else "[DL] "
+        msg = f"{prefix}[download] 100% of {total} in {elapsed} at {speed}"
+        if logger:
+            logger(msg)
+        else:
+            print(msg)
+    return _hook
+
+
+def pick_js_runtimes_dict() -> dict:
+    # yt-dlp expects dict: {"deno": {}} or {"node": {}}
+    if shutil.which("deno"):
+        return {"deno": {}}
+    if shutil.which("node"):
+        return {"node": {}}
+    return {}
+
+
+def build_opts(js_runtimes: dict, out_dir: str, use_cookie: bool, cookie_file: str, logger=None, email: str = "", timeout_s: int = 120):
+    opts = {
+        "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
+        "format": "bv*+ba/b",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "socket_timeout": timeout_s,
+        "js_runtimes": js_runtimes,
+        "extractor_args": {"youtube": {"player_client": ["android", "web_embedded"]}},
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 8,
+        "progress_hooks": [_make_progress_hook(logger=logger, email=email)],
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    if use_cookie and cookie_file:
+        opts["cookiefile"] = cookie_file
+
+    return opts
+
+
+def looks_like_need_cookie(err: str) -> bool:
+    e = (err or "").lower()
+    keywords = [
+        "sign in to confirm youâ€™re not a bot",
+        "sign in to confirm you're not a bot",
+        "use --cookies",
+        "cookies-from-browser",
+        "http error 403",
+        "403: forbidden",
+        "forbidden",
+        "login",
+        "confirm youâ€™re not a bot",
+        "confirm you're not a bot",
+    ]
+    return any(k in e for k in keywords)
+
+
+def _download_once(url: str, out_dir: str, logger: Logger, email: str, timeout_s: int, cookie_file: str = "") -> Tuple[bool, str, str, str]:
+    js_runtimes = pick_js_runtimes_dict()
+    if not js_runtimes:
+        raise RuntimeError("Thieu JS runtime (deno hoac node). Cai deno.exe (portable) + add PATH, hoac cai Node.js.")
+
+    ydl_opts = build_opts(
+        js_runtimes=js_runtimes,
+        out_dir=out_dir,
+        use_cookie=bool(cookie_file),
+        cookie_file=cookie_file,
+        logger=logger,
+        email=email,
+        timeout_s=timeout_s,
+    )
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if not info:
+            return False, "yt-dlp khong co thong tin video", "", ""
+        path = ydl.prepare_filename(info)
+        vid = (info.get("id") or "").strip()
+        title = (info.get("title") or "").strip()
+
+    if not path or not os.path.exists(path):
+        return False, "yt-dlp tai xong nhung khong tim thay file", "", ""
+
+    return True, path, vid, title
+
+
 def download_one(
     email: str,
     url: str,
@@ -56,129 +149,55 @@ def download_one(
         out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "video", email_safe))
         os.makedirs(out_dir, exist_ok=True)
 
-        last_log = {"t": 0.0, "pct": -1, "no_total_t": 0.0}
-
-        def _progress_hook(d):
-            try:
-                if d.get("status") != "downloading":
-                    return
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                downloaded = d.get("downloaded_bytes") or 0
-                now = time.time()
-                if total <= 0:
-                    if (now - last_log["no_total_t"]) >= 3.0:
-                        logger(f"[DL] {email} downloading...")
-                        last_log["no_total_t"] = now
-                    return
-                pct = int(downloaded * 100 / total)
-                if pct == last_log["pct"] and (now - last_log["t"]) < 3.0:
-                    return
-                if (now - last_log["t"]) < 3.0 and (pct - last_log["pct"]) < 10:
-                    return
-                if pct not in (0, 100) and pct % 10 != 0 and (now - last_log["t"]) < 3.0:
-                    return
-                last_log["pct"] = pct
-                last_log["t"] = now
-                mb_done = downloaded / (1024 * 1024)
-                mb_total = total / (1024 * 1024)
-                logger(f"[DL] {email} {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)")
-            except Exception:
-                pass
-
-        class _QuietLogger:
-            def debug(self, msg):
-                pass
-            def warning(self, msg):
-                pass
-            def error(self, msg):
-                pass
-
-        ydl_opts = {
-            "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
-            "format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/best",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "logger": _QuietLogger(),
-            "merge_output_format": "mp4",
-            "socket_timeout": timeout_s,
-            "retries": 3,
-            "fragment_retries": 3,
-            "concurrent_fragment_downloads": 2,
-            "ratelimit": 1_000_000,
-            "sleep_interval": 1,
-            "max_sleep_interval": 2,
-            "progress_hooks": [_progress_hook],
-        }
         cookie_candidates = []
         if cookie_path and os.path.exists(cookie_path):
             cookie_candidates.append(cookie_path)
         if fallback_cookie_path and os.path.exists(fallback_cookie_path):
             cookie_candidates.append(fallback_cookie_path)
-
-        def _run_with_cookie(cookie_file: str) -> Tuple[bool, str, str, str]:
-            if cookie_file:
-                ydl_opts["cookiefile"] = cookie_file
-            elif "cookiefile" in ydl_opts:
-                ydl_opts.pop("cookiefile", None)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    return False, "yt-dlp khong co thong tin video", "", ""
-                path = ydl.prepare_filename(info)
-                vid = (info.get("id") or "").strip()
-                title = (info.get("title") or "").strip()
-            if not path or not os.path.exists(path):
-                return False, "yt-dlp tai xong nhung khong tim thay file", "", ""
-            return True, path, vid, title
-
+        
         logger(f"[DL] START {email} {url}")
         try:
-            if cookie_candidates:
-                ok, path, vid, title = _run_with_cookie(cookie_candidates[0])
-                if ok:
-                    return True, path, vid, title
-                # If first cookie fails with 403, try fallback cookie
-                err_text = str(path).lower()
-                if len(cookie_candidates) > 1 and ("403" in err_text or "forbidden" in err_text):
-                    logger(f"[DL] 403 detected, retrying with fallback cookie...")
-                    return _run_with_cookie(cookie_candidates[1])
-                return False, path, vid, title
-            return _run_with_cookie("")
+            # First try without cookie
+            ok, path, vid, title = _download_once(url, out_dir, logger, email, timeout_s, cookie_file="")
+            if ok:
+                return True, path, vid, title
+            return False, path, vid, title
         except Exception as e:
-            err_str = str(e).lower()
-            if cookie_candidates and len(cookie_candidates) > 1 and ("403" in err_str or "forbidden" in err_str):
-                try:
-                    logger(f"[DL] 403 detected, retrying with fallback cookie...")
-                    return _run_with_cookie(cookie_candidates[1])
-                except Exception:
-                    pass
-            if "ffmpeg is not installed" in err_str or "ffmpeg" in err_str and "not installed" in err_str:
-                if logger:
-                    logger("[DL] FFmpeg missing. Install ffmpeg and add to PATH.")
+            err_str = str(e)
+            if looks_like_need_cookie(err_str):
+                for cookie_file in cookie_candidates:
+                    try:
+                        logger(f"[DL] Retry with cookie: {cookie_file}")
+                        return _download_once(url, out_dir, logger, email, timeout_s, cookie_file=cookie_file)
+                    except Exception as e2:
+                        err_str = str(e2)
+                        if looks_like_need_cookie(err_str) or "403" in err_str.lower() or "forbidden" in err_str.lower():
+                            continue
+                        raise
             # Detect members-only and similar access restriction errors
+            err_low = err_str.lower()
             is_access_restricted = any([
-                "members-only" in err_str,
-                "members only" in err_str,
-                "join this channel" in err_str,
-                "this video is available to channel members" in err_str,
-                "premium only" in err_str,
-                "membership required" in err_str,
-                "you need to be a member" in err_str,
-                "access denied" in err_str,
+                "members-only" in err_low,
+                "members only" in err_low,
+                "join this channel" in err_low,
+                "this video is available to channel members" in err_low,
+                "premium only" in err_low,
+                "membership required" in err_low,
+                "you need to be a member" in err_low,
+                "access denied" in err_low,
             ])
             # Detect video unavailable / age restricted (removed, terminated account, private, etc)
             is_unavailable = any([
-                "video unavailable" in err_str,
-                "has been removed by the uploader" in err_str,
-                "no longer available" in err_str,
-                "account associated with this video has been terminated" in err_str,
-                "this video has been removed" in err_str,
-                "private video" in err_str,
-                "restricted" in err_str,
-                "sign in to confirm your age" in err_str,
-                "age-restricted" in err_str,
-                "age restricted" in err_str,
+                "video unavailable" in err_low,
+                "has been removed by the uploader" in err_low,
+                "no longer available" in err_low,
+                "account associated with this video has been terminated" in err_low,
+                "this video has been removed" in err_low,
+                "private video" in err_low,
+                "restricted" in err_low,
+                "sign in to confirm your age" in err_low,
+                "age-restricted" in err_low,
+                "age restricted" in err_low,
             ])
             if is_access_restricted or is_unavailable:
                 return False, f"VIDEO SKIPPED: {e}", "", ""
