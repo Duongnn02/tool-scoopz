@@ -223,7 +223,19 @@ def login_scoopz(
                 disabled = btn.get_attribute("disabled")
                 return btn if not disabled else False
 
-            btn = wait.until(_btn_enabled)
+            try:
+                btn = _WebDriverWait(driver, 15).until(_btn_enabled)
+            except TimeoutException:
+                _log("[LOGIN] Continue button timeout - refreshing")
+                try:
+                    driver.execute_script("window.stop();")
+                except Exception:
+                    pass
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                return False, "continue_timeout"
             try:
                 btn.click()
             except Exception:

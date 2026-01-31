@@ -38,6 +38,10 @@ from operation_orchestrator import initialize_orchestrator
 
 
 ACCOUNTS = []
+PROFILE_BATCH_SIZE = 100
+PROFILE_BATCH_PAUSE_SEC = 600
+PROFILE_BATCH_STAGGER_SEC = 0.15
+PROFILE_BATCH_PAUSE_CHECK_SEC = 2.0
 FIXED_SCAN_FOLDERS = {
     "alfreorasoly26_at_hotmail_com",
     "driterlaruu_at_hotmail_com",
@@ -139,6 +143,7 @@ class App:
         self._repeat_delay_sec = 0
         self._retry_round = 0
         self._profile_retry_round = 0
+        self._profile_batch_running = False
         self._count_var = tk.StringVar(value="Total: 0")
         self._profile_count_var = tk.StringVar(value="Total Profile: 0")
         self._follow_sort_after_id = None
@@ -1728,7 +1733,7 @@ class App:
             return False
 
     def start_profile_jobs(self) -> None:
-        if self.executor is not None:
+        if self._profile_batch_running or self.executor is not None:
             return
         if self._repeat_after_id:
             try:
@@ -1748,41 +1753,53 @@ class App:
         self._profile_retry_round = 0
         with self.profile_failed_lock:
             self.profile_failed_accounts = []
-        self.executor = ThreadPoolExecutor(max_workers=max_threads)
-        self.profile_semaphore = threading.BoundedSemaphore(max_threads)
         checked_items = [iid for iid in self.profile_tree.get_children() if self.profile_tree.set(iid, "chk") == "v"]
         if not checked_items:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
-            self.executor = None
             return
+        self._profile_batch_running = True
 
-        # Same layout as upload: 5 columns, max 2 rows
-        try:
-            screen_w = self.root.winfo_screenwidth()
-            screen_h = self.root.winfo_screenheight()
-        except Exception:
-            screen_w, screen_h = 1920, 1080
-        gap = 6  # Tight spacing between windows
-        taskbar_h = 40  # Reserve space for taskbar
-        usable_w = screen_w - (gap * 2)
-        usable_h = (screen_h - taskbar_h) - (gap * 2)
-        active_count = len(checked_items)
-        cols = min(5, active_count)
-        rows_layout = min(2, max(1, math.ceil(active_count / cols)))
-        win_w = int((usable_w - gap * (cols - 1)) / cols)
-        win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
-        win_w = max(150, min(280, win_w))
-        win_h = max(420, min(600, win_h))
+        def _sleep_with_stop(total_sec: float) -> None:
+            end_time = time.time() + max(0.0, total_sec)
+            while time.time() < end_time:
+                if self.stop_event.is_set():
+                    break
+                time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, max(0.0, end_time - time.time())))
 
-        slot_idx = 0
-        max_slots = cols * rows_layout
-        for idx_item, item_id in enumerate(checked_items):
+        def _run_batch(batch_items: list) -> None:
+            if not batch_items or self.stop_event.is_set():
+                return
+
+            self._profile_retry_round = 0
+            with self.profile_failed_lock:
+                self.profile_failed_accounts = []
+
             try:
-                idx = int(item_id) - 1
+                screen_w = self.root.winfo_screenwidth()
+                screen_h = self.root.winfo_screenheight()
             except Exception:
-                continue
-            if 0 <= idx < len(self.profile_accounts):
-                acc = self.profile_accounts[idx]
+                screen_w, screen_h = 1920, 1080
+
+            gap = 6
+            taskbar_h = 40
+            usable_w = screen_w - (gap * 2)
+            usable_h = (screen_h - taskbar_h) - (gap * 2)
+            active_count = len(batch_items)
+            cols = min(5, active_count)
+            rows_layout = min(2, max(1, math.ceil(active_count / cols)))
+            win_w = int((usable_w - gap * (cols - 1)) / cols)
+            win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+            win_w = max(150, min(280, win_w))
+            win_h = max(420, min(600, win_h))
+
+            slot_idx = 0
+            max_slots = cols * rows_layout
+            self.executor = ThreadPoolExecutor(max_workers=max_threads)
+            self.profile_semaphore = threading.BoundedSemaphore(max_threads)
+            futures = []
+            for item_id, acc in batch_items:
+                if self.stop_event.is_set():
+                    break
                 pos = slot_idx % max_slots
                 col = pos % cols
                 row = pos // cols
@@ -1790,27 +1807,111 @@ class App:
                 y = gap + row * (win_h + gap)
                 win_pos = f"{x},{y}"
                 win_size = f"{win_w},{win_h}"
-                self.executor.submit(self._profile_open_worker, item_id, acc, win_pos, win_size)
+                futures.append(self.executor.submit(self._profile_open_worker, item_id, acc, win_pos, win_size))
                 slot_idx += 1
+                if PROFILE_BATCH_STAGGER_SEC > 0:
+                    time.sleep(PROFILE_BATCH_STAGGER_SEC)
 
-        def _waiter():
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
             try:
                 self.executor.shutdown(wait=True)
             except Exception:
                 pass
             self.executor = None
+
             with self.profile_failed_lock:
                 failed_list = self.profile_failed_accounts.copy()
                 self.profile_failed_accounts = []
-            if failed_list and not self.stop_event.is_set():
-                if self._profile_retry_round < 3:
-                    self._profile_retry_round += 1
-                    self._log(f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {self._profile_retry_round}/3)...")
-                    self.root.after(1000, lambda fl=failed_list: self._retry_failed_profile_accounts(fl, max_threads))
-                    return
+
+            while failed_list and not self.stop_event.is_set():
+                if self._profile_retry_round >= 3:
+                    self._log(f"[PROFILE RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+                    break
+                self._profile_retry_round += 1
+                self._log(
+                    f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {self._profile_retry_round}/3)..."
+                )
+
+                self.executor = ThreadPoolExecutor(max_workers=max_threads)
+                futures = []
+                active_count = len(failed_list)
+                cols = min(5, active_count)
+                rows_layout = max(1, (active_count + cols - 1) // cols)
+                win_w = int((usable_w - gap * (cols - 1)) / cols)
+                win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+                win_w = max(150, min(280, win_w))
+                win_h = max(420, min(600, win_h))
+                for idx, (item_id, acc) in enumerate(failed_list):
+                    if self.stop_event.is_set():
+                        break
+                    pos = idx % (cols * rows_layout)
+                    col = pos % cols
+                    row = pos // cols
+                    x = gap + col * (win_w + gap)
+                    y = gap + row * (win_h + gap)
+                    retry_win_pos = f"{x},{y}"
+                    retry_win_size = f"{win_w},{win_h}"
+                    futures.append(self.executor.submit(self._profile_open_worker, item_id, acc, retry_win_pos, retry_win_size))
+                    if PROFILE_BATCH_STAGGER_SEC > 0:
+                        time.sleep(PROFILE_BATCH_STAGGER_SEC)
+
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
+
+                try:
+                    self.executor.shutdown(wait=True)
+                except Exception:
+                    pass
+                self.executor = None
+
+                with self.profile_failed_lock:
+                    failed_list = self.profile_failed_accounts.copy()
+                    self.profile_failed_accounts = []
+
             self._clear_profile_failed_log()
 
-        threading.Thread(target=_waiter, daemon=True).start()
+        def _batch_runner():
+            try:
+                items = []
+                for item_id in checked_items:
+                    try:
+                        idx = int(item_id) - 1
+                    except Exception:
+                        continue
+                    if 0 <= idx < len(self.profile_accounts):
+                        items.append((item_id, self.profile_accounts[idx]))
+
+                if not items:
+                    return
+
+                total = len(items)
+                batch_size = max(1, int(PROFILE_BATCH_SIZE))
+                for start_idx in range(0, total, batch_size):
+                    if self.stop_event.is_set():
+                        break
+                    batch = items[start_idx : start_idx + batch_size]
+                    batch_no = (start_idx // batch_size) + 1
+                    total_batches = math.ceil(total / batch_size)
+                    self._log(f"[PROFILE BATCH] Start batch {batch_no}/{total_batches} ({len(batch)} profiles)")
+                    _run_batch(batch)
+                    if self.stop_event.is_set():
+                        break
+                    if start_idx + batch_size < total:
+                        self._log(f"[PROFILE BATCH] Pause {PROFILE_BATCH_PAUSE_SEC}s before next batch")
+                        _sleep_with_stop(PROFILE_BATCH_PAUSE_SEC)
+                self._log("[PROFILE BATCH] Done")
+            finally:
+                self._profile_batch_running = False
+
+        threading.Thread(target=_batch_runner, daemon=True).start()
 
 
     def start_jobs(self) -> None:

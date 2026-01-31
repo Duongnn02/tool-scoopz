@@ -2,6 +2,8 @@
 video/
 accounts_cache.json
 cookies.txt
+logs/
+html_snapshots/
 
 # Python
 __pycache__/

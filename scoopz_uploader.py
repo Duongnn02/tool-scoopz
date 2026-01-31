@@ -38,6 +38,9 @@ from operation_orchestrator import get_orchestrator
 Logger = Callable[[str], None]
 StopChecker = Callable[[], bool]
 
+DIALOG_WATCHDOG_SEC = 45.0
+DIALOG_WATCHDOG_POLL_SEC = 0.5
+
 
 def _log(logger: Logger, msg: str) -> None:
     if logger:
@@ -50,6 +53,44 @@ def _attach_driver(driver_path: str, remote_debugging_address: str):
     service = Service(driver_path)
     driver = webdriver.Chrome(service=service, options=options)
     return driver
+
+
+def _close_file_dialog(logger: Logger) -> bool:
+    if not PYWINAUTO_AVAILABLE:
+        return False
+    title_re = "Open|M\\u1edf|Ch\\u1ecdn t\\u1ec7p|Ch\\u1ecdn t\\u1eadp tin|File Upload|Upload"
+    for backend in ("uia", "win32"):
+        try:
+            app = Application(backend=backend).connect(title_re=title_re, timeout=0.5)
+            dlg = app.window(title_re=title_re)
+            try:
+                dlg.set_focus()
+            except Exception:
+                pass
+            try:
+                dlg.close()
+                _log(logger, f"[UPLOAD-DIALOG] Closed dialog via {backend}")
+                return True
+            except Exception:
+                try:
+                    send_keys("{ESC}")
+                    _log(logger, f"[UPLOAD-DIALOG] Sent ESC to dialog via {backend}")
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return False
+
+
+def _dialog_watchdog(stop_event: threading.Event, timeout_sec: float, logger: Logger) -> None:
+    end_time = time.time() + max(0.0, timeout_sec)
+    while time.time() < end_time:
+        if stop_event.is_set():
+            return
+        time.sleep(DIALOG_WATCHDOG_POLL_SEC)
+    _log(logger, f"[UPLOAD-DIALOG] Watchdog timeout ({timeout_sec}s) - attempting to close dialog")
+    _close_file_dialog(logger)
 
 
 def _force_click(driver, el) -> bool:
@@ -920,9 +961,20 @@ def upload_prepare(
                 return False, driver, "select_click_error", f"Select video click error: {e}"
             
             _log(logger, f"[UPLOAD] Dialog: calling _select_file_in_dialog('{video_path}', timeout=15)...")
-            ok = _select_file_in_dialog(video_path, logger, timeout=15, semaphore=file_dialog_semaphore)
+            watchdog_stop = threading.Event()
+            watchdog = threading.Thread(
+                target=_dialog_watchdog,
+                args=(watchdog_stop, DIALOG_WATCHDOG_SEC, logger),
+                daemon=True,
+            )
+            watchdog.start()
+            try:
+                ok = _select_file_in_dialog(video_path, logger, timeout=15, semaphore=file_dialog_semaphore)
+            finally:
+                watchdog_stop.set()
             _log(logger, f"[UPLOAD] Dialog: _select_file_in_dialog returned {ok}")
             if not ok:
+                _close_file_dialog(logger)
                 return False, driver, "dialog_error", "Open dialog failed"
         except Exception as e:
             _log(logger, f"[UPLOAD] Unexpected error: {e}")

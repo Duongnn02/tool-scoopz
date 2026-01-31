@@ -70,3 +70,6 @@ Symbols not available. Dumping unresolved backtrace:
 2026-01-28 12:25:52 | ERROR    | errors | DOWNLOAD: [awodirudrud@hotmail.com] URL: https://www.youtube.com/shorts/-_9PKmUtDjA | Error: yt-dlp loi: [0;31mERROR:[0m unable to download video data: HTTP Error 403: Forbidden
 2026-01-28 12:25:59 | ERROR    | errors | DOWNLOAD: [wirtzpreze72@hotmail.com] URL: https://www.youtube.com/shorts/vqoOFaiFuYM | Error: yt-dlp loi: [0;31mERROR:[0m unable to download video data: HTTP Error 403: Forbidden
 2026-01-28 12:30:03 | ERROR    | errors | UPLOAD: [palomavane7403@outlook.com] Video: oxkZ-PnFe6U.mp4 | Error: Open dialog failed
+2026-01-31 09:40:15 | ERROR    | errors | UPLOAD: [rrengakendra72@hotmail.com] Video: QADgCLruGtE.mp4 | Error: Stopped
+2026-01-31 10:15:53 | ERROR    | errors | UPLOAD: [lujaincandio@hotmail.com] Video: GkD8rOmJSeo.mp4 | Error: Account blocked
+2026-01-31 15:07:28 | ERROR    | errors | UPLOAD: [adlaheok@hotmail.com] Video: 1oJkA8lTwa0.mp4 | Error: Stopped
