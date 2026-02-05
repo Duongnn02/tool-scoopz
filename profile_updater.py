@@ -6,6 +6,7 @@ import tempfile
 import urllib.request
 from typing import Callable, Tuple, Optional
 import re
+import unicodedata
 import tkinter as tk
 import logging
 
@@ -358,6 +359,103 @@ def fetch_youtube_profile_assets_local(
                 pass
 
         avatar_path = _download_image(avatar_url, logger) if avatar_url else ""
+        return name, username, avatar_path
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def _format_fb_username_from_name(name: str) -> str:
+    val = (name or "").strip().lower()
+    if not val:
+        return "user"
+    val = unicodedata.normalize("NFKD", val)
+    val = "".join(ch for ch in val if not unicodedata.combining(ch))
+    val = re.sub(r"[^a-z0-9\s]", " ", val)
+    val = re.sub(r"\s+", "", val)
+    if len(val) < 3:
+        val = (val + "user")[:3]
+    return val[:218]
+
+
+def _extract_fb_name(driver) -> str:
+    try:
+        name = driver.execute_script(
+            """
+            const h1 = document.querySelector('h1');
+            if (!h1) return '';
+            let text = '';
+            for (const n of h1.childNodes) {
+              if (n.nodeType === Node.TEXT_NODE) text += ' ' + (n.textContent || '');
+            }
+            text = text.replace(/\\s+/g, ' ').trim();
+            if (!text) text = (h1.innerText || '').replace(/\\s+/g, ' ').trim();
+            text = text.replace(/Tài khoản đã xác minh/gi, '').trim();
+            return text;
+            """
+        )
+        return (name or "").strip()
+    except Exception:
+        return ""
+
+
+def _extract_fb_avatar_url(driver) -> str:
+    selectors = [
+        "svg image",
+        "image[xlink\\:href]",
+        "image[href]",
+        "img[data-visualcompletion='media-vc-image']",
+    ]
+    for sel in selectors:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if not els:
+                continue
+            for el in els:
+                src = (
+                    el.get_attribute("xlink:href")
+                    or el.get_attribute("href")
+                    or el.get_attribute("src")
+                    or ""
+                ).strip()
+                if src.startswith("http"):
+                    return src
+        except Exception:
+            pass
+    try:
+        meta = driver.find_element(By.CSS_SELECTOR, 'meta[property="og:image"]')
+        src = (meta.get_attribute("content") or "").strip()
+        if src.startswith("http"):
+            return src
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_facebook_profile_assets_local(
+    fb_url: str,
+    logger: Logger | None = None,
+) -> Tuple[str, str, str]:
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1280,900")
+    driver = webdriver.Chrome(options=options)
+    wait = WebDriverWait(driver, 25)
+
+    try:
+        driver.get(fb_url)
+        try:
+            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+        except Exception:
+            pass
+        time.sleep(1.2)
+
+        name = _extract_fb_name(driver)
+        avatar_url = _extract_fb_avatar_url(driver)
+        avatar_path = _download_image(avatar_url, logger) if avatar_url else ""
+        username = _format_fb_username_from_name(name)
         return name, username, avatar_path
     finally:
         try:

@@ -26,11 +26,13 @@ from gpm_client import create_profile, start_profile, close_profile, delete_prof
 from login_scoopz import login_scoopz, login_scoopz_profile, open_profile_in_scoopz
 from config import SCOOPZ_URL, SCOOPZ_UPLOAD_URL, COOKIES_FILE, COOKIES_FILE_FALLBACK
 from yt_simple_download import download_one
+from fb_simple_download import download_one_facebook
 from shorts_csv_store import get_next_unuploaded, mark_uploaded, update_title_if_empty
 from scoopz_uploader import upload_prepare, upload_post_async
 from followers_fetcher import fetch_followers
-from profile_updater import fetch_youtube_profile_assets_local, update_profile_from_assets
+from profile_updater import fetch_youtube_profile_assets_local, fetch_facebook_profile_assets_local, update_profile_from_assets
 from shorts_scanner import scan_shorts_for_email
+from fb_reels_scanner import scan_facebook_reels_for_email, scan_facebook_reels_multi
 from threading_utils import ResourcePool, RetryHelper, ThreadSafeCounter
 from logging_config import initialize_logger
 from rate_limiter import initialize_rate_limiting, get_operation_delayer
@@ -77,6 +79,8 @@ class App:
         self.root.geometry("1100x520")
         self._accounts_file = os.path.join(_THIS_DIR, "accounts_cache.json")
         self._profile_accounts_file = os.path.join(_THIS_DIR, "profile_accounts_cache.json")
+        self._fb_accounts_file = os.path.join(_THIS_DIR, "fb_accounts_cache.json")
+        self._fb_profile_accounts_file = os.path.join(_THIS_DIR, "fb_profile_accounts_cache.json")
         
         # Initialize logger
         log_dir = os.path.join(_THIS_DIR, "logs")
@@ -144,8 +148,15 @@ class App:
         self._retry_round = 0
         self._profile_retry_round = 0
         self._profile_batch_running = False
+        self._batch_pause_lock = threading.Lock()
+        self._batch_pause_state = {
+            "YTB": {"started": 0, "release_at": 0.0},
+            "FB": {"started": 0, "release_at": 0.0},
+        }
         self._count_var = tk.StringVar(value="Total: 0")
         self._profile_count_var = tk.StringVar(value="Total Profile: 0")
+        self._fb_count_var = tk.StringVar(value="Total FB: 0")
+        self._fb_profile_count_var = tk.StringVar(value="Total FB Profile: 0")
         self._follow_sort_after_id = None
         self._job_item_email_map = {}
         self._job_item_email_lock = threading.Lock()
@@ -165,6 +176,10 @@ class App:
         self._load_rows()
         self.profile_accounts = self._load_profile_accounts_cache()
         self._load_profile_rows()
+        self.fb_accounts = self._load_fb_accounts_cache()
+        self._load_fb_rows()
+        self.fb_profile_accounts = self._load_fb_profile_accounts_cache()
+        self._load_fb_profile_rows()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
@@ -212,7 +227,11 @@ class App:
         self.lbl_total = ttk.Label(top2, textvariable=self._count_var)
         self.lbl_total.pack(side="left", padx=(0, 10))
         self.lbl_profile_total = ttk.Label(top2, textvariable=self._profile_count_var)
-        self.lbl_profile_total.pack(side="left")
+        self.lbl_profile_total.pack(side="left", padx=(0, 10))
+        self.lbl_fb_total = ttk.Label(top2, textvariable=self._fb_count_var)
+        self.lbl_fb_total.pack(side="left", padx=(0, 10))
+        self.lbl_fb_profile_total = ttk.Label(top2, textvariable=self._fb_profile_count_var)
+        self.lbl_fb_profile_total.pack(side="left")
 
         self.btn_start = ttk.Button(top, text="START", command=self.start_jobs)
         self.btn_start.pack(side="left", padx=(0, 8))
@@ -231,9 +250,13 @@ class App:
         self.notebook = ttk.Notebook(self.root)
         self.tab_upload = ttk.Frame(self.notebook)
         self.tab_profile = ttk.Frame(self.notebook)
+        self.tab_fb = ttk.Frame(self.notebook)
+        self.tab_fb_profile = ttk.Frame(self.notebook)
         self.tab_interact = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_upload, text="UPLOAD")
         self.notebook.add(self.tab_profile, text="PROFILE")
+        self.notebook.add(self.tab_fb, text="FB")
+        self.notebook.add(self.tab_fb_profile, text="FB PROFILE")
         self.notebook.add(self.tab_interact, text="INTERACT")
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -323,11 +346,99 @@ class App:
             profile_top, text="IMPORT PROFILE", command=self.import_profile_accounts
         )
         self.btn_import_profile.pack(side="left")
+        ttk.Button(profile_top, text="Select All", command=self._select_all_profile_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(profile_top, text="Deselect All", command=self._deselect_all_profile_accounts).pack(side="left")
 
         self.profile_tree.bind("<Button-1>", self._on_profile_tree_click)
         self.profile_tree.bind("<B1-Motion>", self._on_profile_tree_drag)
         self.profile_tree.bind("<ButtonRelease-1>", self._on_profile_tree_release)
         self.profile_tree.bind("<Button-3>", self._on_profile_tree_right_click)
+
+        fb_table = ttk.Frame(self.tab_fb)
+        fb_table.pack(fill="both", expand=True, padx=8, pady=8)
+        self.fb_tree = ttk.Treeview(
+            fb_table,
+            columns=("chk", "stt", "email", "pass", "proxy", "facebook", "status"),
+            show="headings",
+            selectmode="extended",
+        )
+        self.fb_tree.heading("chk", text="v")
+        self.fb_tree.column("chk", width=40, anchor="center")
+        self.fb_tree.heading("stt", text="STT")
+        self.fb_tree.column("stt", width=50, anchor="center")
+        self.fb_tree.heading("email", text="EMAIL")
+        self.fb_tree.column("email", width=240)
+        self.fb_tree.heading("pass", text="PASS")
+        self.fb_tree.column("pass", width=130)
+        self.fb_tree.heading("proxy", text="PROXY")
+        self.fb_tree.column("proxy", width=260)
+        self.fb_tree.heading("facebook", text="FB REELS")
+        self.fb_tree.column("facebook", width=320)
+        self.fb_tree.heading("status", text="TRẠNG THÁI")
+        self.fb_tree.column("status", width=200)
+
+        fb_scroll = ttk.Scrollbar(fb_table, orient="vertical", command=self.fb_tree.yview)
+        self.fb_tree.configure(yscrollcommand=fb_scroll.set)
+        self.fb_tree.grid(row=0, column=0, sticky="nsew")
+        fb_scroll.grid(row=0, column=1, sticky="ns")
+        fb_table.grid_rowconfigure(0, weight=1)
+        fb_table.grid_columnconfigure(0, weight=1)
+        self.fb_tree.tag_configure("status_ok", foreground="green")
+        self.fb_tree.tag_configure("status_err", foreground="red")
+
+        fb_top = ttk.Frame(self.tab_fb)
+        fb_top.pack(fill="x", padx=8, pady=(8, 0))
+        self.btn_import_fb = ttk.Button(
+            fb_top, text="IMPORT FB", command=self.import_fb_accounts
+        )
+        self.btn_import_fb.pack(side="left")
+        ttk.Button(fb_top, text="Select All", command=self._select_all_fb_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(fb_top, text="Deselect All", command=self._deselect_all_fb_accounts).pack(side="left")
+
+        self.fb_tree.bind("<Button-1>", self._on_fb_tree_click)
+
+        fb_profile_table = ttk.Frame(self.tab_fb_profile)
+        fb_profile_table.pack(fill="both", expand=True, padx=8, pady=8)
+        self.fb_profile_tree = ttk.Treeview(
+            fb_profile_table,
+            columns=("chk", "stt", "email", "pass", "proxy", "facebook", "status"),
+            show="headings",
+            selectmode="extended",
+        )
+        self.fb_profile_tree.heading("chk", text="v")
+        self.fb_profile_tree.column("chk", width=40, anchor="center")
+        self.fb_profile_tree.heading("stt", text="STT")
+        self.fb_profile_tree.column("stt", width=50, anchor="center")
+        self.fb_profile_tree.heading("email", text="EMAIL")
+        self.fb_profile_tree.column("email", width=240)
+        self.fb_profile_tree.heading("pass", text="PASS")
+        self.fb_profile_tree.column("pass", width=130)
+        self.fb_profile_tree.heading("proxy", text="PROXY")
+        self.fb_profile_tree.column("proxy", width=260)
+        self.fb_profile_tree.heading("facebook", text="FB PROFILE LINK")
+        self.fb_profile_tree.column("facebook", width=320)
+        self.fb_profile_tree.heading("status", text="TRẠNG THÁI")
+        self.fb_profile_tree.column("status", width=200)
+
+        fb_profile_scroll = ttk.Scrollbar(fb_profile_table, orient="vertical", command=self.fb_profile_tree.yview)
+        self.fb_profile_tree.configure(yscrollcommand=fb_profile_scroll.set)
+        self.fb_profile_tree.grid(row=0, column=0, sticky="nsew")
+        fb_profile_scroll.grid(row=0, column=1, sticky="ns")
+        fb_profile_table.grid_rowconfigure(0, weight=1)
+        fb_profile_table.grid_columnconfigure(0, weight=1)
+        self.fb_profile_tree.tag_configure("status_ok", foreground="green")
+        self.fb_profile_tree.tag_configure("status_err", foreground="red")
+
+        fb_profile_top = ttk.Frame(self.tab_fb_profile)
+        fb_profile_top.pack(fill="x", padx=8, pady=(8, 0))
+        self.btn_import_fb_profile = ttk.Button(
+            fb_profile_top, text="IMPORT FB PROFILE", command=self.import_fb_profile_accounts
+        )
+        self.btn_import_fb_profile.pack(side="left")
+        ttk.Button(fb_profile_top, text="Select All", command=self._select_all_fb_profile_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(fb_profile_top, text="Deselect All", command=self._deselect_all_fb_profile_accounts).pack(side="left")
+
+        self.fb_profile_tree.bind("<Button-1>", self._on_fb_profile_tree_click)
 
         interact_top = ttk.Frame(self.tab_interact)
         interact_top.pack(fill="x", padx=8, pady=(8, 0))
@@ -711,6 +822,44 @@ class App:
             )
         self._update_counts()
 
+    def _load_fb_rows(self) -> None:
+        self.fb_tree.delete(*self.fb_tree.get_children())
+        for idx, row in enumerate(self.fb_accounts, start=1):
+            self.fb_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(
+                    "v",
+                    idx,
+                    row.get("uid", ""),
+                    row.get("pass", ""),
+                    row.get("proxy", ""),
+                    row.get("facebook", ""),
+                    row.get("status", "READY"),
+                ),
+            )
+        self._update_counts()
+
+    def _load_fb_profile_rows(self) -> None:
+        self.fb_profile_tree.delete(*self.fb_profile_tree.get_children())
+        for idx, row in enumerate(self.fb_profile_accounts, start=1):
+            self.fb_profile_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(
+                    "v",
+                    idx,
+                    row.get("uid", ""),
+                    row.get("pass", ""),
+                    row.get("proxy", ""),
+                    row.get("facebook", ""),
+                    row.get("status", "READY"),
+                ),
+            )
+        self._update_counts()
+
     def _update_counts(self) -> None:
         try:
             self._count_var.set(f"Total: {len(self.accounts)}")
@@ -718,6 +867,14 @@ class App:
             pass
         try:
             self._profile_count_var.set(f"Total Profile: {len(self.profile_accounts)}")
+        except Exception:
+            pass
+        try:
+            self._fb_count_var.set(f"Total FB: {len(self.fb_accounts)}")
+        except Exception:
+            pass
+        try:
+            self._fb_profile_count_var.set(f"Total FB Profile: {len(self.fb_profile_accounts)}")
         except Exception:
             pass
 
@@ -728,8 +885,18 @@ class App:
         q = q.lower()
         if not q:
             return
-        tree = self.profile_tree if self._is_profile_tab() else self.tree
-        rows = self.profile_accounts if self._is_profile_tab() else self.accounts
+        if self._is_profile_tab():
+            tree = self.profile_tree
+            rows = self.profile_accounts
+        elif self._is_fb_tab():
+            tree = self.fb_tree
+            rows = self.fb_accounts
+        elif self._is_fb_profile_tab():
+            tree = self.fb_profile_tree
+            rows = self.fb_profile_accounts
+        else:
+            tree = self.tree
+            rows = self.accounts
         matches = []
         for idx, row in enumerate(rows, start=1):
             email = (row.get("uid") or "").strip().lower()
@@ -850,6 +1017,28 @@ class App:
             self._apply_profile_status_tag(item_id, status)
             try:
                 self.profile_tree.see(item_id)
+            except Exception:
+                pass
+
+        self.root.after(0, _update)
+
+    def _set_fb_status(self, item_id: str, status: str) -> None:
+        def _update():
+            self.fb_tree.set(item_id, "status", status)
+            self._apply_fb_status_tag(item_id, status)
+            try:
+                self.fb_tree.see(item_id)
+            except Exception:
+                pass
+
+        self.root.after(0, _update)
+
+    def _set_fb_profile_status(self, item_id: str, status: str) -> None:
+        def _update():
+            self.fb_profile_tree.set(item_id, "status", status)
+            self._apply_fb_profile_status_tag(item_id, status)
+            try:
+                self.fb_profile_tree.see(item_id)
             except Exception:
                 pass
 
@@ -1049,6 +1238,24 @@ class App:
         else:
             self.profile_tree.item(item_id, tags=())
 
+    def _apply_fb_status_tag(self, item_id: str, status: str) -> None:
+        status_upper = (status or "").upper()
+        if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
+            self.fb_tree.item(item_id, tags=("status_err",))
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE"]):
+            self.fb_tree.item(item_id, tags=("status_ok",))
+        else:
+            self.fb_tree.item(item_id, tags=())
+
+    def _apply_fb_profile_status_tag(self, item_id: str, status: str) -> None:
+        status_upper = (status or "").upper()
+        if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
+            self.fb_profile_tree.item(item_id, tags=("status_err",))
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "UPDATED"]):
+            self.fb_profile_tree.item(item_id, tags=("status_ok",))
+        else:
+            self.fb_profile_tree.item(item_id, tags=())
+
     def _clear_status_tags(self) -> None:
         try:
             for iid in self.tree.get_children():
@@ -1215,13 +1422,19 @@ class App:
 
     def _select_all_accounts(self) -> None:
         """Select all accounts (mark all as checked)"""
+        count = 0
         for item_id in self.tree.get_children():
             self.tree.set(item_id, "chk", "v")
+            count += 1
+        self._log(f"[SELECT] UPLOAD select all ({count})")
 
     def _deselect_all_accounts(self) -> None:
         """Deselect all accounts (unmark all)"""
+        count = 0
         for item_id in self.tree.get_children():
             self.tree.set(item_id, "chk", "")
+            count += 1
+        self._log(f"[SELECT] UPLOAD deselect all ({count})")
 
     def _set_checked_selected(self, checked: bool) -> None:
         mark = "v" if checked else ""
@@ -1272,6 +1485,22 @@ class App:
             elif col_name in ("pass", "proxy", "youtube"):
                 self.profile_accounts[idx][col_name] = new_value
             self._save_profile_accounts_cache()
+        elif tree == self.fb_tree:
+            if idx is None or idx >= len(self.fb_accounts):
+                return
+            if col_name == "email":
+                self.fb_accounts[idx]["uid"] = new_value
+            elif col_name in ("pass", "proxy", "facebook"):
+                self.fb_accounts[idx][col_name] = new_value
+            self._save_fb_accounts_cache()
+        elif tree == self.fb_profile_tree:
+            if idx is None or idx >= len(self.fb_profile_accounts):
+                return
+            if col_name == "email":
+                self.fb_profile_accounts[idx]["uid"] = new_value
+            elif col_name in ("pass", "proxy", "facebook"):
+                self.fb_profile_accounts[idx][col_name] = new_value
+            self._save_fb_profile_accounts_cache()
 
     def _begin_cell_edit(self, tree: ttk.Treeview, item_id: str, col_name: str) -> None:
         self._close_cell_editor(save=True)
@@ -1351,6 +1580,20 @@ class App:
         cur = self.profile_tree.set(item_id, "chk")
         self.profile_tree.set(item_id, "chk", "" if cur == "v" else "v")
 
+    def _select_all_profile_accounts(self) -> None:
+        count = 0
+        for item_id in self.profile_tree.get_children():
+            self.profile_tree.set(item_id, "chk", "v")
+            count += 1
+        self._log(f"[SELECT] PROFILE select all ({count})")
+
+    def _deselect_all_profile_accounts(self) -> None:
+        count = 0
+        for item_id in self.profile_tree.get_children():
+            self.profile_tree.set(item_id, "chk", "")
+            count += 1
+        self._log(f"[SELECT] PROFILE deselect all ({count})")
+
     def _set_checked_selected_profile(self, checked: bool) -> None:
         mark = "v" if checked else ""
         for item_id in self.profile_tree.selection():
@@ -1406,6 +1649,80 @@ class App:
                 self.profile_tree.selection_set(row)
             self._profile_context_item = row
             self.profile_menu.tk_popup(event.x_root, event.y_root)
+
+    def _toggle_checked_fb(self, item_id: str) -> None:
+        cur = self.fb_tree.set(item_id, "chk")
+        self.fb_tree.set(item_id, "chk", "" if cur == "v" else "v")
+
+    def _select_all_fb_accounts(self) -> None:
+        count = 0
+        for item_id in self.fb_tree.get_children():
+            self.fb_tree.set(item_id, "chk", "v")
+            count += 1
+        self._log(f"[SELECT] FB select all ({count})")
+
+    def _deselect_all_fb_accounts(self) -> None:
+        count = 0
+        for item_id in self.fb_tree.get_children():
+            self.fb_tree.set(item_id, "chk", "")
+            count += 1
+        self._log(f"[SELECT] FB deselect all ({count})")
+
+    def _on_fb_tree_click(self, event) -> None:
+        region = self.fb_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.fb_tree.identify_column(event.x)
+        row = self.fb_tree.identify_row(event.y)
+        if row:
+            try:
+                col_idx = int(column[1:]) - 1
+                col_name = self.fb_tree["columns"][col_idx]
+            except Exception:
+                col_name = ""
+            if col_name in {"email", "pass", "proxy", "facebook"}:
+                self._begin_cell_edit(self.fb_tree, row, col_name)
+                return "break"
+        if column == "#1" and row:
+            self._toggle_checked_fb(row)
+            return "break"
+
+    def _toggle_checked_fb_profile(self, item_id: str) -> None:
+        cur = self.fb_profile_tree.set(item_id, "chk")
+        self.fb_profile_tree.set(item_id, "chk", "" if cur == "v" else "v")
+
+    def _select_all_fb_profile_accounts(self) -> None:
+        count = 0
+        for item_id in self.fb_profile_tree.get_children():
+            self.fb_profile_tree.set(item_id, "chk", "v")
+            count += 1
+        self._log(f"[SELECT] FB PROFILE select all ({count})")
+
+    def _deselect_all_fb_profile_accounts(self) -> None:
+        count = 0
+        for item_id in self.fb_profile_tree.get_children():
+            self.fb_profile_tree.set(item_id, "chk", "")
+            count += 1
+        self._log(f"[SELECT] FB PROFILE deselect all ({count})")
+
+    def _on_fb_profile_tree_click(self, event) -> None:
+        region = self.fb_profile_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.fb_profile_tree.identify_column(event.x)
+        row = self.fb_profile_tree.identify_row(event.y)
+        if row:
+            try:
+                col_idx = int(column[1:]) - 1
+                col_name = self.fb_profile_tree["columns"][col_idx]
+            except Exception:
+                col_name = ""
+            if col_name in {"email", "pass", "proxy", "facebook"}:
+                self._begin_cell_edit(self.fb_profile_tree, row, col_name)
+                return "break"
+        if column == "#1" and row:
+            self._toggle_checked_fb_profile(row)
+            return "break"
 
     def _get_selected_accounts(self):
         items = []
@@ -1598,9 +1915,49 @@ class App:
         except Exception:
             pass
 
+    def _load_fb_accounts_cache(self) -> list:
+        if not os.path.exists(self._fb_accounts_file):
+            return []
+        try:
+            with open(self._fb_accounts_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            return []
+        return []
+
+    def _save_fb_accounts_cache(self) -> None:
+        try:
+            with open(self._fb_accounts_file, "w", encoding="utf-8") as f:
+                json.dump(self.fb_accounts, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _load_fb_profile_accounts_cache(self) -> list:
+        if not os.path.exists(self._fb_profile_accounts_file):
+            return []
+        try:
+            with open(self._fb_profile_accounts_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            return []
+        return []
+
+    def _save_fb_profile_accounts_cache(self) -> None:
+        try:
+            with open(self._fb_profile_accounts_file, "w", encoding="utf-8") as f:
+                json.dump(self.fb_profile_accounts, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
     def _on_close(self) -> None:
         self._save_accounts_cache()
         self._save_profile_accounts_cache()
+        self._save_fb_accounts_cache()
+        self._save_fb_profile_accounts_cache()
         # Print error summary before closing
         self.error_logger.print_error_summary()
         try:
@@ -1609,6 +1966,15 @@ class App:
             pass
 
     def import_accounts(self) -> None:
+        if self._is_profile_tab():
+            self.import_profile_accounts()
+            return
+        if self._is_fb_tab():
+            self.import_fb_accounts()
+            return
+        if self._is_fb_profile_tab():
+            self.import_fb_profile_accounts()
+            return
         path = filedialog.askopenfilename(
             title="Import accounts",
             filetypes=[
@@ -1726,9 +2092,139 @@ class App:
         self._save_profile_accounts_cache()
         self._log(f"[IMPORT PROFILE] Loaded {len(new_accounts)} accounts")
 
+    def import_fb_accounts(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Import FB accounts",
+            filetypes=[
+                ("Excel", "*.xlsx"),
+                ("Text/CSV", "*.txt;*.csv;*.tsv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        rows = []
+        try:
+            if ext == ".xlsx":
+                try:
+                    import openpyxl  # type: ignore
+                except Exception:
+                    messagebox.showerror("Import", "Can phai cai dat openpyxl de doc file .xlsx")
+                    return
+                wb = openpyxl.load_workbook(path, read_only=True)
+                ws = wb.active
+                for row in ws.iter_rows(values_only=True):
+                    if not row:
+                        continue
+                    rows.append([str(c).strip() if c is not None else "" for c in row])
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                delimiter = "\t" if "\t" in content else ","
+                reader = csv.reader(content.splitlines(), delimiter=delimiter)
+                rows = [r for r in reader if r]
+        except Exception as e:
+            messagebox.showerror("Import", f"Loi doc file: {e}")
+            return
+
+        new_accounts = []
+        for row in rows:
+            if len(row) < 4:
+                continue
+            uid = (row[0] or "").strip()
+            pwd = (row[1] or "").strip()
+            proxy = (row[2] or "").strip()
+            fb_link = (row[3] or "").strip()
+            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy.lower() in ("proxy", "raw_proxy"):
+                continue
+            if not uid:
+                continue
+            new_accounts.append({"uid": uid, "pass": pwd, "proxy": proxy, "facebook": fb_link})
+
+        if not new_accounts:
+            messagebox.showinfo("Import", "Khong tim thay dong du lieu hop le.")
+            return
+
+        self.fb_accounts = new_accounts
+        self._load_fb_rows()
+        self._save_fb_accounts_cache()
+        self._log(f"[IMPORT FB] Loaded {len(new_accounts)} accounts")
+
+    def import_fb_profile_accounts(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Import FB profile accounts",
+            filetypes=[
+                ("Excel", "*.xlsx"),
+                ("Text/CSV", "*.txt;*.csv;*.tsv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        rows = []
+        try:
+            if ext == ".xlsx":
+                try:
+                    import openpyxl  # type: ignore
+                except Exception:
+                    messagebox.showerror("Import", "Can phai cai dat openpyxl de doc file .xlsx")
+                    return
+                wb = openpyxl.load_workbook(path, read_only=True)
+                ws = wb.active
+                for row in ws.iter_rows(values_only=True):
+                    if not row:
+                        continue
+                    rows.append([str(c).strip() if c is not None else "" for c in row])
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                delimiter = "\t" if "\t" in content else ","
+                reader = csv.reader(content.splitlines(), delimiter=delimiter)
+                rows = [r for r in reader if r]
+        except Exception as e:
+            messagebox.showerror("Import", f"Loi doc file: {e}")
+            return
+
+        new_accounts = []
+        for row in rows:
+            if len(row) < 4:
+                continue
+            uid = (row[0] or "").strip()
+            pwd = (row[1] or "").strip()
+            proxy = (row[2] or "").strip()
+            fb_link = (row[3] or "").strip()
+            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy.lower() in ("proxy", "raw_proxy"):
+                continue
+            if not uid:
+                continue
+            new_accounts.append({"uid": uid, "pass": pwd, "proxy": proxy, "facebook": fb_link})
+
+        if not new_accounts:
+            messagebox.showinfo("Import", "Khong tim thay dong du lieu hop le.")
+            return
+
+        self.fb_profile_accounts = new_accounts
+        self._load_fb_profile_rows()
+        self._save_fb_profile_accounts_cache()
+        self._log(f"[IMPORT FB PROFILE] Loaded {len(new_accounts)} accounts")
+
     def _is_profile_tab(self) -> bool:
         try:
             return self.notebook.nametowidget(self.notebook.select()) == self.tab_profile
+        except Exception:
+            return False
+
+    def _is_fb_tab(self) -> bool:
+        try:
+            return self.notebook.nametowidget(self.notebook.select()) == self.tab_fb
+        except Exception:
+            return False
+
+    def _is_fb_profile_tab(self) -> bool:
+        try:
+            return self.notebook.nametowidget(self.notebook.select()) == self.tab_fb_profile
         except Exception:
             return False
 
@@ -1817,6 +2313,36 @@ class App:
                     f.result()
                 except Exception:
                     pass
+
+    def _reset_batch_pause_state(self, lane: str) -> None:
+        key = (lane or "").upper()
+        with self._batch_pause_lock:
+            self._batch_pause_state[key] = {"started": 0, "release_at": 0.0}
+
+    def _wait_batch_pause_if_needed(self, lane: str) -> bool:
+        if PROFILE_BATCH_SIZE <= 0 or PROFILE_BATCH_PAUSE_SEC <= 0:
+            return True
+
+        key = (lane or "").upper()
+        with self._batch_pause_lock:
+            state = self._batch_pause_state.setdefault(key, {"started": 0, "release_at": 0.0})
+            state["started"] += 1
+            started = state["started"]
+            if started > 1 and (started - 1) % PROFILE_BATCH_SIZE == 0:
+                now = time.time()
+                state["release_at"] = max(now, state["release_at"]) + PROFILE_BATCH_PAUSE_SEC
+                self._log(
+                    f"[{key} BATCH] Reached {started - 1} profiles, pause {PROFILE_BATCH_PAUSE_SEC}s"
+                )
+            release_at = state["release_at"]
+
+        while True:
+            wait_s = release_at - time.time()
+            if wait_s <= 0:
+                return not self.stop_event.is_set()
+            if self.stop_event.is_set():
+                return False
+            time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, wait_s))
 
             try:
                 self.executor.shutdown(wait=True)
@@ -1918,6 +2444,12 @@ class App:
         if self._is_profile_tab():
             self.start_profile_jobs()
             return
+        if self._is_fb_profile_tab():
+            self.start_fb_profile_jobs()
+            return
+        if self._is_fb_tab():
+            self.start_fb_jobs()
+            return
         if self.executor is not None:
             return
         if self._repeat_after_id:
@@ -1935,6 +2467,7 @@ class App:
             return
 
         self.stop_event.clear()
+        self._reset_batch_pause_state("YTB")
         self._clear_status_tags()
         self._retry_round = 0
         # Clear failed accounts list at start of new cycle
@@ -2076,6 +2609,7 @@ class App:
 
         # Clear executor state
         self.stop_event.clear()
+        self._reset_batch_pause_state("YTB")
         self._clear_status_tags()
         self._retry_round = 0
         with self.failed_accounts_lock:
@@ -2187,6 +2721,12 @@ class App:
         threading.Thread(target=_repeat_waiter, daemon=True).start()
 
     def start_scan(self) -> None:
+        if self._is_fb_profile_tab():
+            self._log("[FB PROFILE] Khong co scan o tab nay.")
+            return
+        if self._is_fb_tab():
+            self.start_fb_scan()
+            return
         if self.executor is not None:
             return
 
@@ -2240,6 +2780,673 @@ class App:
         )
         self._set_status(item_id, f"SCAN OK ({added})")
         self._log(f"[{acc['uid']}] SCAN OK: added {added}, total {total}")
+
+    def start_fb_scan(self) -> None:
+        if self.executor is not None:
+            return
+        try:
+            max_threads = int(self.entry_threads.get())
+            if max_threads <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Loi", "So luong phai > 0")
+            return
+
+        checked_items = [iid for iid in self.fb_tree.get_children() if self.fb_tree.set(iid, "chk") == "v"]
+        if not checked_items:
+            messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
+            return
+
+        self.stop_event.clear()
+        selected = []
+        email_to_item = {}
+        for idx, acc in enumerate(self.fb_accounts, start=1):
+            item_id = str(idx)
+            if item_id not in checked_items:
+                continue
+            selected.append(acc)
+            email = (acc.get("uid") or "").strip()
+            if email:
+                email_to_item[email] = item_id
+                self._set_fb_status(item_id, "QUEUED")
+
+        def _on_status(email: str, status: str) -> None:
+            item_id = email_to_item.get((email or "").strip())
+            if not item_id:
+                return
+            self._set_fb_status(item_id, status)
+
+        def _runner():
+            scan_facebook_reels_multi(
+                selected,
+                stop_check=lambda: self.stop_event.is_set(),
+                logger=self._log,
+                cookie_file=os.path.join(_THIS_DIR, "cookiefb.txt"),
+                max_workers=2,
+                on_status=_on_status,
+            )
+
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        fut = self.executor.submit(_runner)
+
+        def _waiter():
+            try:
+                fut.result()
+            except Exception as e:
+                self._log(f"[FB SCAN] ERR: {e}")
+            finally:
+                try:
+                    self.executor.shutdown(wait=False)
+                except Exception:
+                    pass
+                self.executor = None
+
+        threading.Thread(target=_waiter, daemon=True).start()
+
+    def _fb_scan_worker(self, item_id: str, acc: dict) -> None:
+        if self.stop_event.is_set():
+            return
+        reels_url = (acc.get("facebook") or "").strip()
+        if not reels_url:
+            self._log(f"[{acc['uid']}] FB SCAN SKIP: No reels URL")
+            return
+        self._set_fb_status(item_id, "SCAN...")
+        self._log(f"[{acc['uid']}] FB SCAN START")
+        total, added = scan_facebook_reels_for_email(
+            acc["uid"],
+            reels_url,
+            lambda: self.stop_event.is_set(),
+            self._log,
+            cookie_file=os.path.join(_THIS_DIR, "cookiefb.txt"),
+        )
+        self._set_fb_status(item_id, f"SCAN OK ({added})")
+        self._log(f"[{acc['uid']}] FB SCAN OK: added {added}, total {total}")
+
+    def start_fb_profile_jobs(self) -> None:
+        if self.executor is not None:
+            return
+        try:
+            max_threads = int(self.entry_threads.get())
+            if max_threads <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Loi", "So luong phai > 0")
+            return
+
+        checked_items = [iid for iid in self.fb_profile_tree.get_children() if self.fb_profile_tree.set(iid, "chk") == "v"]
+        if not checked_items:
+            messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
+            return
+
+        self.stop_event.clear()
+        self.executor = ThreadPoolExecutor(max_workers=max_threads)
+        self.profile_semaphore = threading.BoundedSemaphore(max_threads)
+
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            screen_w, screen_h = 1920, 1080
+        gap = 6
+        taskbar_h = 40
+        usable_w = screen_w - (gap * 2)
+        usable_h = (screen_h - taskbar_h) - (gap * 2)
+        active_count = len(checked_items)
+        cols = min(5, active_count)
+        rows_layout = min(2, max(1, math.ceil(active_count / cols)))
+        win_w = int((usable_w - gap * (cols - 1)) / cols)
+        win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+        win_w = max(150, min(280, win_w))
+        win_h = max(420, min(600, win_h))
+
+        futures = []
+        slot_idx = 0
+        max_slots = cols * rows_layout
+        for idx, acc in enumerate(self.fb_profile_accounts, start=1):
+            item_id = str(idx)
+            if item_id not in checked_items:
+                continue
+            pos = slot_idx % max_slots
+            col = pos % cols
+            row = pos // cols
+            x = gap + col * (win_w + gap)
+            y = gap + row * (win_h + gap)
+            win_pos = f"{x},{y}"
+            win_size = f"{win_w},{win_h}"
+            futures.append(self.executor.submit(self._fb_profile_worker, item_id, acc, win_pos, win_size))
+            slot_idx += 1
+
+        def _waiter():
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+            self.executor = None
+
+        threading.Thread(target=_waiter, daemon=True).start()
+
+    def _fb_profile_worker(self, item_id: str, acc: dict, win_pos: str, win_size: str) -> None:
+        sem = self.profile_semaphore
+        if sem:
+            sem.acquire()
+        if self.stop_event.is_set():
+            if sem:
+                sem.release()
+            return
+        profile_id = None
+        try:
+            fb_url = (acc.get("facebook") or "").strip()
+            if not fb_url:
+                self._set_fb_profile_status(item_id, "FB LINK ERR")
+                return
+
+            self._set_fb_profile_status(item_id, "CREATE...")
+            ok_c = False
+            data_c = {}
+            msg_c = ""
+            with self.create_lock:
+                for attempt in range(3):
+                    ok_c, data_c, msg_c = create_profile(acc["uid"], acc["proxy"], SCOOPZ_URL)
+                    if ok_c:
+                        break
+                    self._set_fb_profile_status(item_id, f"CREATE RETRY {attempt+1}/3")
+                    time.sleep(3 + attempt)
+            if not ok_c:
+                self._set_fb_profile_status(item_id, f"CREATE ERR: {msg_c}")
+                return
+
+            if isinstance(data_c, dict):
+                profile_id = (data_c.get("data") or {}).get("id") or data_c.get("id") or data_c.get("profile_id")
+            if not profile_id:
+                self._set_fb_profile_status(item_id, "NO PROFILE ID")
+                return
+            self._remember_profile_path(profile_id, data_c)
+            self.created_profiles.add(profile_id)
+
+            self._set_fb_profile_status(item_id, "START...")
+            ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
+            if not ok_s:
+                self._set_fb_profile_status(item_id, f"START ERR: {msg_s}")
+                return
+            driver_path, remote = extract_driver_info(data_s)
+            if not (driver_path and remote):
+                self._set_fb_profile_status(item_id, "STARTED (no debug)")
+                return
+
+            self._set_fb_profile_status(item_id, "LOGIN...")
+            ok_login, err_login = login_scoopz(
+                driver_path,
+                remote,
+                acc["uid"],
+                acc["pass"],
+                "",
+                max_retries=3,
+                keep_browser=True,
+            )
+            if not ok_login:
+                self._set_fb_profile_status(item_id, self._format_login_error(err_login))
+                return
+            if self.stop_event.is_set():
+                return
+
+            self._set_fb_profile_status(item_id, "LOGIN OK")
+            self._set_fb_profile_status(item_id, "FB FETCH...")
+            fb_name, fb_username, avatar_path = fetch_facebook_profile_assets_local(fb_url, self._log)
+            if not (fb_name and fb_username and avatar_path and os.path.exists(avatar_path)):
+                self._set_fb_profile_status(item_id, "FB FETCH ERR")
+                return
+            self._save_profile_assets(acc["uid"], fb_name, fb_username, avatar_path)
+
+            self._set_fb_profile_status(item_id, "OPEN PROFILE...")
+            self._set_fb_profile_status(item_id, "WAIT UPDATE...")
+            ok_pf = False
+            err_pf = ""
+            with self.profile_update_lock:
+                for attempt in range(1, 4):
+                    if self.stop_event.is_set():
+                        return
+                    self._set_fb_profile_status(item_id, f"OPEN PROFILE... ({attempt}/3)")
+                    ok_pf, err_pf = open_profile_in_scoopz(
+                        driver_path,
+                        remote,
+                        avatar_path,
+                        fb_name,
+                        fb_username,
+                        logger=self._log,
+                        max_retries=3,
+                    )
+                    if ok_pf:
+                        break
+                    retryable = (
+                        "cannot connect to chrome" in (err_pf or "").lower()
+                        or "profile link not found" in (err_pf or "").lower()
+                        or "profile page load timeout" in (err_pf or "").lower()
+                        or "dialog busy" in (err_pf or "").lower()
+                    )
+                    if not retryable:
+                        break
+                    wait_s = 2 + attempt * 2
+                    self._log(f"[{acc['uid']}] FB PROFILE RETRY {attempt}/3 in {wait_s}s: {err_pf}")
+                    time.sleep(wait_s)
+            if not ok_pf:
+                self._set_fb_profile_status(item_id, f"PROFILE ERR: {err_pf}")
+                return
+            self._set_fb_profile_status(item_id, "PROFILE OPENED")
+            self._set_fb_profile_status(item_id, "DONE")
+        finally:
+            if sem:
+                try:
+                    sem.release()
+                except Exception:
+                    pass
+            try:
+                if profile_id:
+                    close_profile(profile_id, 3)
+                    delete_profile(profile_id, 10)
+            except Exception:
+                pass
+            try:
+                if profile_id:
+                    self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            if profile_id:
+                self._delete_profile_path(profile_id)
+                self._track_profile_cleanup()
+
+    def start_fb_jobs(self) -> None:
+        if self.executor is not None:
+            return
+        try:
+            max_threads = int(self.entry_threads.get())
+            if max_threads <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Loi", "So luong phai > 0")
+            return
+        try:
+            max_videos = int(self.entry_videos.get())
+            if max_videos <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Loi", "Videos phai > 0")
+            return
+
+        checked_items = [iid for iid in self.fb_tree.get_children() if self.fb_tree.set(iid, "chk") == "v"]
+        if not checked_items:
+            messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
+            return
+
+        self.stop_event.clear()
+        self._reset_batch_pause_state("FB")
+        self._retry_round = 0
+        with self.failed_accounts_lock:
+            self.failed_accounts = []
+        self.executor = ThreadPoolExecutor(max_workers=max_threads)
+        self.login_semaphore = threading.BoundedSemaphore(max_threads)
+        self.upload_retry_semaphore = threading.BoundedSemaphore(max_threads)
+
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            screen_w, screen_h = 1920, 1080
+
+        gap = 6
+        taskbar_h = 40
+        usable_w = screen_w - (gap * 2)
+        usable_h = (screen_h - taskbar_h) - (gap * 2)
+        active_count = len(checked_items)
+        cols = min(5, active_count)
+        rows_layout = min(2, max(1, math.ceil(active_count / cols)))
+        win_w = int((usable_w - gap * (cols - 1)) / cols)
+        win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+        win_w = max(150, min(280, win_w))
+        win_h = max(420, min(600, win_h))
+
+        futures = []
+        slot_idx = 0
+        max_slots = cols * rows_layout
+        for idx, acc in enumerate(self.fb_accounts, start=1):
+            item_id = str(idx)
+            if item_id not in checked_items:
+                continue
+            self._bind_item_email(item_id, acc.get("uid", ""))
+            pos = slot_idx % max_slots
+            col = pos % cols
+            row = pos // cols
+            x = gap + col * (win_w + gap)
+            y = gap + row * (win_h + gap)
+            win_pos = f"{x},{y}"
+            win_size = f"{win_w},{win_h}"
+            futures.append(self.executor.submit(self._fb_worker_one, item_id, acc, win_pos, win_size, max_videos))
+            slot_idx += 1
+
+        def _waiter():
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+            self.executor = None
+            with self.failed_accounts_lock:
+                failed_list = self.failed_accounts.copy()
+                self.failed_accounts = []
+            if failed_list and not self.stop_event.is_set():
+                if self._retry_round < 3:
+                    self._retry_round += 1
+                    self._log(f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
+                    self.root.after(
+                        1000,
+                        lambda fl=failed_list: self._retry_failed_fb_accounts(fl, max_threads, max_videos),
+                    )
+                    return
+                self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+            self._clear_failed_log()
+
+        threading.Thread(target=_waiter, daemon=True).start()
+
+    def _retry_failed_fb_accounts(self, failed_accounts: list, max_threads: int, max_videos: int) -> None:
+        if self.stop_event.is_set():
+            return
+
+        self._log(f"[FB RETRY] Retrying {len(failed_accounts)} failed accounts...")
+        try:
+            for item_id, _acc in failed_accounts:
+                self._set_fb_status(item_id, f"RETRY {self._retry_round}/3")
+        except Exception:
+            pass
+
+        self.executor = ThreadPoolExecutor(max_workers=max_threads)
+        futures = []
+
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            screen_w, screen_h = 1920, 1080
+        gap = 6
+        taskbar_h = 40
+        usable_w = screen_w - (gap * 2)
+        usable_h = (screen_h - taskbar_h) - (gap * 2)
+        active_count = len(failed_accounts)
+        cols = min(5, active_count)
+        rows_layout = max(1, (active_count + cols - 1) // cols)
+        win_w = int((usable_w - gap * (cols - 1)) / cols)
+        win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+        win_w = max(150, min(280, win_w))
+        win_h = max(420, min(600, win_h))
+
+        for idx, (item_id, acc) in enumerate(failed_accounts):
+            if self.stop_event.is_set():
+                break
+            self._bind_item_email(item_id, acc.get("uid", ""))
+            pos = idx % (cols * rows_layout)
+            col = pos % cols
+            row = pos // cols
+            x = gap + col * (win_w + gap)
+            y = gap + row * (win_h + gap)
+            retry_win_pos = f"{x},{y}"
+            retry_win_size = f"{win_w},{win_h}"
+            futures.append(self.executor.submit(self._fb_worker_one, item_id, acc, retry_win_pos, retry_win_size, max_videos))
+
+        def _retry_waiter():
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+            self.executor = None
+            with self.failed_accounts_lock:
+                failed_list = self.failed_accounts.copy()
+                self.failed_accounts = []
+            if failed_list and not self.stop_event.is_set():
+                if self._retry_round < 3:
+                    self._retry_round += 1
+                    self._log(
+                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)..."
+                    )
+                    self.root.after(
+                        1000,
+                        lambda fl=failed_list: self._retry_failed_fb_accounts(fl, max_threads, max_videos),
+                    )
+                    return
+                self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+            self._clear_failed_log()
+
+        threading.Thread(target=_retry_waiter, daemon=True).start()
+
+    def _fb_worker_one(self, item_id: str, acc: dict, win_pos: str, win_size: str, max_videos: int) -> None:
+        if self.stop_event.is_set():
+            return
+        if not self._wait_batch_pause_if_needed("FB"):
+            return
+        profile_id = None
+        max_file_size_bytes = 100 * 1024 * 1024
+
+        def _extract_fb_video_id(text: str) -> str:
+            val = (text or "").strip()
+            if not val:
+                return ""
+            m = re.search(r"/reel/(\d+)", val)
+            if m:
+                return m.group(1)
+            return ""
+
+        self._log(f"[{acc['uid']}] FB START")
+        self._set_fb_status(item_id, "CREATE...")
+        ok_c = False
+        data_c = {}
+        msg_c = ""
+        with self.create_lock:
+            for attempt in range(3):
+                ok_c, data_c, msg_c = create_profile(acc["uid"], acc["proxy"], SCOOPZ_URL)
+                if ok_c:
+                    break
+                wait_s = 5 + attempt * 3
+                self._set_fb_status(item_id, f"CREATE RETRY {attempt+1}/3")
+                self._log(f"[{acc['uid']}] CREATE ERR: {msg_c} | retry in {wait_s}s")
+                time.sleep(wait_s)
+        if not ok_c:
+            self._set_fb_status(item_id, f"CREATE ERR: {msg_c}")
+            self._record_failed(item_id, acc, f"CREATE ERR: {msg_c}")
+            return
+
+        profile_id = None
+        if isinstance(data_c, dict):
+            profile_id = (data_c.get("data") or {}).get("id") or data_c.get("id") or data_c.get("profile_id")
+        if not profile_id:
+            self._set_fb_status(item_id, "NO PROFILE ID")
+            self._record_failed(item_id, acc, "NO PROFILE ID")
+            return
+        self._remember_profile_path(profile_id, data_c)
+        self.created_profiles.add(profile_id)
+
+        self._set_fb_status(item_id, "START...")
+        ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
+        if not ok_s:
+            self._set_fb_status(item_id, f"START ERR: {msg_s}")
+            self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+            return
+
+        with self.active_lock:
+            self.active_profiles[item_id] = profile_id
+        driver_path, remote = extract_driver_info(data_s)
+        status = "STARTED" if driver_path and remote else "STARTED (no debug)"
+        self._set_fb_status(item_id, status)
+
+        if not (driver_path and remote):
+            self._record_failed(item_id, acc, "STARTED (no debug)")
+            return
+
+        self._set_fb_status(item_id, "LOGIN...")
+        ok_login, err_login = login_scoopz(
+            driver_path,
+            remote,
+            acc["uid"],
+            acc["pass"],
+            "",
+            max_retries=3,
+            keep_browser=True,
+        )
+        if not ok_login:
+            status = self._format_login_error(err_login)
+            self._set_fb_status(item_id, status)
+            self._record_failed(item_id, acc, status)
+            return
+
+        self._set_fb_status(item_id, "LOGIN OK")
+        success_count = 0
+        safety_guard = 0
+        while success_count < max_videos:
+            if self.stop_event.is_set():
+                break
+            safety_guard += 1
+            if safety_guard > max_videos * 5:
+                break
+
+            self.operation_delayer.delay_before_download(acc["uid"], self._log_progress)
+            ok_next, row = get_next_unuploaded(acc["uid"])
+            if not ok_next:
+                self._set_fb_status(item_id, "HẾT VIDEO")
+                break
+            row_url = (row.get("url") or "").strip()
+            row_id = (row.get("video_id") or "").strip()
+            if not row_url:
+                if row_id.startswith("http"):
+                    row_url = row_id
+                elif row_id:
+                    row_url = f"https://www.facebook.com/reel/{row_id}"
+            if not row_url:
+                break
+
+            self._set_fb_status(item_id, f"DOWNLOAD {success_count+1}/{max_videos}...")
+            ok_dl, path_or_err, vid_id, title = download_one_facebook(
+                acc["uid"],
+                row_url,
+                self._log_progress,
+                cookie_path=os.path.join(_THIS_DIR, "cookiefb.txt"),
+                timeout_s=300,
+            )
+            mark_id = vid_id or row_id or _extract_fb_video_id(row_url)
+            if not ok_dl:
+                err_text = str(path_or_err)
+                lower = err_text.lower()
+                if "video skipped" in lower or "private" in lower or "isn't available" in lower:
+                    try:
+                        mark_uploaded(acc["uid"], mark_id)
+                    except Exception:
+                        pass
+                    continue
+                self._set_fb_status(item_id, f"DOWNLOAD ERR: {err_text}")
+                self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
+                break
+
+            if vid_id and title:
+                try:
+                    update_title_if_empty(acc["uid"], vid_id, title)
+                except Exception:
+                    pass
+            try:
+                if os.path.exists(path_or_err):
+                    file_size = os.path.getsize(path_or_err)
+                    if file_size > max_file_size_bytes:
+                        self._log(
+                            f"[{acc['uid']}] SKIP BIG FILE: {file_size / (1024 * 1024):.1f}MB > 100MB"
+                        )
+                        try:
+                            mark_uploaded(acc["uid"], mark_id)
+                        except Exception:
+                            pass
+                        self._delete_uploaded_video(path_or_err, acc["uid"])
+                        continue
+            except Exception:
+                pass
+            caption = title or ""
+            self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
+            with self.upload_retry_semaphore:
+                ok_p = False
+                drv = None
+                up_status = ""
+                up_msg = ""
+                token = self._enqueue_upload_turn()
+                if not self._wait_upload_turn(token):
+                    return
+                try:
+                    for attempt in range(3):
+                        if self.stop_event.is_set():
+                            break
+                        driver_key = f"{acc['uid']}_upload"
+                        try:
+                            with self.dialog_lock_pool.acquire(driver_key, timeout=60):
+                                ok_p, drv, up_status, up_msg = upload_prepare(
+                                    driver_path,
+                                    remote,
+                                    path_or_err,
+                                    caption,
+                                    lambda: self.stop_event.is_set(),
+                                    self._log,
+                                    acc.get("uid", ""),
+                                    max_total_s=360,
+                                    file_dialog_semaphore=self.file_dialog_semaphore,
+                                )
+                        except Exception as e:
+                            up_msg = f"Lock timeout: {e}"
+                        if ok_p:
+                            break
+                        if up_status in ("dialog_lock_timeout", "caption_error", "dialog_error", "timeout", "unexpected_error", "error") and attempt < 2:
+                            time.sleep(2 + attempt)
+                            continue
+                        break
+                finally:
+                    self._release_upload_turn(token)
+
+            if not ok_p:
+                self._set_fb_status(item_id, f"UPLOAD ERR: {up_msg or up_status}")
+                self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
+                break
+
+            self._set_fb_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
+            st, msg, _purl, _foll = upload_post_async(
+                drv,
+                self._log,
+                max_total_s=180,
+                post_button_semaphore=self.post_button_semaphore,
+            )
+            if st == "success":
+                try:
+                    mark_uploaded(acc["uid"], mark_id)
+                except Exception:
+                    pass
+                self._set_fb_status(item_id, "UPLOAD OK")
+                self._delete_uploaded_video(path_or_err, acc["uid"])
+                success_count += 1
+            else:
+                err_text = msg or st
+                self._set_fb_status(item_id, f"UPLOAD ERR: {err_text}")
+                self._record_failed(item_id, acc, f"UPLOAD ERR: {err_text}")
+                break
+
+        try:
+            if profile_id:
+                close_profile(profile_id, 3)
+                delete_profile(profile_id, 10)
+        except Exception:
+            pass
+        try:
+            if profile_id:
+                self.created_profiles.discard(profile_id)
+        except Exception:
+            pass
+        if profile_id:
+            self._delete_profile_path(profile_id)
+            self._track_profile_cleanup()
+        try:
+            with self.active_lock:
+                self.active_profiles.pop(item_id, None)
+        except Exception:
+            pass
 
     def _retry_failed_accounts(self, failed_accounts: list, max_threads: int, max_videos: int) -> None:
         """Retry failed accounts with new threads"""
@@ -3064,6 +4271,8 @@ class App:
 
     def stop_jobs(self) -> None:
         self.stop_event.set()
+        self._reset_batch_pause_state("YTB")
+        self._reset_batch_pause_state("FB")
         if self._repeat_after_id:
             try:
                 self.root.after_cancel(self._repeat_after_id)
@@ -3137,6 +4346,8 @@ class App:
 
     def _worker_one(self, item_id: str, acc: dict, win_pos: str, win_size: str, max_videos: int) -> None:
         if self.stop_event.is_set():
+            return
+        if not self._wait_batch_pause_if_needed("YTB"):
             return
 
         def _restart_profile() -> tuple:

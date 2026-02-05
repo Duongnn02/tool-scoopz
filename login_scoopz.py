@@ -768,6 +768,15 @@ def open_profile_in_scoopz(
                 if value and value not in candidates:
                     candidates.append(value)
 
+            nick_words = [w for w in re.split(r"\s+", (nickname or "").strip()) if w]
+            if len(nick_words) >= 3:
+                nick_base = _sanitize_username("".join(nick_words)).replace("_", "")
+                if len(nick_base) >= 7:
+                    _add_candidate(nick_base[:6] + "1")
+                else:
+                    padded = (nick_base + "1" + "useruser")[:7]
+                    _add_candidate(padded)
+
             _add_candidate(user_base)
             _add_candidate(user_base.replace("_", ""))
             if len(user_base) > 12:
