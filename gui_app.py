@@ -402,6 +402,7 @@ class App:
         self.fb_tree.bind("<Button-1>", self._on_fb_tree_click)
         self.fb_tree.bind("<B1-Motion>", self._on_fb_tree_drag)
         self.fb_tree.bind("<ButtonRelease-1>", self._on_fb_tree_release)
+        self.fb_tree.bind("<Button-3>", self._on_fb_tree_right_click)
 
         fb_profile_table = ttk.Frame(self.tab_fb_profile)
         fb_profile_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -447,6 +448,7 @@ class App:
         self.fb_profile_tree.bind("<Button-1>", self._on_fb_profile_tree_click)
         self.fb_profile_tree.bind("<B1-Motion>", self._on_fb_profile_tree_drag)
         self.fb_profile_tree.bind("<ButtonRelease-1>", self._on_fb_profile_tree_release)
+        self.fb_profile_tree.bind("<Button-3>", self._on_fb_profile_tree_right_click)
 
         interact_top = ttk.Frame(self.tab_interact)
         interact_top.pack(fill="x", padx=8, pady=(8, 0))
@@ -486,6 +488,8 @@ class App:
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected(True))
         self.menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected(False))
+        self.menu.add_command(label="Tick all", command=self._select_all_accounts)
+        self.menu.add_command(label="Untick all", command=self._deselect_all_accounts)
         self.menu.add_separator()
         self.menu.add_command(label="Login selected", command=self.menu_login_selected)
         self.menu.add_command(label="Upload selected", command=self.menu_upload_selected)
@@ -494,8 +498,22 @@ class App:
         self.profile_menu = tk.Menu(self.root, tearoff=0)
         self.profile_menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected_profile(True))
         self.profile_menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected_profile(False))
+        self.profile_menu.add_command(label="Tick all", command=self._select_all_profile_accounts)
+        self.profile_menu.add_command(label="Untick all", command=self._deselect_all_profile_accounts)
         self.profile_menu.add_separator()
         self.profile_menu.add_command(label="Open YouTube", command=self.menu_profile_selected)
+
+        self.fb_menu = tk.Menu(self.root, tearoff=0)
+        self.fb_menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected_fb(True))
+        self.fb_menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected_fb(False))
+        self.fb_menu.add_command(label="Tick all", command=self._select_all_fb_accounts)
+        self.fb_menu.add_command(label="Untick all", command=self._deselect_all_fb_accounts)
+
+        self.fb_profile_menu = tk.Menu(self.root, tearoff=0)
+        self.fb_profile_menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected_fb_profile(True))
+        self.fb_profile_menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected_fb_profile(False))
+        self.fb_profile_menu.add_command(label="Tick all", command=self._select_all_fb_profile_accounts)
+        self.fb_profile_menu.add_command(label="Untick all", command=self._deselect_all_fb_profile_accounts)
 
         self.log_box = tk.Text(self.root, height=6, state="disabled")
         self.log_box.pack(fill="both", expand=False, padx=8, pady=(0, 8))
@@ -1662,6 +1680,11 @@ class App:
         cur = self.fb_tree.set(item_id, "chk")
         self.fb_tree.set(item_id, "chk", "" if cur == "v" else "v")
 
+    def _set_checked_selected_fb(self, checked: bool) -> None:
+        mark = "v" if checked else ""
+        for item_id in self.fb_tree.selection():
+            self.fb_tree.set(item_id, "chk", mark)
+
     def _select_all_fb_accounts(self) -> None:
         count = 0
         for item_id in self.fb_tree.get_children():
@@ -1698,6 +1721,13 @@ class App:
             self._fb_dragging = True
             self._fb_drag_start = row
 
+    def _on_fb_tree_right_click(self, event) -> None:
+        row = self.fb_tree.identify_row(event.y)
+        if row:
+            if row not in self.fb_tree.selection():
+                self.fb_tree.selection_set(row)
+            self.fb_menu.tk_popup(event.x_root, event.y_root)
+
     def _on_fb_tree_drag(self, event) -> None:
         if not self._fb_dragging or not self._fb_drag_start:
             return
@@ -1721,6 +1751,11 @@ class App:
     def _toggle_checked_fb_profile(self, item_id: str) -> None:
         cur = self.fb_profile_tree.set(item_id, "chk")
         self.fb_profile_tree.set(item_id, "chk", "" if cur == "v" else "v")
+
+    def _set_checked_selected_fb_profile(self, checked: bool) -> None:
+        mark = "v" if checked else ""
+        for item_id in self.fb_profile_tree.selection():
+            self.fb_profile_tree.set(item_id, "chk", mark)
 
     def _select_all_fb_profile_accounts(self) -> None:
         count = 0
@@ -1757,6 +1792,13 @@ class App:
         if row:
             self._fb_profile_dragging = True
             self._fb_profile_drag_start = row
+
+    def _on_fb_profile_tree_right_click(self, event) -> None:
+        row = self.fb_profile_tree.identify_row(event.y)
+        if row:
+            if row not in self.fb_profile_tree.selection():
+                self.fb_profile_tree.selection_set(row)
+            self.fb_profile_menu.tk_popup(event.x_root, event.y_root)
 
     def _on_fb_profile_tree_drag(self, event) -> None:
         if not self._fb_profile_dragging or not self._fb_profile_drag_start:
