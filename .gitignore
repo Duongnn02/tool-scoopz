@@ -10,7 +10,7 @@ accounts_under_10_follow.xlsx
 fb_accounts_cache.json
 fb_profile_accounts_cache.json
 .env
-
+extra_proxies.txt
 # Python
 __pycache__/
 *.py[cod]
