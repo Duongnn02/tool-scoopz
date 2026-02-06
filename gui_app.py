@@ -1842,6 +1842,39 @@ class App:
         except Exception:
             pass
 
+    def _force_close_all_profiles(self) -> None:
+        try:
+            with self.active_lock:
+                ids = list(self.active_profiles.values())
+                self.active_profiles.clear()
+        except Exception:
+            ids = []
+        try:
+            ids.extend(list(self.created_profiles))
+            self.created_profiles.clear()
+        except Exception:
+            pass
+        try:
+            ids.extend(list(self.profile_created_profiles))
+            self.profile_created_profiles.clear()
+        except Exception:
+            pass
+        ids = list({pid for pid in ids if pid})
+        for pid in ids:
+            try:
+                close_profile(pid, 3)
+                delete_profile(pid, 10)
+            except Exception:
+                pass
+            try:
+                self._delete_profile_path(pid)
+            except Exception:
+                pass
+        try:
+            self._cleanup_gpm_root(force=True)
+        except Exception:
+            pass
+
     def _reset_statuses(self, tree: ttk.Treeview, accounts: list, ready_text: str = "READY") -> None:
         try:
             for acc in accounts:
@@ -2976,6 +3009,7 @@ class App:
     def start_profile_jobs(self) -> None:
         if self._profile_batch_running or self.executor is not None:
             return
+        self._force_close_all_profiles()
         self._reset_all_statuses()
         self._clear_all_logs()
         if self._repeat_after_id:
@@ -3226,6 +3260,7 @@ class App:
             return
         if self.executor is not None:
             return
+        self._force_close_all_profiles()
         self._reset_all_statuses()
         self._clear_all_logs()
         if self._repeat_after_id:
@@ -3679,6 +3714,7 @@ class App:
     def start_fb_profile_jobs(self) -> None:
         if self.executor is not None:
             return
+        self._force_close_all_profiles()
         self._reset_all_statuses()
         self._clear_all_logs()
         try:
@@ -3923,6 +3959,7 @@ class App:
     def start_fb_jobs(self) -> None:
         if self.executor is not None:
             return
+        self._force_close_all_profiles()
         self._reset_all_statuses()
         self._clear_all_logs()
         try:
