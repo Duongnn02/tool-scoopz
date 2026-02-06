@@ -1455,7 +1455,20 @@ class App:
                 return -1
 
         try:
-            self.accounts.sort(key=lambda acc: _to_num(acc.get("followers")), reverse=descending)
+            email_to_followers = {}
+            for iid in self.tree.get_children():
+                email = (self.tree.set(iid, "email") or "").strip()
+                if not email:
+                    continue
+                email_to_followers[email] = _to_num(self.tree.set(iid, "followers"))
+
+            def _followers_for(acc: dict) -> int:
+                email = (acc.get("uid") or "").strip()
+                if email in email_to_followers:
+                    return email_to_followers[email]
+                return _to_num(acc.get("followers"))
+
+            self.accounts.sort(key=_followers_for, reverse=descending)
             self._rebuild_tree_from_accounts()
             self._save_accounts_cache()
         except Exception:
