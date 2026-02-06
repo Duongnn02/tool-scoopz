@@ -1567,6 +1567,10 @@ class App:
             items.sort(key=lambda iid: _to_num(tree.set(iid, col)), reverse=descending)
             for idx, iid in enumerate(items):
                 tree.move(iid, "", idx)
+                try:
+                    tree.set(iid, "stt", str(idx + 1))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1835,6 +1839,32 @@ class App:
         try:
             for iid in self.tree.get_children():
                 self.tree.item(iid, tags=())
+        except Exception:
+            pass
+
+    def _reset_statuses(self, tree: ttk.Treeview, accounts: list, ready_text: str = "READY") -> None:
+        try:
+            for acc in accounts:
+                acc["status"] = ready_text
+        except Exception:
+            pass
+        try:
+            for iid in tree.get_children():
+                tree.set(iid, "status", ready_text)
+                tree.item(iid, tags=())
+        except Exception:
+            pass
+
+    def _reset_all_statuses(self) -> None:
+        self._reset_statuses(self.tree, self.accounts, "READY")
+        self._reset_statuses(self.profile_tree, self.profile_accounts, "READY")
+        self._reset_statuses(self.fb_tree, self.fb_accounts, "READY")
+        self._reset_statuses(self.fb_profile_tree, self.fb_profile_accounts, "READY")
+        try:
+            self._save_accounts_cache()
+            self._save_profile_accounts_cache()
+            self._save_fb_accounts_cache()
+            self._save_fb_profile_accounts_cache()
         except Exception:
             pass
 
@@ -2946,6 +2976,7 @@ class App:
     def start_profile_jobs(self) -> None:
         if self._profile_batch_running or self.executor is not None:
             return
+        self._reset_all_statuses()
         self._clear_all_logs()
         if self._repeat_after_id:
             try:
@@ -3195,6 +3226,7 @@ class App:
             return
         if self.executor is not None:
             return
+        self._reset_all_statuses()
         self._clear_all_logs()
         if self._repeat_after_id:
             try:
@@ -3647,6 +3679,7 @@ class App:
     def start_fb_profile_jobs(self) -> None:
         if self.executor is not None:
             return
+        self._reset_all_statuses()
         self._clear_all_logs()
         try:
             max_threads = int(self.entry_threads.get())
@@ -3890,6 +3923,7 @@ class App:
     def start_fb_jobs(self) -> None:
         if self.executor is not None:
             return
+        self._reset_all_statuses()
         self._clear_all_logs()
         try:
             max_threads = int(self.entry_threads.get())
@@ -5324,6 +5358,7 @@ class App:
 
     def reload_app(self) -> None:
         self.stop_jobs()
+        self._reset_all_statuses()
         exe = sys.executable
         script = os.path.abspath(__file__)
         try:
