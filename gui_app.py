@@ -973,6 +973,8 @@ class App:
             except Exception:
                 pass
     def _load_rows(self) -> None:
+        self.accounts = self._dedupe_accounts(self.accounts)
+        self._save_accounts_cache()
         self.tree.delete(*self.tree.get_children())
         for idx, row in enumerate(self.accounts, start=1):
             posts = row.get("posts", "")
@@ -998,6 +1000,8 @@ class App:
         self._update_counts()
 
     def _load_profile_rows(self) -> None:
+        self.profile_accounts = self._dedupe_accounts(self.profile_accounts)
+        self._save_profile_accounts_cache()
         self.profile_tree.delete(*self.profile_tree.get_children())
         for idx, row in enumerate(self.profile_accounts, start=1):
             self.profile_tree.insert(
@@ -1017,6 +1021,8 @@ class App:
         self._update_counts()
 
     def _load_fb_rows(self) -> None:
+        self.fb_accounts = self._dedupe_accounts(self.fb_accounts)
+        self._save_fb_accounts_cache()
         self.fb_tree.delete(*self.fb_tree.get_children())
         for idx, row in enumerate(self.fb_accounts, start=1):
             self.fb_tree.insert(
@@ -1036,6 +1042,8 @@ class App:
         self._update_counts()
 
     def _load_fb_profile_rows(self) -> None:
+        self.fb_profile_accounts = self._dedupe_accounts(self.fb_profile_accounts)
+        self._save_fb_profile_accounts_cache()
         self.fb_profile_tree.delete(*self.fb_profile_tree.get_children())
         for idx, row in enumerate(self.fb_profile_accounts, start=1):
             self.fb_profile_tree.insert(
@@ -1087,6 +1095,19 @@ class App:
             return len({(acc.get("uid") or "").strip() for acc in accounts if acc.get("uid")})
         except Exception:
             return len(accounts)
+
+    def _dedupe_accounts(self, accounts: list) -> list:
+        seen = set()
+        out = []
+        for acc in accounts or []:
+            uid = (acc.get("uid") or "").strip()
+            if not uid:
+                continue
+            if uid in seen:
+                continue
+            seen.add(uid)
+            out.append(acc)
+        return out
 
     def _format_total_with_run(self, label: str, total: int, kind: str) -> str:
         done = 0
@@ -1933,6 +1954,18 @@ class App:
             self.log_box.see(tk.END)
             self.log_box.configure(state="disabled")
         self.root.after(0, _append)
+
+    def _start_download_watchdog(self, email: str, label: str, interval_s: int = 30) -> threading.Event:
+        stop_evt = threading.Event()
+        start = time.time()
+
+        def _watch() -> None:
+            while not stop_evt.wait(interval_s):
+                elapsed = int(time.time() - start)
+                self._log(f"[{email}] {label} still running {elapsed}s")
+
+        threading.Thread(target=_watch, daemon=True).start()
+        return stop_evt
 
     def _clear_log_files(self) -> None:
         paths = [
@@ -4288,6 +4321,8 @@ class App:
                 path_or_err = ""
                 vid_id = ""
                 title = ""
+                download_start_ts = time.time()
+                watchdog = self._start_download_watchdog(acc["uid"], "FB DOWNLOAD")
                 while True:
                     ok_dl, path_or_err, vid_id, title = download_one_facebook(
                         acc["uid"],
@@ -4312,6 +4347,15 @@ class App:
                         skip_account = True
                         break
                     break
+                try:
+                    watchdog.set()
+                except Exception:
+                    pass
+                elapsed = int(time.time() - download_start_ts)
+                if ok_dl:
+                    self._log(f"[{acc['uid']}] FB DOWNLOAD END OK after {elapsed}s")
+                else:
+                    self._log(f"[{acc['uid']}] FB DOWNLOAD END ERR after {elapsed}s: {path_or_err}")
                 mark_id = vid_id or row_id or _extract_fb_video_id(row_url)
                 if not ok_dl:
                     err_text = str(path_or_err)
@@ -5603,6 +5647,8 @@ class App:
                         ok_dl = False
                         skip_current = False
                         skip_account = False
+                        download_start_ts = time.time()
+                        watchdog = self._start_download_watchdog(acc["uid"], "DOWNLOAD")
                         while True:
                             ok_dl, path_or_err, vid_id, title = download_one(
                                 acc["uid"],
@@ -5672,6 +5718,16 @@ class App:
                             break
     
                         mark_id = vid_id or row_id or _extract_video_id(row_url)
+                        try:
+                            watchdog.set()
+                        except Exception:
+                            pass
+                        elapsed = int(time.time() - download_start_ts)
+                        if ok_dl:
+                            self._log(f"[{acc['uid']}] DOWNLOAD END OK after {elapsed}s")
+                        else:
+                            self._log(f"[{acc['uid']}] DOWNLOAD END ERR after {elapsed}s: {path_or_err}")
+
                         if skip_account:
                             break
                         if skip_current:
