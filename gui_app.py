@@ -90,7 +90,7 @@ class App:
         
         # Initialize orchestrator with CONSERVATIVE mode
         # This coordinates all operations: login delays, sequential downloads, serial uploads
-        self.orchestrator = initialize_orchestrator("conservative", logger=self.error_logger.main_logger.info)
+        self.orchestrator = initialize_orchestrator("aggressive", logger=self.error_logger.main_logger.info)
         
         # Initialize rate limiter with conservative strategy
         initialize_rate_limiting("conservative")
