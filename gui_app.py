@@ -247,6 +247,8 @@ class App:
         self.btn_search_email = ttk.Button(top2, text="FIND", command=self._search_email)
         self.btn_search_email.pack(side="left", padx=(0, 12))
         self._sort_state = {}
+        self.btn_sort_follow_all = ttk.Button(top2, text="SORT FOLLOW ALL", command=self._toggle_followers_sort_all)
+        self.btn_sort_follow_all.pack(side="left", padx=(0, 12))
 
         self.lbl_total = ttk.Label(top2, textvariable=self._count_var)
         self.lbl_total.pack(side="left", padx=(0, 10))
@@ -1391,8 +1393,13 @@ class App:
                 "tags": self.tree.item(iid, "tags"),
             }
         self.tree.delete(*self.tree.get_children())
-        for idx, row in enumerate(self.accounts, start=1):
+        seen = set()
+        out_idx = 1
+        for row in self.accounts:
             email = row.get("uid", "")
+            if email in seen:
+                continue
+            seen.add(email)
             cached = state.get(email, {})
             posts = cached.get("posts", row.get("posts", ""))
             followers = cached.get("followers", row.get("followers", ""))
@@ -1403,10 +1410,10 @@ class App:
             self.tree.insert(
                 "",
                 "end",
-                iid=str(idx),
+                iid=str(out_idx),
                 values=(
                     chk,
-                    idx,
+                    out_idx,
                     email,
                     row.get("pass", ""),
                     row.get("proxy", ""),
@@ -1418,9 +1425,41 @@ class App:
                 ),
                 tags=tags,
             )
+            out_idx += 1
 
     def _sort_followers_desc(self) -> None:
         return
+
+    def _toggle_followers_sort_all(self) -> None:
+        state = self._sort_state.get("followers_all")
+        if state == "desc":
+            self._sort_state["followers_all"] = "asc"
+            self._sort_accounts_by_followers(descending=False)
+            return
+        self._sort_state["followers_all"] = "desc"
+        self._sort_accounts_by_followers(descending=True)
+
+    def _sort_accounts_by_followers(self, descending: bool = True) -> None:
+        def _to_num(val) -> int:
+            if val is None or val == "":
+                return -1
+            text = str(val).strip()
+            if not text:
+                return -1
+            digits = re.sub(r"[^0-9]", "", text)
+            if not digits:
+                return -1
+            try:
+                return int(digits)
+            except Exception:
+                return -1
+
+        try:
+            self.accounts.sort(key=lambda acc: _to_num(acc.get("followers")), reverse=descending)
+            self._rebuild_tree_from_accounts()
+            self._save_accounts_cache()
+        except Exception:
+            pass
 
     def _enqueue_upload_turn(self) -> int:
         with self._upload_queue_cond:
@@ -1520,6 +1559,8 @@ class App:
 
     def _reset_upload_tree_order(self) -> None:
         # Rebuild upload tree in original accounts order
+        self._sort_state["posts"] = None
+        self._sort_state["followers"] = None
         self._rebuild_tree_from_accounts()
 
     def _toggle_upload_sort(self, col: str) -> None:
