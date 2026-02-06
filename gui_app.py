@@ -156,6 +156,13 @@ class App:
         self._retry_round = 0
         self._profile_retry_round = 0
         self._profile_batch_running = False
+        self._run_counts = {
+            "upload": {"done": 0, "total": 0, "emails": set()},
+            "profile": {"done": 0, "total": 0, "emails": set()},
+            "fb": {"done": 0, "total": 0, "emails": set()},
+            "fb_profile": {"done": 0, "total": 0, "emails": set()},
+        }
+        self._run_counts_lock = threading.Lock()
         self._batch_pause_lock = threading.Lock()
         self._batch_pause_state = {
             "YTB": {"started": 0, "release_at": 0.0},
@@ -1050,21 +1057,85 @@ class App:
 
     def _update_counts(self) -> None:
         try:
-            self._count_var.set(f"Total: {len(self.accounts)}")
+            self._count_var.set(self._format_total_with_run("Total", len(self.accounts), "upload"))
         except Exception:
             pass
         try:
-            self._profile_count_var.set(f"Total Profile: {len(self.profile_accounts)}")
+            self._profile_count_var.set(
+                self._format_total_with_run("Total Profile", len(self.profile_accounts), "profile")
+            )
         except Exception:
             pass
         try:
-            self._fb_count_var.set(f"Total FB: {len(self.fb_accounts)}")
+            self._fb_count_var.set(self._format_total_with_run("Total FB", len(self.fb_accounts), "fb"))
         except Exception:
             pass
         try:
-            self._fb_profile_count_var.set(f"Total FB Profile: {len(self.fb_profile_accounts)}")
+            self._fb_profile_count_var.set(
+                self._format_total_with_run("Total FB Profile", len(self.fb_profile_accounts), "fb_profile")
+            )
         except Exception:
             pass
+
+    def _format_total_with_run(self, label: str, total: int, kind: str) -> str:
+        done = 0
+        total_run = 0
+        try:
+            with self._run_counts_lock:
+                rc = self._run_counts.get(kind) or {}
+                done = int(rc.get("done", 0) or 0)
+                total_run = int(rc.get("total", 0) or 0)
+        except Exception:
+            done = 0
+            total_run = 0
+        if total_run > 0:
+            return f"{label}: {total} | Run: {done}/{total_run}"
+        return f"{label}: {total}"
+
+    def _set_run_total(self, kind: str, total: int) -> None:
+        try:
+            with self._run_counts_lock:
+                rc = self._run_counts.get(kind)
+                if rc is None:
+                    return
+                rc["done"] = 0
+                rc["total"] = max(0, int(total or 0))
+                rc["emails"] = set()
+        except Exception:
+            pass
+        self._update_counts()
+
+    def _reset_run(self, kind: str) -> None:
+        try:
+            with self._run_counts_lock:
+                rc = self._run_counts.get(kind)
+                if rc is None:
+                    return
+                rc["done"] = 0
+                rc["total"] = 0
+                rc["emails"] = set()
+        except Exception:
+            pass
+        self._update_counts()
+
+    def _mark_run_done(self, kind: str, email: str) -> None:
+        if not email:
+            return
+        updated = False
+        try:
+            with self._run_counts_lock:
+                rc = self._run_counts.get(kind)
+                if not rc or rc.get("total", 0) <= 0:
+                    return
+                if email in rc.get("emails", set()):
+                    return
+                rc["emails"].add(email)
+                rc["done"] = min(int(rc.get("total", 0)), int(rc.get("done", 0)) + 1)
+                updated = True
+        except Exception:
+            updated = False
+        if updated:
+            self._update_counts()
 
     def _search_email(self) -> None:
         q = (self.entry_search_email.get() or "").strip()
@@ -1187,6 +1258,7 @@ class App:
                 self.tree.set(resolved_id, "profile_id", profile_id)
             self.tree.set(resolved_id, "status", status)
             self._apply_status_tag(resolved_id, status)
+            self._auto_scroll_if_needed(self.tree, resolved_id, status)
             try:
                 email = self.tree.set(resolved_id, "email")
                 if email:
@@ -1206,10 +1278,7 @@ class App:
         def _update():
             self.profile_tree.set(item_id, "status", status)
             self._apply_profile_status_tag(item_id, status)
-            try:
-                self.profile_tree.see(item_id)
-            except Exception:
-                pass
+            self._auto_scroll_if_needed(self.profile_tree, item_id, status)
 
         self.root.after(0, _update)
 
@@ -1217,10 +1286,7 @@ class App:
         def _update():
             self.fb_tree.set(item_id, "status", status)
             self._apply_fb_status_tag(item_id, status)
-            try:
-                self.fb_tree.see(item_id)
-            except Exception:
-                pass
+            self._auto_scroll_if_needed(self.fb_tree, item_id, status)
 
         self.root.after(0, _update)
 
@@ -1228,12 +1294,30 @@ class App:
         def _update():
             self.fb_profile_tree.set(item_id, "status", status)
             self._apply_fb_profile_status_tag(item_id, status)
-            try:
-                self.fb_profile_tree.see(item_id)
-            except Exception:
-                pass
+            self._auto_scroll_if_needed(self.fb_profile_tree, item_id, status)
 
         self.root.after(0, _update)
+
+    def _auto_scroll_if_needed(self, tree: ttk.Treeview, item_id: str, status: str) -> None:
+        try:
+            status_upper = (status or "").upper()
+            active_keys = [
+                "START",
+                "LOGIN",
+                "SCAN",
+                "POSTING",
+                "DOWNLOAD",
+                "JOIN",
+                "RESTART",
+                "RELOGIN",
+            ]
+            if not any(key in status_upper for key in active_keys):
+                return
+            if tree.bbox(item_id) is not None:
+                return
+            tree.see(item_id)
+        except Exception:
+            pass
 
     def _record_failed(self, item_id: str, acc: dict, reason: str) -> None:
         with self.failed_accounts_lock:
@@ -2761,6 +2845,7 @@ class App:
         if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
+        self._set_run_total("profile", len(checked_emails))
         self._profile_batch_running = True
 
         def _sleep_with_stop(total_sec: float) -> None:
@@ -2960,6 +3045,7 @@ class App:
                 self._log("[PROFILE BATCH] Done")
             finally:
                 self._profile_batch_running = False
+                self._reset_run("profile")
 
         threading.Thread(target=_batch_runner, daemon=True).start()
 
@@ -3017,6 +3103,7 @@ class App:
         if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
+        self._set_run_total("upload", len(checked_emails))
 
         # Optimized layout: 5 profiles per row, full screen width - COMPACT MODE
         try:
@@ -3125,6 +3212,7 @@ class App:
                     self._do_repeat_cycle()
 
                 self._repeat_after_id = self.root.after(delay_ms, _repeat_start)
+            self._reset_run("upload")
 
         threading.Thread(target=_waiter, daemon=True).start()
 
@@ -3144,6 +3232,7 @@ class App:
         checked_emails = self._get_checked_email_set(self.tree)
         if not checked_emails:
             return
+        self._set_run_total("upload", len(checked_emails))
 
         # Clear executor state
         self.stop_event.clear()
@@ -3259,6 +3348,7 @@ class App:
 
                 self._repeat_after_id = self.root.after(delay_ms, _repeat_again)
                 self._log(f"[REPEAT] Next cycle in {self._repeat_delay_sec:.0f} seconds...")
+            self._reset_run("upload")
 
         threading.Thread(target=_repeat_waiter, daemon=True).start()
 
@@ -3443,6 +3533,7 @@ class App:
         if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
+        self._set_run_total("fb_profile", len(checked_emails))
 
         self._fixed_threads = max_threads
         self.stop_event.clear()
@@ -3494,6 +3585,7 @@ class App:
                 except Exception:
                     pass
             self.executor = None
+            self._reset_run("fb_profile")
 
         threading.Thread(target=_waiter, daemon=True).start()
 
@@ -3506,7 +3598,10 @@ class App:
                 sem.release()
             return
         profile_id = None
+        started = False
+        email = (acc.get("uid") or "").strip()
         try:
+            started = True
             fb_url = (acc.get("facebook") or "").strip()
             if not fb_url:
                 self._set_fb_profile_status(item_id, "FB LINK ERR")
@@ -3635,6 +3730,8 @@ class App:
             self._set_fb_profile_status(item_id, "PROFILE OPENED")
             self._set_fb_profile_status(item_id, "DONE")
         finally:
+            if started:
+                self._mark_run_done("fb_profile", email)
             if sem:
                 try:
                     sem.release()
@@ -3678,6 +3775,7 @@ class App:
         if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
+        self._set_run_total("fb", len(checked_emails))
 
         self.stop_event.clear()
         self._reset_batch_pause_state("FB")
@@ -3750,6 +3848,7 @@ class App:
                     return
                 self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
+            self._reset_run("fb")
 
         threading.Thread(target=_waiter, daemon=True).start()
 
@@ -3820,270 +3919,277 @@ class App:
                     return
                 self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
+            self._reset_run("fb")
 
         threading.Thread(target=_retry_waiter, daemon=True).start()
 
     def _fb_worker_one(self, item_id: str, acc: dict, win_pos: str, win_size: str, max_videos: int) -> None:
-        if self.stop_event.is_set():
-            return
-        if not self._wait_batch_pause_if_needed("FB"):
-            return
-        profile_id = None
-        max_file_size_bytes = 100 * 1024 * 1024
-
-        def _extract_fb_video_id(text: str) -> str:
-            val = (text or "").strip()
-            if not val:
+        email = (acc.get("uid") or "").strip()
+        started = False
+        try:
+            if self.stop_event.is_set():
+                return
+            if not self._wait_batch_pause_if_needed("FB"):
+                return
+            started = True
+            profile_id = None
+            max_file_size_bytes = 100 * 1024 * 1024
+    
+            def _extract_fb_video_id(text: str) -> str:
+                val = (text or "").strip()
+                if not val:
+                    return ""
+                m = re.search(r"/reel/(\d+)", val)
+                if m:
+                    return m.group(1)
                 return ""
-            m = re.search(r"/reel/(\d+)", val)
-            if m:
-                return m.group(1)
-            return ""
-
-        self._log(f"[{acc['uid']}] FB START")
-        self._set_fb_status(item_id, "CREATE...")
-        ok_c = False
-        data_c = {}
-        msg_c = ""
-        with self.create_lock:
-            for attempt in range(3):
-                ok_c, data_c, msg_c = create_profile(acc["uid"], acc["proxy"], SCOOPZ_URL)
-                if ok_c:
-                    break
-                wait_s = 5 + attempt * 3
-                self._set_fb_status(item_id, f"CREATE RETRY {attempt+1}/3")
-                self._log(f"[{acc['uid']}] CREATE ERR: {msg_c} | retry in {wait_s}s")
-                time.sleep(wait_s)
-        if not ok_c:
-            self._set_fb_status(item_id, f"CREATE ERR: {msg_c}")
-            self._record_failed(item_id, acc, f"CREATE ERR: {msg_c}")
-            return
-
-        profile_id = None
-        if isinstance(data_c, dict):
-            profile_id = (data_c.get("data") or {}).get("id") or data_c.get("id") or data_c.get("profile_id")
-        if not profile_id:
-            self._set_fb_status(item_id, "NO PROFILE ID")
-            self._record_failed(item_id, acc, "NO PROFILE ID")
-            return
-        self._remember_profile_path(profile_id, data_c)
-        self.created_profiles.add(profile_id)
-
-        self._set_fb_status(item_id, "START...")
-        ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
-        if not ok_s:
-            if self._is_proxy_error(msg_s):
-                try:
-                    close_profile(profile_id, 3)
-                    delete_profile(profile_id, 10)
-                except Exception:
-                    pass
-                try:
-                    self.created_profiles.discard(profile_id)
-                except Exception:
-                    pass
-                self._delete_profile_path(profile_id)
-                new_id, new_data_s, _err = self._retry_start_profile_with_new_proxy(
-                    acc,
-                    item_id,
-                    "fb",
-                    self.fb_tree,
-                    lambda s: self._set_fb_status(item_id, s),
-                    win_pos=win_pos,
-                    win_size=win_size,
-                    created_set="created_profiles",
-                )
-                if new_id and new_data_s:
-                    profile_id = new_id
-                    data_s = new_data_s
-                    ok_s = True
+    
+            self._log(f"[{acc['uid']}] FB START")
+            self._set_fb_status(item_id, "CREATE...")
+            ok_c = False
+            data_c = {}
+            msg_c = ""
+            with self.create_lock:
+                for attempt in range(3):
+                    ok_c, data_c, msg_c = create_profile(acc["uid"], acc["proxy"], SCOOPZ_URL)
+                    if ok_c:
+                        break
+                    wait_s = 5 + attempt * 3
+                    self._set_fb_status(item_id, f"CREATE RETRY {attempt+1}/3")
+                    self._log(f"[{acc['uid']}] CREATE ERR: {msg_c} | retry in {wait_s}s")
+                    time.sleep(wait_s)
+            if not ok_c:
+                self._set_fb_status(item_id, f"CREATE ERR: {msg_c}")
+                self._record_failed(item_id, acc, f"CREATE ERR: {msg_c}")
+                return
+    
+            profile_id = None
+            if isinstance(data_c, dict):
+                profile_id = (data_c.get("data") or {}).get("id") or data_c.get("id") or data_c.get("profile_id")
+            if not profile_id:
+                self._set_fb_status(item_id, "NO PROFILE ID")
+                self._record_failed(item_id, acc, "NO PROFILE ID")
+                return
+            self._remember_profile_path(profile_id, data_c)
+            self.created_profiles.add(profile_id)
+    
+            self._set_fb_status(item_id, "START...")
+            ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
+            if not ok_s:
+                if self._is_proxy_error(msg_s):
+                    try:
+                        close_profile(profile_id, 3)
+                        delete_profile(profile_id, 10)
+                    except Exception:
+                        pass
+                    try:
+                        self.created_profiles.discard(profile_id)
+                    except Exception:
+                        pass
+                    self._delete_profile_path(profile_id)
+                    new_id, new_data_s, _err = self._retry_start_profile_with_new_proxy(
+                        acc,
+                        item_id,
+                        "fb",
+                        self.fb_tree,
+                        lambda s: self._set_fb_status(item_id, s),
+                        win_pos=win_pos,
+                        win_size=win_size,
+                        created_set="created_profiles",
+                    )
+                    if new_id and new_data_s:
+                        profile_id = new_id
+                        data_s = new_data_s
+                        ok_s = True
+                    else:
+                        self._set_fb_status(item_id, f"START ERR: {msg_s}")
+                        self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                        return
                 else:
                     self._set_fb_status(item_id, f"START ERR: {msg_s}")
                     self._record_failed(item_id, acc, f"START ERR: {msg_s}")
                     return
-            else:
-                self._set_fb_status(item_id, f"START ERR: {msg_s}")
-                self._record_failed(item_id, acc, f"START ERR: {msg_s}")
-                return
-
-        with self.active_lock:
-            self.active_profiles[item_id] = profile_id
-        driver_path, remote = extract_driver_info(data_s)
-        status = "STARTED" if driver_path and remote else "STARTED (no debug)"
-        self._set_fb_status(item_id, status)
-
-        if not (driver_path and remote):
-            self._record_failed(item_id, acc, "STARTED (no debug)")
-            return
-
-        self._set_fb_status(item_id, "LOGIN...")
-        ok_login, err_login = login_scoopz(
-            driver_path,
-            remote,
-            acc["uid"],
-            acc["pass"],
-            "",
-            max_retries=3,
-            keep_browser=True,
-        )
-        if not ok_login:
-            status = self._format_login_error(err_login)
+    
+            with self.active_lock:
+                self.active_profiles[item_id] = profile_id
+            driver_path, remote = extract_driver_info(data_s)
+            status = "STARTED" if driver_path and remote else "STARTED (no debug)"
             self._set_fb_status(item_id, status)
-            self._record_failed(item_id, acc, status)
-            return
-
-        self._set_fb_status(item_id, "LOGIN OK")
-        success_count = 0
-        safety_guard = 0
-        while success_count < max_videos:
-            if self.stop_event.is_set():
-                break
-            safety_guard += 1
-            if safety_guard > max_videos * 5:
-                break
-
-            self.operation_delayer.delay_before_download(acc["uid"], self._log_progress)
-            ok_next, row = get_next_unuploaded(acc["uid"])
-            if not ok_next:
-                self._set_fb_status(item_id, "HẾT VIDEO")
-                break
-            row_url = (row.get("url") or "").strip()
-            row_id = (row.get("video_id") or "").strip()
-            if not row_url:
-                if row_id.startswith("http"):
-                    row_url = row_id
-                elif row_id:
-                    row_url = f"https://www.facebook.com/reel/{row_id}"
-            if not row_url:
-                break
-
-            self._set_fb_status(item_id, f"DOWNLOAD {success_count+1}/{max_videos}...")
-            ok_dl, path_or_err, vid_id, title = download_one_facebook(
+    
+            if not (driver_path and remote):
+                self._record_failed(item_id, acc, "STARTED (no debug)")
+                return
+    
+            self._set_fb_status(item_id, "LOGIN...")
+            ok_login, err_login = login_scoopz(
+                driver_path,
+                remote,
                 acc["uid"],
-                row_url,
-                self._log_progress,
-                cookie_path=os.path.join(_THIS_DIR, "cookiefb.txt"),
-                timeout_s=300,
+                acc["pass"],
+                "",
+                max_retries=3,
+                keep_browser=True,
             )
-            mark_id = vid_id or row_id or _extract_fb_video_id(row_url)
-            if not ok_dl:
-                err_text = str(path_or_err)
-                lower = err_text.lower()
-                if "video skipped" in lower or "private" in lower or "isn't available" in lower:
-                    try:
-                        mark_uploaded(acc["uid"], mark_id)
-                    except Exception:
-                        pass
-                    continue
-                self._set_fb_status(item_id, f"DOWNLOAD ERR: {err_text}")
-                self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
-                break
-
-            if vid_id and title:
-                try:
-                    update_title_if_empty(acc["uid"], vid_id, title)
-                except Exception:
-                    pass
-            try:
-                if os.path.exists(path_or_err):
-                    file_size = os.path.getsize(path_or_err)
-                    if file_size > max_file_size_bytes:
-                        self._log(
-                            f"[{acc['uid']}] SKIP BIG FILE: {file_size / (1024 * 1024):.1f}MB > 100MB"
-                        )
+            if not ok_login:
+                status = self._format_login_error(err_login)
+                self._set_fb_status(item_id, status)
+                self._record_failed(item_id, acc, status)
+                return
+    
+            self._set_fb_status(item_id, "LOGIN OK")
+            success_count = 0
+            safety_guard = 0
+            while success_count < max_videos:
+                if self.stop_event.is_set():
+                    break
+                safety_guard += 1
+                if safety_guard > max_videos * 5:
+                    break
+    
+                self.operation_delayer.delay_before_download(acc["uid"], self._log_progress)
+                ok_next, row = get_next_unuploaded(acc["uid"])
+                if not ok_next:
+                    self._set_fb_status(item_id, "HẾT VIDEO")
+                    break
+                row_url = (row.get("url") or "").strip()
+                row_id = (row.get("video_id") or "").strip()
+                if not row_url:
+                    if row_id.startswith("http"):
+                        row_url = row_id
+                    elif row_id:
+                        row_url = f"https://www.facebook.com/reel/{row_id}"
+                if not row_url:
+                    break
+    
+                self._set_fb_status(item_id, f"DOWNLOAD {success_count+1}/{max_videos}...")
+                ok_dl, path_or_err, vid_id, title = download_one_facebook(
+                    acc["uid"],
+                    row_url,
+                    self._log_progress,
+                    cookie_path=os.path.join(_THIS_DIR, "cookiefb.txt"),
+                    timeout_s=300,
+                )
+                mark_id = vid_id or row_id or _extract_fb_video_id(row_url)
+                if not ok_dl:
+                    err_text = str(path_or_err)
+                    lower = err_text.lower()
+                    if "video skipped" in lower or "private" in lower or "isn't available" in lower:
                         try:
                             mark_uploaded(acc["uid"], mark_id)
                         except Exception:
                             pass
-                        self._delete_uploaded_video(path_or_err, acc["uid"])
                         continue
-            except Exception:
-                pass
-            caption = title or ""
-            self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
-            with self.upload_retry_semaphore:
-                ok_p = False
-                drv = None
-                up_status = ""
-                up_msg = ""
-                token = self._enqueue_upload_turn()
-                if not self._wait_upload_turn(token):
-                    return
+                    self._set_fb_status(item_id, f"DOWNLOAD ERR: {err_text}")
+                    self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
+                    break
+    
+                if vid_id and title:
+                    try:
+                        update_title_if_empty(acc["uid"], vid_id, title)
+                    except Exception:
+                        pass
                 try:
-                    for attempt in range(3):
-                        if self.stop_event.is_set():
-                            break
-                        driver_key = f"{acc['uid']}_upload"
-                        try:
-                            with self.dialog_lock_pool.acquire(driver_key, timeout=60):
-                                ok_p, drv, up_status, up_msg = upload_prepare(
-                                    driver_path,
-                                    remote,
-                                    path_or_err,
-                                    caption,
-                                    lambda: self.stop_event.is_set(),
-                                    self._log,
-                                    acc.get("uid", ""),
-                                    max_total_s=360,
-                                    file_dialog_semaphore=self.file_dialog_semaphore,
-                                )
-                        except Exception as e:
-                            up_msg = f"Lock timeout: {e}"
-                        if ok_p:
-                            break
-                        if up_status in ("dialog_lock_timeout", "caption_error", "dialog_error", "timeout", "unexpected_error", "error") and attempt < 2:
-                            time.sleep(2 + attempt)
+                    if os.path.exists(path_or_err):
+                        file_size = os.path.getsize(path_or_err)
+                        if file_size > max_file_size_bytes:
+                            self._log(
+                                f"[{acc['uid']}] SKIP BIG FILE: {file_size / (1024 * 1024):.1f}MB > 100MB"
+                            )
+                            try:
+                                mark_uploaded(acc["uid"], mark_id)
+                            except Exception:
+                                pass
+                            self._delete_uploaded_video(path_or_err, acc["uid"])
                             continue
-                        break
-                finally:
-                    self._release_upload_turn(token)
-
-            if not ok_p:
-                self._set_fb_status(item_id, f"UPLOAD ERR: {up_msg or up_status}")
-                self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
-                break
-
-            self._set_fb_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
-            st, msg, _purl, _foll = upload_post_async(
-                drv,
-                self._log,
-                max_total_s=180,
-                post_button_semaphore=self.post_button_semaphore,
-            )
-            if st == "success":
-                try:
-                    mark_uploaded(acc["uid"], mark_id)
                 except Exception:
                     pass
-                self._set_fb_status(item_id, "UPLOAD OK")
-                self._delete_uploaded_video(path_or_err, acc["uid"])
-                success_count += 1
-            else:
-                err_text = msg or st
-                self._set_fb_status(item_id, f"UPLOAD ERR: {err_text}")
-                self._record_failed(item_id, acc, f"UPLOAD ERR: {err_text}")
-                break
-
-        try:
+                caption = title or ""
+                self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
+                with self.upload_retry_semaphore:
+                    ok_p = False
+                    drv = None
+                    up_status = ""
+                    up_msg = ""
+                    token = self._enqueue_upload_turn()
+                    if not self._wait_upload_turn(token):
+                        return
+                    try:
+                        for attempt in range(3):
+                            if self.stop_event.is_set():
+                                break
+                            driver_key = f"{acc['uid']}_upload"
+                            try:
+                                with self.dialog_lock_pool.acquire(driver_key, timeout=60):
+                                    ok_p, drv, up_status, up_msg = upload_prepare(
+                                        driver_path,
+                                        remote,
+                                        path_or_err,
+                                        caption,
+                                        lambda: self.stop_event.is_set(),
+                                        self._log,
+                                        acc.get("uid", ""),
+                                        max_total_s=360,
+                                        file_dialog_semaphore=self.file_dialog_semaphore,
+                                    )
+                            except Exception as e:
+                                up_msg = f"Lock timeout: {e}"
+                            if ok_p:
+                                break
+                            if up_status in ("dialog_lock_timeout", "caption_error", "dialog_error", "timeout", "unexpected_error", "error") and attempt < 2:
+                                time.sleep(2 + attempt)
+                                continue
+                            break
+                    finally:
+                        self._release_upload_turn(token)
+    
+                if not ok_p:
+                    self._set_fb_status(item_id, f"UPLOAD ERR: {up_msg or up_status}")
+                    self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
+                    break
+    
+                self._set_fb_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
+                st, msg, _purl, _foll = upload_post_async(
+                    drv,
+                    self._log,
+                    max_total_s=180,
+                    post_button_semaphore=self.post_button_semaphore,
+                )
+                if st == "success":
+                    try:
+                        mark_uploaded(acc["uid"], mark_id)
+                    except Exception:
+                        pass
+                    self._set_fb_status(item_id, "UPLOAD OK")
+                    self._delete_uploaded_video(path_or_err, acc["uid"])
+                    success_count += 1
+                else:
+                    err_text = msg or st
+                    self._set_fb_status(item_id, f"UPLOAD ERR: {err_text}")
+                    self._record_failed(item_id, acc, f"UPLOAD ERR: {err_text}")
+                    break
+    
+            try:
+                if profile_id:
+                    close_profile(profile_id, 3)
+                    delete_profile(profile_id, 10)
+            except Exception:
+                pass
+            try:
+                if profile_id:
+                    self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
             if profile_id:
-                close_profile(profile_id, 3)
-                delete_profile(profile_id, 10)
-        except Exception:
-            pass
-        try:
-            if profile_id:
-                self.created_profiles.discard(profile_id)
-        except Exception:
-            pass
-        if profile_id:
-            self._delete_profile_path(profile_id)
-            self._track_profile_cleanup()
-        try:
-            with self.active_lock:
-                self.active_profiles.pop(item_id, None)
-        except Exception:
-            pass
-
+                self._delete_profile_path(profile_id)
+                self._track_profile_cleanup()
+            try:
+                with self.active_lock:
+                    self.active_profiles.pop(item_id, None)
+            except Exception:
+                pass
+        finally:
+            if started:
+                self._mark_run_done("fb", email)
     def _retry_failed_accounts(self, failed_accounts: list, max_threads: int, max_videos: int) -> None:
         """Retry failed accounts with new threads"""
         if self.stop_event.is_set():
@@ -4749,9 +4855,12 @@ class App:
         if sem:
             sem.acquire()
         profile_id = None
+        started = False
+        email = (acc.get("uid") or "").strip()
         try:
             if self.stop_event.is_set():
                 return
+            started = True
             yt_url = (acc.get("youtube") or "").strip()
             if not yt_url:
                 self._set_profile_status(item_id, "YTB ERR: Thieu link")
@@ -4959,6 +5068,8 @@ class App:
             self._set_profile_status(item_id, "DONE")
             self._log(f"[{acc['uid']}] PROFILE DONE")
         finally:
+            if started:
+                self._mark_run_done("profile", email)
             if profile_id:
                 try:
                     close_profile(profile_id, 3)
@@ -5063,424 +5174,430 @@ class App:
             pass
 
     def _worker_one(self, item_id: str, acc: dict, win_pos: str, win_size: str, max_videos: int) -> None:
-        if self.stop_event.is_set():
-            return
-        if not self._wait_batch_pause_if_needed("YTB"):
-            return
-
-        def _restart_profile() -> tuple:
-            try:
-                self._set_status(item_id, "RESTART...")
-                close_profile(profile_id, 3)
-                ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
-                if not ok_s:
-                    self._set_status(item_id, f"RESTART ERR: {msg_s}")
-                    self._log(f"[{acc['uid']}] RESTART ERR: {msg_s}")
+        email = (acc.get("uid") or "").strip()
+        started = False
+        try:
+            if self.stop_event.is_set():
+                return
+            if not self._wait_batch_pause_if_needed("YTB"):
+                return
+            started = True
+    
+            def _restart_profile() -> tuple:
+                try:
+                    self._set_status(item_id, "RESTART...")
+                    close_profile(profile_id, 3)
+                    ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
+                    if not ok_s:
+                        self._set_status(item_id, f"RESTART ERR: {msg_s}")
+                        self._log(f"[{acc['uid']}] RESTART ERR: {msg_s}")
+                        return None, None
+                    drv_path, dbg_addr = extract_driver_info(data_s)
+                    if not drv_path or not dbg_addr:
+                        self._set_status(item_id, "RESTART NO DEBUG", profile_id=profile_id)
+                        return None, None
+                    self._set_status(item_id, "RELOGIN...")
+                    ok_login, err_login = login_scoopz(
+                        drv_path,
+                        dbg_addr,
+                        acc["uid"],
+                        acc["pass"],
+                        "",
+                        max_retries=2,
+                        keep_browser=True,
+                    )
+                    if not ok_login:
+                        status = self._format_login_error(err_login)
+                        if status == "SAI PASS":
+                            self._set_status(item_id, status)
+                            self._log(f"[{acc['uid']}] {status}")
+                        else:
+                            self._set_status(item_id, f"RELOGIN ERR: {err_login}")
+                            self._log(f"[{acc['uid']}] RELOGIN ERR: {err_login}")
+                        return None, None
+                    self._set_status(item_id, "RESTART OK", profile_id=profile_id)
+                    return drv_path, dbg_addr
+                except Exception as e:
+                    self._set_status(item_id, f"RESTART ERR: {e}")
+                    self._log(f"[{acc['uid']}] RESTART ERR: {e}")
                     return None, None
-                drv_path, dbg_addr = extract_driver_info(data_s)
-                if not drv_path or not dbg_addr:
-                    self._set_status(item_id, "RESTART NO DEBUG", profile_id=profile_id)
-                    return None, None
-                self._set_status(item_id, "RELOGIN...")
+    
+            def _extract_video_id(text: str) -> str:
+                val = (text or "").strip()
+                if not val:
+                    return ""
+                if "shorts/" in val:
+                    return val.split("shorts/", 1)[1].split("?", 1)[0].strip("/")
+                if "watch?v=" in val:
+                    return val.split("watch?v=", 1)[1].split("&", 1)[0]
+                return ""
+    
+            self._log(f"[{acc['uid']}] START")
+            self._set_status(item_id, "CREATE...")
+            ok_c = False
+            data_c = {}
+            msg_c = ""
+            with self.create_lock:
+                for attempt in range(3):
+                    ok_c, data_c, msg_c = create_profile(acc["uid"], acc["proxy"], SCOOPZ_URL)
+                    if ok_c:
+                        break
+                    wait_s = 5 + attempt * 3
+                    self._set_status(item_id, f"CREATE RETRY {attempt+1}/3")
+                    self._log(f"[{acc['uid']}] CREATE ERR: {msg_c} | retry in {wait_s}s")
+                    time.sleep(wait_s)
+            if not ok_c:
+                self._set_status(item_id, f"CREATE ERR: {msg_c}")
+                self._log(f"[{acc['uid']}] CREATE ERR: {msg_c}")
+                self._record_failed(item_id, acc, f"CREATE ERR: {msg_c}")
+                return
+    
+            profile_id = None
+            if isinstance(data_c, dict):
+                profile_id = (data_c.get("data") or {}).get("id") or data_c.get("id") or data_c.get("profile_id")
+            if not profile_id:
+                self._set_status(item_id, "NO PROFILE ID")
+                self._log(f"[{acc['uid']}] NO PROFILE ID")
+                self._record_failed(item_id, acc, "NO PROFILE ID")
+                return
+            self._remember_profile_path(profile_id, data_c)
+            self.created_profiles.add(profile_id)
+    
+            self._set_status(item_id, "START...", profile_id=profile_id)
+            ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
+            if not ok_s:
+                if self._is_proxy_error(msg_s):
+                    swapped = self._replace_proxy_for_account(acc, item_id, "upload", self.tree)
+                    if swapped:
+                        self._set_status(item_id, f"START ERR: {msg_s} (proxy replaced)")
+                        self._log(f"[{acc['uid']}] START ERR: {msg_s} (proxy replaced)")
+                        self._record_failed(item_id, acc, f"START ERR: {msg_s} (proxy replaced)")
+                        return
+                self._set_status(item_id, f"START ERR: {msg_s}")
+                self._log(f"[{acc['uid']}] START ERR: {msg_s}")
+                self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                return
+    
+            with self.active_lock:
+                self.active_profiles[item_id] = profile_id
+            driver_path, remote = extract_driver_info(data_s)
+            status = "STARTED" if driver_path and remote else "STARTED (no debug)"
+            self._set_status(item_id, status, profile_id=profile_id)
+            self._log(f"[{acc['uid']}] START OK")
+    
+            if driver_path and remote:
+                self._set_status(item_id, "LOGIN...")
+                self._log(f"[{acc['uid']}] LOGIN START")
                 ok_login, err_login = login_scoopz(
-                    drv_path,
-                    dbg_addr,
+                    driver_path,
+                    remote,
                     acc["uid"],
                     acc["pass"],
                     "",
-                    max_retries=2,
+                    max_retries=3,
                     keep_browser=True,
                 )
-                if not ok_login:
-                    status = self._format_login_error(err_login)
-                    if status == "SAI PASS":
-                        self._set_status(item_id, status)
-                        self._log(f"[{acc['uid']}] {status}")
-                    else:
-                        self._set_status(item_id, f"RELOGIN ERR: {err_login}")
-                        self._log(f"[{acc['uid']}] RELOGIN ERR: {err_login}")
-                    return None, None
-                self._set_status(item_id, "RESTART OK", profile_id=profile_id)
-                return drv_path, dbg_addr
-            except Exception as e:
-                self._set_status(item_id, f"RESTART ERR: {e}")
-                self._log(f"[{acc['uid']}] RESTART ERR: {e}")
-                return None, None
-
-        def _extract_video_id(text: str) -> str:
-            val = (text or "").strip()
-            if not val:
-                return ""
-            if "shorts/" in val:
-                return val.split("shorts/", 1)[1].split("?", 1)[0].strip("/")
-            if "watch?v=" in val:
-                return val.split("watch?v=", 1)[1].split("&", 1)[0]
-            return ""
-
-        self._log(f"[{acc['uid']}] START")
-        self._set_status(item_id, "CREATE...")
-        ok_c = False
-        data_c = {}
-        msg_c = ""
-        with self.create_lock:
-            for attempt in range(3):
-                ok_c, data_c, msg_c = create_profile(acc["uid"], acc["proxy"], SCOOPZ_URL)
-                if ok_c:
-                    break
-                wait_s = 5 + attempt * 3
-                self._set_status(item_id, f"CREATE RETRY {attempt+1}/3")
-                self._log(f"[{acc['uid']}] CREATE ERR: {msg_c} | retry in {wait_s}s")
-                time.sleep(wait_s)
-        if not ok_c:
-            self._set_status(item_id, f"CREATE ERR: {msg_c}")
-            self._log(f"[{acc['uid']}] CREATE ERR: {msg_c}")
-            self._record_failed(item_id, acc, f"CREATE ERR: {msg_c}")
-            return
-
-        profile_id = None
-        if isinstance(data_c, dict):
-            profile_id = (data_c.get("data") or {}).get("id") or data_c.get("id") or data_c.get("profile_id")
-        if not profile_id:
-            self._set_status(item_id, "NO PROFILE ID")
-            self._log(f"[{acc['uid']}] NO PROFILE ID")
-            self._record_failed(item_id, acc, "NO PROFILE ID")
-            return
-        self._remember_profile_path(profile_id, data_c)
-        self.created_profiles.add(profile_id)
-
-        self._set_status(item_id, "START...", profile_id=profile_id)
-        ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
-        if not ok_s:
-            if self._is_proxy_error(msg_s):
-                swapped = self._replace_proxy_for_account(acc, item_id, "upload", self.tree)
-                if swapped:
-                    self._set_status(item_id, f"START ERR: {msg_s} (proxy replaced)")
-                    self._log(f"[{acc['uid']}] START ERR: {msg_s} (proxy replaced)")
-                    self._record_failed(item_id, acc, f"START ERR: {msg_s} (proxy replaced)")
-                    return
-            self._set_status(item_id, f"START ERR: {msg_s}")
-            self._log(f"[{acc['uid']}] START ERR: {msg_s}")
-            self._record_failed(item_id, acc, f"START ERR: {msg_s}")
-            return
-
-        with self.active_lock:
-            self.active_profiles[item_id] = profile_id
-        driver_path, remote = extract_driver_info(data_s)
-        status = "STARTED" if driver_path and remote else "STARTED (no debug)"
-        self._set_status(item_id, status, profile_id=profile_id)
-        self._log(f"[{acc['uid']}] START OK")
-
-        if driver_path and remote:
-            self._set_status(item_id, "LOGIN...")
-            self._log(f"[{acc['uid']}] LOGIN START")
-            ok_login, err_login = login_scoopz(
-                driver_path,
-                remote,
-                acc["uid"],
-                acc["pass"],
-                "",
-                max_retries=3,
-                keep_browser=True,
-            )
-            if ok_login:
-                self._set_status(item_id, "LOGIN OK")
-                self._log(f"[{acc['uid']}] LOGIN OK")
-                download_started = threading.Event()
-                def _idle_watchdog():
-                    if download_started.wait(timeout=30):
-                        return
-                    if self.stop_event.is_set():
-                        return
-                    ok_next, row = get_next_unuploaded(acc["uid"])
-                    if not ok_next:
-                        self._set_status(item_id, "HẾT VIDEO")
-                        self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
-                        return
-                    self._set_status(item_id, "LOGIN OK (IDLE)")
-                    self._log(f"[{acc['uid']}] LOGIN OK (IDLE) - no download started")
-                threading.Thread(target=_idle_watchdog, daemon=True).start()
-                success_count = 0
-                safety_guard = 0
-                restart_attempts = 0
-                while success_count < max_videos:
-                    if self.stop_event.is_set():
-                        break
-                    safety_guard += 1
-                    if safety_guard > max_videos * 5:
-                        self._log(f"[{acc['uid']}] Too many skips, stop loop")
-                        break
-                    
-                    # Smart delay before next video
-                    self.operation_delayer.delay_before_download(acc["uid"], self._log_progress)
-                    
-                    ok_next, row = get_next_unuploaded(acc["uid"])
-                    if not ok_next:
-                        self._set_status(item_id, "HẾT VIDEO")
-                        self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
-                        break
-                    row_url = (row.get("url") or "").strip()
-                    row_id = (row.get("video_id") or "").strip()
-                    if not row_url:
-                        if row_id.startswith("http"):
-                            row_url = row_id
-                        elif row_id:
-                            row_url = f"https://www.youtube.com/shorts/{row_id}"
-                    if not row_url:
-                        self._log(f"[{acc['uid']}] No URL in CSV row")
-                        break
-                    download_started.set()
-                    self._log(f"[{acc['uid']}] NEXT VIDEO: {row_id} | {row_url}")
-                    self._set_status(item_id, f"DOWNLOAD {success_count+1}/{max_videos}...")
-                    self._log(f"[{acc['uid']}] DOWNLOAD START: {row_url}")
-                    retry_dl = 0
-                    path_or_err = ""
-                    vid_id = ""
-                    title = ""
-                    ok_dl = False
-                    skip_current = False
-                    while True:
-                        ok_dl, path_or_err, vid_id, title = download_one(
-                            acc["uid"],
-                            row_url,
-                            self._log_progress,
-                            cookie_path=COOKIES_FILE,
-                            fallback_cookie_path=COOKIES_FILE_FALLBACK,
-                            timeout_s=300,
-                        )
+                if ok_login:
+                    self._set_status(item_id, "LOGIN OK")
+                    self._log(f"[{acc['uid']}] LOGIN OK")
+                    download_started = threading.Event()
+                    def _idle_watchdog():
+                        if download_started.wait(timeout=30):
+                            return
+                        if self.stop_event.is_set():
+                            return
+                        ok_next, row = get_next_unuploaded(acc["uid"])
+                        if not ok_next:
+                            self._set_status(item_id, "HẾT VIDEO")
+                            self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
+                            return
+                        self._set_status(item_id, "LOGIN OK (IDLE)")
+                        self._log(f"[{acc['uid']}] LOGIN OK (IDLE) - no download started")
+                    threading.Thread(target=_idle_watchdog, daemon=True).start()
+                    success_count = 0
+                    safety_guard = 0
+                    restart_attempts = 0
+                    while success_count < max_videos:
+                        if self.stop_event.is_set():
+                            break
+                        safety_guard += 1
+                        if safety_guard > max_videos * 5:
+                            self._log(f"[{acc['uid']}] Too many skips, stop loop")
+                            break
+    
+                        # Smart delay before next video
+                        self.operation_delayer.delay_before_download(acc["uid"], self._log_progress)
+    
+                        ok_next, row = get_next_unuploaded(acc["uid"])
+                        if not ok_next:
+                            self._set_status(item_id, "HẾT VIDEO")
+                            self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
+                            break
+                        row_url = (row.get("url") or "").strip()
+                        row_id = (row.get("video_id") or "").strip()
+                        if not row_url:
+                            if row_id.startswith("http"):
+                                row_url = row_id
+                            elif row_id:
+                                row_url = f"https://www.youtube.com/shorts/{row_id}"
+                        if not row_url:
+                            self._log(f"[{acc['uid']}] No URL in CSV row")
+                            break
+                        download_started.set()
+                        self._log(f"[{acc['uid']}] NEXT VIDEO: {row_id} | {row_url}")
+                        self._set_status(item_id, f"DOWNLOAD {success_count+1}/{max_videos}...")
+                        self._log(f"[{acc['uid']}] DOWNLOAD START: {row_url}")
+                        retry_dl = 0
+                        path_or_err = ""
+                        vid_id = ""
+                        title = ""
+                        ok_dl = False
+                        skip_current = False
+                        while True:
+                            ok_dl, path_or_err, vid_id, title = download_one(
+                                acc["uid"],
+                                row_url,
+                                self._log_progress,
+                                cookie_path=COOKIES_FILE,
+                                fallback_cookie_path=COOKIES_FILE_FALLBACK,
+                                timeout_s=300,
+                            )
+                            if ok_dl:
+                                break
+                            err_text = str(path_or_err)
+                            lower = err_text.lower()
+                            is_restricted = (
+                                "video restricted" in lower
+                                or "members-only" in lower
+                                or "members only" in lower
+                                or "join this channel" in lower
+                                or "premium only" in lower
+                                or "membership required" in lower
+                            )
+                            is_skipped = (
+                                "video skipped" in lower
+                                or "private video" in lower
+                                or "sign in if you've been granted access" in lower
+                                or "sign in to confirm your age" in lower
+                                or "age-restricted" in lower
+                                or "age restricted" in lower
+                            )
+    
+                            if is_skipped:
+                                self._log(f"[{acc['uid']}] VIDEO UNAVAILABLE - AUTO SKIP")
+                                # Mark as uploaded so it's skipped in future runs
+                                mark_id = vid_id or row_id or _extract_video_id(row_url)
+                                try:
+                                    mark_uploaded(acc["uid"], mark_id)
+                                except Exception as e:
+                                    self._log(f"[{acc['uid']}] Could not mark video: {e}")
+                                skip_current = True
+                                break
+                            if "timeout" in lower or "timed out" in lower:
+                                self._set_status(item_id, f"DOWNLOAD ERR: {err_text}")
+                                self._log(f"[{acc['uid']}] DOWNLOAD ERR: {err_text}")
+                                self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
+                                return
+    
+                            if is_restricted and retry_dl < 1:
+                                retry_dl += 1
+                                self._log(f"[{acc['uid']}] DOWNLOAD RETRY (restricted): {row_url}")
+                                self.operation_delayer.delay_on_error(acc['uid'], "restricted_video", self._log_progress)
+                                continue
+                            if is_restricted and retry_dl == 1:
+                                # Relogin disabled - skip to next video
+                                self._log(f"[{acc['uid']}] VIDEO RESTRICTED - SKIP (no relogin): {err_text}")
+                                self.error_logger.log_download_error(acc['uid'], row_url, f"Video restricted - {err_text}")
+                                break
+                            if is_restricted and retry_dl >= 2:
+                                self._log(f"[{acc['uid']}] VIDEO RESTRICTED - SKIP: {err_text}")
+                                self.error_logger.log_download_error(acc['uid'], row_url, f"Video restricted - {err_text}")
+                                break
+                            break
+    
+                        mark_id = vid_id or row_id or _extract_video_id(row_url)
+                        if skip_current:
+                            continue
                         if ok_dl:
-                            break
-                        err_text = str(path_or_err)
-                        lower = err_text.lower()
-                        is_restricted = (
-                            "video restricted" in lower
-                            or "members-only" in lower
-                            or "members only" in lower
-                            or "join this channel" in lower
-                            or "premium only" in lower
-                            or "membership required" in lower
-                        )
-                        is_skipped = (
-                            "video skipped" in lower
-                            or "private video" in lower
-                            or "sign in if you've been granted access" in lower
-                            or "sign in to confirm your age" in lower
-                            or "age-restricted" in lower
-                            or "age restricted" in lower
-                        )
-                        
-                        if is_skipped:
-                            self._log(f"[{acc['uid']}] VIDEO UNAVAILABLE - AUTO SKIP")
-                            # Mark as uploaded so it's skipped in future runs
-                            mark_id = vid_id or row_id or _extract_video_id(row_url)
-                            try:
-                                mark_uploaded(acc["uid"], mark_id)
-                            except Exception as e:
-                                self._log(f"[{acc['uid']}] Could not mark video: {e}")
-                            skip_current = True
-                            break
-                        if "timeout" in lower or "timed out" in lower:
+                            if vid_id and title:
+                                try:
+                                    update_title_if_empty(acc["uid"], vid_id, title)
+                                except Exception:
+                                    pass
+                            self._set_status(item_id, f"DOWNLOAD OK {success_count+1}/{max_videos}")
+                            self._log(f"[{acc['uid']}] DOWNLOAD OK")
+                            caption = title or ""
+    
+                            # Smart delay before upload
+                            self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
+    
+                            # Use semaphore to limit concurrent uploads
+                            with self.upload_retry_semaphore:
+                                ok_p = False
+                                drv = None
+                                up_status = ""
+                                up_msg = ""
+                                token = self._enqueue_upload_turn()
+                                if not self._wait_upload_turn(token):
+                                    return
+                                try:
+                                    # Retry with exponential backoff
+                                    for attempt in range(3):
+                                        if self.stop_event.is_set():
+                                            break
+    
+                                        # Use per-driver lock to prevent file dialog conflicts
+                                        driver_key = f"{acc['uid']}_upload"
+                                        try:
+                                            with self.dialog_lock_pool.acquire(driver_key, timeout=60):
+                                                ok_p, drv, up_status, up_msg = upload_prepare(
+                                                    driver_path,
+                                                    remote,
+                                                    path_or_err,
+                                                    caption,
+                                                    lambda: self.stop_event.is_set(),
+                                                    self._log,
+                                                    acc.get("uid", ""),
+                                                    max_total_s=360,
+                                                    file_dialog_semaphore=self.file_dialog_semaphore,
+                                                )
+                                        except Exception as e:
+                                            up_msg = f"Lock timeout: {e}"
+                                            self._log(f"[{acc['uid']}] Upload lock error: {e}")
+    
+                                        if ok_p:
+                                            break
+    
+                                        # Retry on dialog lock timeout
+                                        if up_status == "dialog_lock_timeout":
+                                            if attempt < 2:
+                                                wait_time = 5  # Wait 5s before retrying dialog lock
+                                                self._log(f"[{acc['uid']}] Dialog lock timeout, retry in {wait_time}s...")
+                                                time.sleep(wait_time)
+                                                continue
+                                            else:
+                                                break
+    
+                                        # Retry by re-opening upload page on certain failures
+                                        if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error"):
+                                            if attempt < 2:
+                                                wait_time = 2 + attempt
+                                                self._log(f"[{acc['uid']}] Upload page retry {attempt+1}/2 in {wait_time}s (status={up_status})")
+                                                time.sleep(wait_time)
+                                                continue
+                                            else:
+                                                break
+    
+                                        # Don't retry certain errors
+                                        if up_status not in ("select_not_found", "select_click_error"):
+                                            break
+    
+                                        # Backoff before retry
+                                        if attempt < 2:
+                                            wait_time = min(2 ** attempt, 10)  # 2s, 4s
+                                            self._log(f"[{acc['uid']}] Upload retry in {wait_time}s...")
+                                            time.sleep(wait_time)
+                                finally:
+                                    self._release_upload_turn(token)
+    
+                                if not ok_p and up_status in ("select_not_found", "select_click_error"):
+                                    # Upload select not found - add to retry queue and break
+                                    self._set_status(item_id, f"UPLOAD LOI: {up_status}")
+                                    self._log(f"[{acc['uid']}] Upload {up_status} - retry this account")
+                                    self._record_failed(item_id, acc, f"UPLOAD {up_status}")
+                                    break
+    
+                            if not ok_p:
+                                if up_status == "account_blocked" or "Kh?ng th?y tr?ng th?i Uploading/Uploaded" in (up_msg or ""):
+                                    self._set_status(item_id, "ACCOUNT BLOCKED")
+                                    self._log(f"[{acc['uid']}] ACCOUNT BLOCKED - retry this account")
+                                    self.error_logger.log_upload_error(acc['uid'], path_or_err, "Account blocked")
+                                    self._record_failed(item_id, acc, "ACCOUNT BLOCKED")
+                                    break
+                                else:
+                                    self._set_status(item_id, f"UPLOAD ERR: {up_msg or up_status}")
+                                    self._log(f"[{acc['uid']}] UPLOAD ERR: {up_msg or up_status}")
+                                    self.error_logger.log_upload_error(acc['uid'], path_or_err, up_msg or up_status)
+                                    self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
+                                    # Other upload errors - skip without retry
+                                    break
+                            else:
+                                self._set_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
+                                st, msg, purl, foll = upload_post_async(drv, self._log, max_total_s=180, post_button_semaphore=self.post_button_semaphore)
+                                if st == "success":
+                                    try:
+                                        mark_uploaded(acc["uid"], mark_id)
+                                    except Exception:
+                                        pass
+                                    self._set_profile_info(item_id, purl, foll)
+                                    self._set_status(item_id, "UPLOAD OK")
+                                    self._log(f"[{acc['uid']}] UPLOAD OK")
+                                    self._delete_uploaded_video(path_or_err, acc["uid"])
+                                    self.error_logger.log_success(
+                                        acc['uid'],
+                                        "UPLOAD",
+                                        f"Video {success_count+1}/{max_videos} posted successfully",
+                                    )
+                                    success_count += 1
+                                else:
+                                    err_text = msg or st
+                                    status_text = "UPLOAD LOI" if "Select video not found" in (err_text or "") else f"UPLOAD ERR: {err_text}"
+                                    self._set_status(item_id, status_text)
+                                    self._log(f"[{acc['uid']}] UPLOAD ERR: {err_text}")
+                                    self.error_logger.log_upload_error(acc['uid'], path_or_err, err_text)
+                                    self._record_failed(item_id, acc, f"UPLOAD ERR: {err_text}")
+                                    break
+                        else:
+                            err_text = str(path_or_err)
                             self._set_status(item_id, f"DOWNLOAD ERR: {err_text}")
                             self._log(f"[{acc['uid']}] DOWNLOAD ERR: {err_text}")
-                            self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
-                            return
-                        
-                        if is_restricted and retry_dl < 1:
-                            retry_dl += 1
-                            self._log(f"[{acc['uid']}] DOWNLOAD RETRY (restricted): {row_url}")
-                            self.operation_delayer.delay_on_error(acc['uid'], "restricted_video", self._log_progress)
-                            continue
-                        if is_restricted and retry_dl == 1:
-                            # Relogin disabled - skip to next video
-                            self._log(f"[{acc['uid']}] VIDEO RESTRICTED - SKIP (no relogin): {err_text}")
-                            self.error_logger.log_download_error(acc['uid'], row_url, f"Video restricted - {err_text}")
-                            break
-                        if is_restricted and retry_dl >= 2:
-                            self._log(f"[{acc['uid']}] VIDEO RESTRICTED - SKIP: {err_text}")
-                            self.error_logger.log_download_error(acc['uid'], row_url, f"Video restricted - {err_text}")
-                            break
-                        break
-
-                    mark_id = vid_id or row_id or _extract_video_id(row_url)
-                    if skip_current:
-                        continue
-                    if ok_dl:
-                        if vid_id and title:
-                            try:
-                                update_title_if_empty(acc["uid"], vid_id, title)
-                            except Exception:
-                                pass
-                        self._set_status(item_id, f"DOWNLOAD OK {success_count+1}/{max_videos}")
-                        self._log(f"[{acc['uid']}] DOWNLOAD OK")
-                        caption = title or ""
-                        
-                        # Smart delay before upload
-                        self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
-                        
-                        # Use semaphore to limit concurrent uploads
-                        with self.upload_retry_semaphore:
-                            ok_p = False
-                            drv = None
-                            up_status = ""
-                            up_msg = ""
-                            token = self._enqueue_upload_turn()
-                            if not self._wait_upload_turn(token):
-                                return
-                            try:
-                                # Retry with exponential backoff
-                                for attempt in range(3):
-                                    if self.stop_event.is_set():
-                                        break
-                                        
-                                    # Use per-driver lock to prevent file dialog conflicts
-                                    driver_key = f"{acc['uid']}_upload"
-                                    try:
-                                        with self.dialog_lock_pool.acquire(driver_key, timeout=60):
-                                            ok_p, drv, up_status, up_msg = upload_prepare(
-                                                driver_path,
-                                                remote,
-                                                path_or_err,
-                                                caption,
-                                                lambda: self.stop_event.is_set(),
-                                                self._log,
-                                                acc.get("uid", ""),
-                                                max_total_s=360,
-                                                file_dialog_semaphore=self.file_dialog_semaphore,
-                                            )
-                                    except Exception as e:
-                                        up_msg = f"Lock timeout: {e}"
-                                        self._log(f"[{acc['uid']}] Upload lock error: {e}")
-                                    
-                                    if ok_p:
-                                        break
-                                    
-                                    # Retry on dialog lock timeout
-                                    if up_status == "dialog_lock_timeout":
-                                        if attempt < 2:
-                                            wait_time = 5  # Wait 5s before retrying dialog lock
-                                            self._log(f"[{acc['uid']}] Dialog lock timeout, retry in {wait_time}s...")
-                                            time.sleep(wait_time)
-                                            continue
-                                        else:
-                                            break
-
-                                    # Retry by re-opening upload page on certain failures
-                                    if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error"):
-                                        if attempt < 2:
-                                            wait_time = 2 + attempt
-                                            self._log(f"[{acc['uid']}] Upload page retry {attempt+1}/2 in {wait_time}s (status={up_status})")
-                                            time.sleep(wait_time)
-                                            continue
-                                        else:
-                                            break
-                                    
-                                    # Don't retry certain errors
-                                    if up_status not in ("select_not_found", "select_click_error"):
-                                        break
-                                    
-                                    # Backoff before retry
-                                    if attempt < 2:
-                                        wait_time = min(2 ** attempt, 10)  # 2s, 4s
-                                        self._log(f"[{acc['uid']}] Upload retry in {wait_time}s...")
-                                        time.sleep(wait_time)
-                            finally:
-                                self._release_upload_turn(token)
-                            
-                            if not ok_p and up_status in ("select_not_found", "select_click_error"):
-                                # Upload select not found - add to retry queue and break
-                                self._set_status(item_id, f"UPLOAD LOI: {up_status}")
-                                self._log(f"[{acc['uid']}] Upload {up_status} - retry this account")
-                                self._record_failed(item_id, acc, f"UPLOAD {up_status}")
-                                break
-
-                        if not ok_p:
-                            if up_status == "account_blocked" or "Kh?ng th?y tr?ng th?i Uploading/Uploaded" in (up_msg or ""):
-                                self._set_status(item_id, "ACCOUNT BLOCKED")
-                                self._log(f"[{acc['uid']}] ACCOUNT BLOCKED - retry this account")
-                                self.error_logger.log_upload_error(acc['uid'], path_or_err, "Account blocked")
-                                self._record_failed(item_id, acc, "ACCOUNT BLOCKED")
-                                break
-                            else:
-                                self._set_status(item_id, f"UPLOAD ERR: {up_msg or up_status}")
-                                self._log(f"[{acc['uid']}] UPLOAD ERR: {up_msg or up_status}")
-                                self.error_logger.log_upload_error(acc['uid'], path_or_err, up_msg or up_status)
-                                self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
-                                # Other upload errors - skip without retry
-                                break
-                        else:
-                            self._set_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
-                            st, msg, purl, foll = upload_post_async(drv, self._log, max_total_s=180, post_button_semaphore=self.post_button_semaphore)
-                            if st == "success":
+                            self.error_logger.log_download_error(acc['uid'], row_url, err_text)
+                            lower = err_text.lower()
+                            if (
+                                "video unavailable" in lower
+                                or "removed by the uploader" in lower
+                                or "members-only" in lower
+                                or "members only" in lower
+                                or "join this channel" in lower
+                                or "video skipped" in lower
+                                or "private video" in lower
+                                or "sign in if you've been granted access" in lower
+                            ):
                                 try:
                                     mark_uploaded(acc["uid"], mark_id)
                                 except Exception:
                                     pass
-                                self._set_profile_info(item_id, purl, foll)
-                                self._set_status(item_id, "UPLOAD OK")
-                                self._log(f"[{acc['uid']}] UPLOAD OK")
-                                self._delete_uploaded_video(path_or_err, acc["uid"])
-                                self.error_logger.log_success(
-                                    acc['uid'],
-                                    "UPLOAD",
-                                    f"Video {success_count+1}/{max_videos} posted successfully",
-                                )
-                                success_count += 1
-                            else:
-                                err_text = msg or st
-                                status_text = "UPLOAD LOI" if "Select video not found" in (err_text or "") else f"UPLOAD ERR: {err_text}"
-                                self._set_status(item_id, status_text)
-                                self._log(f"[{acc['uid']}] UPLOAD ERR: {err_text}")
-                                self.error_logger.log_upload_error(acc['uid'], path_or_err, err_text)
-                                self._record_failed(item_id, acc, f"UPLOAD ERR: {err_text}")
-                                break
-                    else:
-                        err_text = str(path_or_err)
-                        self._set_status(item_id, f"DOWNLOAD ERR: {err_text}")
-                        self._log(f"[{acc['uid']}] DOWNLOAD ERR: {err_text}")
-                        self.error_logger.log_download_error(acc['uid'], row_url, err_text)
-                        lower = err_text.lower()
-                        if (
-                            "video unavailable" in lower
-                            or "removed by the uploader" in lower
-                            or "members-only" in lower
-                            or "members only" in lower
-                            or "join this channel" in lower
-                            or "video skipped" in lower
-                            or "private video" in lower
-                            or "sign in if you've been granted access" in lower
-                        ):
-                            try:
-                                mark_uploaded(acc["uid"], mark_id)
-                            except Exception:
-                                pass
-                            continue
-                        # Relogin disabled - skip video
-                        break
-            else:
-                status = self._format_login_error(err_login)
-                self._set_status(item_id, status)
-                self._log(f"[{acc['uid']}] {status}")
-                # Track failed account for retry
-                self._record_failed(item_id, acc, status)
-            try:
+                                continue
+                            # Relogin disabled - skip video
+                            break
+                else:
+                    status = self._format_login_error(err_login)
+                    self._set_status(item_id, status)
+                    self._log(f"[{acc['uid']}] {status}")
+                    # Track failed account for retry
+                    self._record_failed(item_id, acc, status)
+                try:
+                    if profile_id:
+                        close_profile(profile_id, 3)
+                        delete_profile(profile_id, 10)
+                except Exception:
+                    pass
+                try:
+                    if profile_id:
+                        self.created_profiles.discard(profile_id)
+                except Exception:
+                    pass
                 if profile_id:
-                    close_profile(profile_id, 3)
-                    delete_profile(profile_id, 10)
+                    self._delete_profile_path(profile_id)
+                    self._track_profile_cleanup()
+            try:
+                with self.active_lock:
+                    self.active_profiles.pop(item_id, None)
             except Exception:
                 pass
-            try:
-                if profile_id:
-                    self.created_profiles.discard(profile_id)
-            except Exception:
-                pass
-            if profile_id:
-                self._delete_profile_path(profile_id)
-                self._track_profile_cleanup()
-        try:
-            with self.active_lock:
-                self.active_profiles.pop(item_id, None)
-        except Exception:
-            pass
-
+        finally:
+            if started:
+                self._mark_run_done("upload", email)
 
 if __name__ == "__main__":
     root = tk.Tk()
