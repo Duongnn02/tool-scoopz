@@ -4,6 +4,12 @@ accounts_cache.json
 cookies.txt
 logs/
 html_snapshots/
+chrome_automation_user_data/
+chrome_automation_user_data_*/
+accounts_under_10_follow.xlsx
+fb_accounts_cache.json
+fb_profile_accounts_cache.json
+.env
 
 # Python
 __pycache__/
@@ -51,6 +57,12 @@ logs/
 # Cache
 .cache/
 *.cache
+*_cache.json
+*_accounts_cache.json
+*.db
+*.sqlite
+*.sqlite3
+.pytest_cache/
 
 # Temporary files
 *.tmp

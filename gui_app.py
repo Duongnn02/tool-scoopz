@@ -81,6 +81,7 @@ class App:
         self._profile_accounts_file = os.path.join(_THIS_DIR, "profile_accounts_cache.json")
         self._fb_accounts_file = os.path.join(_THIS_DIR, "fb_accounts_cache.json")
         self._fb_profile_accounts_file = os.path.join(_THIS_DIR, "fb_profile_accounts_cache.json")
+        self._extra_proxy_file = os.path.join(_THIS_DIR, "extra_proxies.txt")
         
         # Initialize logger
         log_dir = os.path.join(_THIS_DIR, "logs")
@@ -193,6 +194,7 @@ class App:
         }
 
         self._build_ui()
+        self._load_extra_proxy_list()
         self.accounts = self._load_accounts_cache() or ACCOUNTS
         self._load_rows()
         self.profile_accounts = self._load_profile_accounts_cache()
@@ -1669,6 +1671,43 @@ class App:
         elif kind == "fb_profile":
             self._save_fb_profile_accounts_cache()
 
+    def _load_extra_proxy_list(self) -> None:
+        try:
+            if not os.path.exists(self._extra_proxy_file):
+                return
+            with open(self._extra_proxy_file, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            return
+        proxies = []
+        for raw in content.splitlines():
+            line = (raw or "").strip()
+            if not line:
+                continue
+            for sep in (",", "\t", ";", " "):
+                if sep in line:
+                    line = line.split(sep, 1)[0].strip()
+                    break
+            if line:
+                proxies.append(line)
+        if not proxies:
+            return
+        with self._extra_proxy_lock:
+            self._extra_proxies = proxies
+            self._extra_proxy_idx = 0
+
+    def _save_extra_proxy_list(self) -> None:
+        try:
+            with self._extra_proxy_lock:
+                proxies = list(self._extra_proxies)
+        except Exception:
+            return
+        try:
+            with open(self._extra_proxy_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(proxies))
+        except Exception:
+            pass
+
     def _replace_proxy_for_account(self, acc: dict, item_id: str, kind: str, tree: ttk.Treeview) -> bool:
         new_proxy = self._next_proxy()
         if not new_proxy:
@@ -1756,6 +1795,35 @@ class App:
             self.log_box.see(tk.END)
             self.log_box.configure(state="disabled")
         self.root.after(0, _append)
+
+    def _clear_log_files(self) -> None:
+        paths = [
+            os.path.join(_THIS_DIR, "logs", "app.log"),
+            os.path.join(_THIS_DIR, "logs", "uploads.log"),
+            os.path.join(_THIS_DIR, "logs", "downloads.log"),
+            os.path.join(_THIS_DIR, "logs", "errors.log"),
+            os.path.join(_THIS_DIR, "logs", "threads.log"),
+            os.path.join(_THIS_DIR, "logs", "failed_accounts.log"),
+        ]
+        for path in paths:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8"):
+                    pass
+            except Exception:
+                pass
+
+    def _clear_log_view(self) -> None:
+        try:
+            self.log_box.configure(state="normal")
+            self.log_box.delete("1.0", tk.END)
+            self.log_box.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _clear_all_logs(self) -> None:
+        self._clear_log_files()
+        self._clear_log_view()
 
     def _format_login_error(self, err: str) -> str:
         text = (err or "").strip().lower()
@@ -2614,6 +2682,7 @@ class App:
         with self._extra_proxy_lock:
             self._extra_proxies = proxies
             self._extra_proxy_idx = 0
+        self._save_extra_proxy_list()
         self._log(f"[PROXY] Loaded {len(proxies)} proxies")
 
     def import_profile_accounts(self) -> None:
@@ -2814,6 +2883,7 @@ class App:
     def start_profile_jobs(self) -> None:
         if self._profile_batch_running or self.executor is not None:
             return
+        self._clear_all_logs()
         if self._repeat_after_id:
             try:
                 self.root.after_cancel(self._repeat_after_id)
@@ -3062,6 +3132,7 @@ class App:
             return
         if self.executor is not None:
             return
+        self._clear_all_logs()
         if self._repeat_after_id:
             try:
                 self.root.after_cancel(self._repeat_after_id)
@@ -3513,6 +3584,7 @@ class App:
     def start_fb_profile_jobs(self) -> None:
         if self.executor is not None:
             return
+        self._clear_all_logs()
         try:
             max_threads = int(self.entry_threads.get())
             if max_threads <= 0:
@@ -3755,6 +3827,7 @@ class App:
     def start_fb_jobs(self) -> None:
         if self.executor is not None:
             return
+        self._clear_all_logs()
         try:
             max_threads = int(self.entry_threads.get())
             if max_threads <= 0:
@@ -4062,13 +4135,37 @@ class App:
                     break
     
                 self._set_fb_status(item_id, f"DOWNLOAD {success_count+1}/{max_videos}...")
-                ok_dl, path_or_err, vid_id, title = download_one_facebook(
-                    acc["uid"],
-                    row_url,
-                    self._log_progress,
-                    cookie_path=os.path.join(_THIS_DIR, "cookiefb.txt"),
-                    timeout_s=300,
-                )
+                retry_dl = 0
+                skip_current = False
+                skip_account = False
+                ok_dl = False
+                path_or_err = ""
+                vid_id = ""
+                title = ""
+                while True:
+                    ok_dl, path_or_err, vid_id, title = download_one_facebook(
+                        acc["uid"],
+                        row_url,
+                        self._log_progress,
+                        cookie_path=os.path.join(_THIS_DIR, "cookiefb.txt"),
+                        timeout_s=120,
+                    )
+                    if ok_dl:
+                        break
+                    err_text = str(path_or_err)
+                    lower = err_text.lower()
+                    is_timeout = "timeout" in lower or "timed out" in lower
+                    if is_timeout:
+                        if retry_dl < 1:
+                            retry_dl += 1
+                            self._log(f"[{acc['uid']}] FB DOWNLOAD TIMEOUT - RETRY 1/1")
+                            continue
+                        self._log(f"[{acc['uid']}] FB DOWNLOAD TIMEOUT - SKIP ACCOUNT")
+                        self._set_fb_status(item_id, "DOWNLOAD TIMEOUT")
+                        self._record_failed(item_id, acc, "DOWNLOAD TIMEOUT")
+                        skip_account = True
+                        break
+                    break
                 mark_id = vid_id or row_id or _extract_fb_video_id(row_url)
                 if not ok_dl:
                     err_text = str(path_or_err)
@@ -4078,6 +4175,10 @@ class App:
                             mark_uploaded(acc["uid"], mark_id)
                         except Exception:
                             pass
+                        continue
+                    if skip_account:
+                        break
+                    if skip_current:
                         continue
                     self._set_fb_status(item_id, f"DOWNLOAD ERR: {err_text}")
                     self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
@@ -5091,6 +5192,7 @@ class App:
                 sem.release()
 
     def stop_jobs(self) -> None:
+        self._clear_all_logs()
         self.stop_event.set()
         self._fixed_threads = None
         try:
@@ -5353,6 +5455,7 @@ class App:
                         title = ""
                         ok_dl = False
                         skip_current = False
+                        skip_account = False
                         while True:
                             ok_dl, path_or_err, vid_id, title = download_one(
                                 acc["uid"],
@@ -5360,12 +5463,13 @@ class App:
                                 self._log_progress,
                                 cookie_path=COOKIES_FILE,
                                 fallback_cookie_path=COOKIES_FILE_FALLBACK,
-                                timeout_s=300,
+                                timeout_s=120,
                             )
                             if ok_dl:
                                 break
                             err_text = str(path_or_err)
                             lower = err_text.lower()
+                            is_timeout = "timeout" in lower or "timed out" in lower
                             is_restricted = (
                                 "video restricted" in lower
                                 or "members-only" in lower
@@ -5393,12 +5497,17 @@ class App:
                                     self._log(f"[{acc['uid']}] Could not mark video: {e}")
                                 skip_current = True
                                 break
-                            if "timeout" in lower or "timed out" in lower:
-                                self._set_status(item_id, f"DOWNLOAD ERR: {err_text}")
-                                self._log(f"[{acc['uid']}] DOWNLOAD ERR: {err_text}")
-                                self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
-                                return
-    
+                            if is_timeout:
+                                if retry_dl < 1:
+                                    retry_dl += 1
+                                    self._log(f"[{acc['uid']}] DOWNLOAD TIMEOUT - RETRY 1/1")
+                                    continue
+                                self._log(f"[{acc['uid']}] DOWNLOAD TIMEOUT - SKIP ACCOUNT")
+                                self._set_status(item_id, "DOWNLOAD TIMEOUT")
+                                self._record_failed(item_id, acc, "DOWNLOAD TIMEOUT")
+                                skip_account = True
+                                break
+
                             if is_restricted and retry_dl < 1:
                                 retry_dl += 1
                                 self._log(f"[{acc['uid']}] DOWNLOAD RETRY (restricted): {row_url}")
@@ -5416,6 +5525,8 @@ class App:
                             break
     
                         mark_id = vid_id or row_id or _extract_video_id(row_url)
+                        if skip_account:
+                            break
                         if skip_current:
                             continue
                         if ok_dl:
