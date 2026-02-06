@@ -1393,13 +1393,9 @@ class App:
                 "tags": self.tree.item(iid, "tags"),
             }
         self.tree.delete(*self.tree.get_children())
-        seen = set()
         out_idx = 1
         for row in self.accounts:
             email = row.get("uid", "")
-            if email in seen:
-                continue
-            seen.add(email)
             cached = state.get(email, {})
             posts = cached.get("posts", row.get("posts", ""))
             followers = cached.get("followers", row.get("followers", ""))
