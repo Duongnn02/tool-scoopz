@@ -72,18 +72,41 @@ def fetch_followers(driver_path: str, remote_debugging_address: str, logger: Log
                 logger(f"[FOLLOW] Read followers err: {e}")
             followers = None
 
+        posts = None
+        # Try to read posts from common profile stats block
         try:
-            posts_el = wait.until(
-                EC.visibility_of_element_located(
-                    (By.XPATH, "//div[.//span[normalize-space()='Posts' or normalize-space()='Post']]/span[contains(@class,'font-bold')]")
+            stats_root = wait.until(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        "//div[contains(@class,'items-center') and .//span[normalize-space()='Posts' or normalize-space()='Post']]",
+                    )
                 )
             )
-            txt = (posts_el.text or "").strip()
-            posts = _parse_count(txt)
+            spans = stats_root.find_elements(By.XPATH, ".//span[contains(@class,'font-bold')]")
+            if spans:
+                txt = (spans[0].text or "").strip()
+                posts = _parse_count(txt)
         except Exception as e:
             if logger:
-                logger(f"[FOLLOW] Read posts err: {e}")
+                logger(f"[FOLLOW] Posts block err: {e}")
             posts = None
+        # Fallback: find exact 'Posts' label and get previous bold span
+        if posts is None:
+            try:
+                posts_lbl = driver.find_element(
+                    By.XPATH,
+                    "//span[normalize-space()='Posts' or normalize-space()='Post']",
+                )
+                try:
+                    prev = posts_lbl.find_element(By.XPATH, "preceding-sibling::span[contains(@class,'font-bold')][1]")
+                except Exception:
+                    prev = posts_lbl.find_element(By.XPATH, "../span[contains(@class,'font-bold')][1]")
+                txt = (prev.text or "").strip()
+                posts = _parse_count(txt)
+            except Exception as e:
+                if logger:
+                    logger(f"[FOLLOW] Read posts err: {e}")
 
         try:
             profile_url = (driver.current_url or "").strip()

@@ -161,6 +161,12 @@ class App:
             "YTB": {"started": 0, "release_at": 0.0},
             "FB": {"started": 0, "release_at": 0.0},
         }
+        self._resume_pending = {
+            "upload": set(),
+            "profile": set(),
+            "fb": set(),
+            "fb_profile": set(),
+        }
         self._count_var = tk.StringVar(value="Total: 0")
         self._profile_count_var = tk.StringVar(value="Total Profile: 0")
         self._fb_count_var = tk.StringVar(value="Total FB: 0")
@@ -204,7 +210,7 @@ class App:
         self.entry_videos.insert(0, "1")
         self.entry_videos.pack(side="left", padx=(5, 15))
 
-        self.chk_repeat = ttk.Checkbutton(top, text="Repeat", variable=self.repeat_var)
+        self.chk_repeat = ttk.Checkbutton(top, text="Lặp lại", variable=self.repeat_var)
         self.chk_repeat.pack(side="left", padx=(0, 6))
         ttk.Label(top, text="Delay (min):").pack(side="left")
         self.entry_repeat_delay = ttk.Entry(top, width=6)
@@ -231,6 +237,12 @@ class App:
         self.entry_search_email.bind("<FocusOut>", self._search_focus_out)
         self.btn_search_email = ttk.Button(top2, text="FIND", command=self._search_email)
         self.btn_search_email.pack(side="left", padx=(0, 12))
+        self.btn_sort_follow = ttk.Button(top2, text="SORT FOLLOW", command=lambda: self._sort_tree_by_column(self.tree, "followers"))
+        self.btn_sort_follow.pack(side="left", padx=(0, 6))
+        self.btn_sort_posts = ttk.Button(top2, text="SORT POSTS", command=lambda: self._sort_tree_by_column(self.tree, "posts"))
+        self.btn_sort_posts.pack(side="left", padx=(0, 6))
+        self.btn_sort_reset = ttk.Button(top2, text="RESET ORDER", command=self._reset_upload_tree_order)
+        self.btn_sort_reset.pack(side="left", padx=(0, 12))
 
         self.lbl_total = ttk.Label(top2, textvariable=self._count_var)
         self.lbl_total.pack(side="left", padx=(0, 10))
@@ -263,11 +275,13 @@ class App:
         self.tab_fb = ttk.Frame(self.notebook)
         self.tab_fb_profile = ttk.Frame(self.notebook)
         self.tab_interact = ttk.Frame(self.notebook)
+        self.tab_stats = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_upload, text="UPLOAD")
         self.notebook.add(self.tab_profile, text="PROFILE")
         self.notebook.add(self.tab_fb, text="FB")
         self.notebook.add(self.tab_fb_profile, text="FB PROFILE")
         self.notebook.add(self.tab_interact, text="INTERACT")
+        self.notebook.add(self.tab_stats, text="THỐNG KÊ")
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         # Add Select All / Deselect All buttons for tab_upload
@@ -406,6 +420,8 @@ class App:
         self.btn_import_fb.pack(side="left")
         ttk.Button(fb_top, text="Select All", command=self._select_all_fb_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(fb_top, text="Deselect All", command=self._deselect_all_fb_accounts).pack(side="left")
+        ttk.Button(fb_top, text="SORT EMAIL", command=lambda: self._sort_tree_by_column(self.fb_tree, "email")).pack(side="left", padx=(8, 4))
+        ttk.Button(fb_top, text="RESET ORDER", command=lambda: self._reorder_tree_by_accounts(self.fb_tree, self.fb_accounts)).pack(side="left")
 
         self.fb_tree.bind("<Button-1>", self._on_fb_tree_click)
         self.fb_tree.bind("<B1-Motion>", self._on_fb_tree_drag)
@@ -493,6 +509,47 @@ class App:
         self.interact_urls = tk.Text(interact_body, height=12)
         self.interact_urls.pack(fill="both", expand=True)
 
+        stats_top = ttk.Frame(self.tab_stats)
+        stats_top.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(stats_top, text="Posts >= ").pack(side="left")
+        self.entry_stats_min_posts = ttk.Entry(stats_top, width=6)
+        self.entry_stats_min_posts.insert(0, "50")
+        self.entry_stats_min_posts.pack(side="left", padx=(5, 10))
+        ttk.Label(stats_top, text="Followers < ").pack(side="left")
+        self.entry_stats_min_followers = ttk.Entry(stats_top, width=6)
+        self.entry_stats_min_followers.insert(0, "100")
+        self.entry_stats_min_followers.pack(side="left", padx=(5, 10))
+        self.btn_stats_refresh = ttk.Button(stats_top, text="REFRESH", command=self._refresh_stats)
+        self.btn_stats_refresh.pack(side="left")
+
+        stats_table = ttk.Frame(self.tab_stats)
+        stats_table.pack(fill="both", expand=True, padx=8, pady=8)
+        self.stats_tree = ttk.Treeview(
+            stats_table,
+            columns=("stt", "source", "email", "posts", "followers"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.stats_tree.heading("stt", text="STT")
+        self.stats_tree.column("stt", width=50, anchor="center")
+        self.stats_tree.heading("source", text="SOURCE")
+        self.stats_tree.column("source", width=90, anchor="center")
+        self.stats_tree.heading("email", text="EMAIL")
+        self.stats_tree.column("email", width=260)
+        self.stats_tree.heading("posts", text="POSTS")
+        self.stats_tree.column("posts", width=90, anchor="center")
+        self.stats_tree.heading("followers", text="FOLLOWERS")
+        self.stats_tree.column("followers", width=100, anchor="center")
+        self.stats_tree.tag_configure("low_ratio", foreground="red")
+        stats_scroll = ttk.Scrollbar(stats_table, orient="vertical", command=self.stats_tree.yview)
+        self.stats_tree.configure(yscrollcommand=stats_scroll.set)
+        self.stats_tree.grid(row=0, column=0, sticky="nsew")
+        stats_scroll.grid(row=0, column=1, sticky="ns")
+        stats_table.grid_rowconfigure(0, weight=1)
+        stats_table.grid_columnconfigure(0, weight=1)
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected(True))
         self.menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected(False))
@@ -538,6 +595,69 @@ class App:
             pass
         return 10
 
+    def _on_tab_changed(self, _evt=None) -> None:
+        try:
+            if self.notebook.nametowidget(self.notebook.select()) == self.tab_stats:
+                self._refresh_stats()
+        except Exception:
+            pass
+
+    def _refresh_stats(self) -> None:
+        def _to_num(val) -> int:
+            if val is None or val == "":
+                return 0
+            text = str(val).strip()
+            if not text:
+                return 0
+            digits = re.sub(r"[^0-9]", "", text)
+            if not digits:
+                return 0
+            try:
+                return int(digits)
+            except Exception:
+                return 0
+
+        try:
+            min_posts = int(self.entry_stats_min_posts.get() or 0)
+        except Exception:
+            min_posts = 0
+        try:
+            max_followers = int(self.entry_stats_min_followers.get() or 0)
+        except Exception:
+            max_followers = 0
+
+        try:
+            self.stats_tree.delete(*self.stats_tree.get_children())
+        except Exception:
+            pass
+
+        rows = []
+        for acc in self.accounts:
+            email = (acc.get("uid") or "").strip()
+            posts = _to_num(acc.get("posts"))
+            followers = _to_num(acc.get("followers"))
+            if posts < min_posts:
+                continue
+            rows.append(("UPLOAD", email, posts, followers))
+
+        for acc in self.fb_accounts:
+            email = (acc.get("uid") or "").strip()
+            posts = _to_num(acc.get("posts"))
+            followers = _to_num(acc.get("followers"))
+            if posts < min_posts:
+                continue
+            rows.append(("FB", email, posts, followers))
+
+        for idx, (source, email, posts, followers) in enumerate(rows, start=1):
+            tags = ("low_ratio",) if max_followers > 0 and followers < max_followers else ()
+            self.stats_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(idx, source, email, posts, followers),
+                tags=tags,
+            )
+
     def start_join_circles(self) -> None:
         if self.executor is not None:
             return
@@ -552,8 +672,8 @@ class App:
         self.stop_event.clear()
         self.executor = ThreadPoolExecutor(max_workers=max_threads)
         self.login_semaphore = threading.BoundedSemaphore(max_threads)
-        checked_items = [iid for iid in self.tree.get_children() if self.tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        checked_emails = self._get_checked_email_set(self.tree)
+        if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             self.executor = None
             return
@@ -567,7 +687,7 @@ class App:
         taskbar_h = 40
         usable_w = screen_w - (gap * 2)
         usable_h = (screen_h - taskbar_h) - (gap * 2)
-        active_count = len(checked_items)
+        active_count = len(checked_emails)
         cols = min(5, active_count)
         rows_layout = min(2, max(1, math.ceil(active_count / cols)))
         win_w = int((usable_w - gap * (cols - 1)) / cols)
@@ -578,22 +698,23 @@ class App:
         join_max = self._get_join_max()
         slot_idx = 0
         max_slots = cols * rows_layout
-        for item_id in checked_items:
-            try:
-                idx = int(item_id) - 1
-            except Exception:
+        email_to_iid = self._map_email_to_item_id(self.tree)
+        for acc in self.accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
                 continue
-            if 0 <= idx < len(self.accounts):
-                acc = self.accounts[idx]
-                pos = slot_idx % max_slots
-                col = pos % cols
-                row = pos // cols
-                x = gap + col * (win_w + gap)
-                y = gap + row * (win_h + gap)
-                win_pos = f"{x},{y}"
-                win_size = f"{win_w},{win_h}"
-                self.executor.submit(self._join_circles_worker, item_id, acc, win_pos, win_size, join_max)
-                slot_idx += 1
+            item_id = email_to_iid.get(email)
+            if not item_id:
+                continue
+            pos = slot_idx % max_slots
+            col = pos % cols
+            row = pos // cols
+            x = gap + col * (win_w + gap)
+            y = gap + row * (win_h + gap)
+            win_pos = f"{x},{y}"
+            win_size = f"{win_w},{win_h}"
+            self.executor.submit(self._join_circles_worker, item_id, acc, win_pos, win_size, join_max)
+            slot_idx += 1
 
         def _waiter():
             try:
@@ -965,10 +1086,13 @@ class App:
             tree = self.tree
             rows = self.accounts
         matches = []
-        for idx, row in enumerate(rows, start=1):
-            email = (row.get("uid") or "").strip().lower()
-            if q in email:
-                matches.append(str(idx))
+        email_to_iid = self._map_email_to_item_id(tree)
+        for row in rows:
+            email = (row.get("uid") or "").strip()
+            if q in email.lower():
+                iid = email_to_iid.get(email)
+                if iid:
+                    matches.append(iid)
         if not matches:
             self._log(f"[SEARCH] No match: {q}")
             return
@@ -1290,6 +1414,96 @@ class App:
         except Exception:
             pass
 
+    def _sort_tree_by_column(self, tree: ttk.Treeview, col: str) -> None:
+        def _to_num(val) -> int:
+            if val is None or val == "":
+                return -1
+            text = str(val).strip()
+            if not text:
+                return -1
+            digits = re.sub(r"[^0-9]", "", text)
+            if not digits:
+                return -1
+            try:
+                return int(digits)
+            except Exception:
+                return -1
+
+        try:
+            items = list(tree.get_children())
+            items.sort(key=lambda iid: _to_num(tree.set(iid, col)), reverse=True)
+            for idx, iid in enumerate(items):
+                tree.move(iid, "", idx)
+        except Exception:
+            pass
+
+    def _reset_upload_tree_order(self) -> None:
+        # Rebuild upload tree in original accounts order
+        self._rebuild_tree_from_accounts()
+
+    def _get_checked_email_set(self, tree: ttk.Treeview) -> set:
+        emails = set()
+        try:
+            for iid in tree.get_children():
+                if tree.set(iid, "chk") != "v":
+                    continue
+                email = (tree.set(iid, "email") or "").strip()
+                if email:
+                    emails.add(email)
+        except Exception:
+            pass
+        return emails
+
+    def _map_email_to_item_id(self, tree: ttk.Treeview) -> dict:
+        mapping = {}
+        try:
+            for iid in tree.get_children():
+                email = (tree.set(iid, "email") or "").strip()
+                if email:
+                    mapping[email] = iid
+        except Exception:
+            pass
+        return mapping
+
+    def _status_is_done(self, status: str, done_keys: set) -> bool:
+        text = (status or "").strip().upper()
+        return any(k in text for k in done_keys)
+
+    def _collect_pending_emails(self, tree: ttk.Treeview, done_keys: set) -> set:
+        pending = set()
+        try:
+            for iid in tree.get_children():
+                email = (tree.set(iid, "email") or "").strip()
+                if not email:
+                    continue
+                status = tree.set(iid, "status")
+                if not self._status_is_done(status, done_keys):
+                    pending.add(email)
+        except Exception:
+            pass
+        return pending
+
+    def _prompt_resume(self, kind: str, count: int) -> bool:
+        msg = (
+            f"Có {count} tài khoản chưa OK.\n"
+            f"Bạn muốn chạy tiếp các tài khoản chưa OK không?"
+        )
+        return messagebox.askyesno("Tiep tuc", msg)
+
+    def _reorder_tree_by_accounts(self, tree: ttk.Treeview, accounts: list) -> None:
+        try:
+            email_to_iid = self._map_email_to_item_id(tree)
+            idx = 0
+            for acc in accounts:
+                email = (acc.get("uid") or "").strip()
+                iid = email_to_iid.get(email)
+                if not iid:
+                    continue
+                tree.move(iid, "", idx)
+                idx += 1
+        except Exception:
+            pass
+
     def _apply_status_tag(self, item_id: str, status: str) -> None:
         status_upper = (status or "").upper()
         if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
@@ -1519,8 +1733,7 @@ class App:
                             acc["posts"] = posts
                         break
                 self._save_accounts_cache()
-                if followers is not None:
-                    self._schedule_follow_sort()
+                # Keep original order; no auto sort after fetching followers
         except Exception:
             pass
 
@@ -1975,70 +2188,64 @@ class App:
 
     def _get_selected_accounts(self):
         items = []
+        acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.accounts}
         for iid in self.tree.selection():
-            try:
-                idx = int(iid) - 1
-            except Exception:
-                continue
-            if 0 <= idx < len(self.accounts):
-                items.append((iid, self.accounts[idx]))
+            email = (self.tree.set(iid, "email") or "").strip()
+            acc = acc_by_email.get(email)
+            if acc:
+                items.append((iid, acc))
         return items
 
     def _get_selected_profile_accounts(self):
         items = []
+        acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.profile_accounts}
         for iid in self.profile_tree.selection():
-            try:
-                idx = int(iid) - 1
-            except Exception:
-                continue
-            if 0 <= idx < len(self.profile_accounts):
-                items.append((iid, self.profile_accounts[idx]))
+            email = (self.profile_tree.set(iid, "email") or "").strip()
+            acc = acc_by_email.get(email)
+            if acc:
+                items.append((iid, acc))
         return items
 
     def _get_checked_accounts(self):
         items = []
+        acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.accounts}
         for iid in self.tree.get_children():
             if self.tree.set(iid, "chk") != "v":
                 continue
-            try:
-                idx = int(iid) - 1
-            except Exception:
-                continue
-            if 0 <= idx < len(self.accounts):
-                items.append((iid, self.accounts[idx]))
+            email = (self.tree.set(iid, "email") or "").strip()
+            acc = acc_by_email.get(email)
+            if acc:
+                items.append((iid, acc))
         return items
 
     def _get_checked_profile_accounts(self):
         items = []
+        acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.profile_accounts}
         for iid in self.profile_tree.get_children():
             if self.profile_tree.set(iid, "chk") != "v":
                 continue
-            try:
-                idx = int(iid) - 1
-            except Exception:
-                continue
-            if 0 <= idx < len(self.profile_accounts):
-                items.append((iid, self.profile_accounts[idx]))
+            email = (self.profile_tree.set(iid, "email") or "").strip()
+            acc = acc_by_email.get(email)
+            if acc:
+                items.append((iid, acc))
         return items
 
     def _get_context_accounts(self):
         if self._context_item:
-            try:
-                idx = int(self._context_item) - 1
-            except Exception:
-                return []
-            if 0 <= idx < len(self.accounts):
-                return [(self._context_item, self.accounts[idx])]
+            email = (self.tree.set(self._context_item, "email") or "").strip()
+            acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.accounts}
+            acc = acc_by_email.get(email)
+            if acc:
+                return [(self._context_item, acc)]
         return []
 
     def _get_context_profile_accounts(self):
         if self._profile_context_item:
-            try:
-                idx = int(self._profile_context_item) - 1
-            except Exception:
-                return []
-            if 0 <= idx < len(self.profile_accounts):
-                return [(self._profile_context_item, self.profile_accounts[idx])]
+            email = (self.profile_tree.set(self._profile_context_item, "email") or "").strip()
+            acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.profile_accounts}
+            acc = acc_by_email.get(email)
+            if acc:
+                return [(self._profile_context_item, acc)]
         return []
 
     def menu_login_selected(self) -> None:
@@ -2542,8 +2749,16 @@ class App:
         self._profile_retry_round = 0
         with self.profile_failed_lock:
             self.profile_failed_accounts = []
-        checked_items = [iid for iid in self.profile_tree.get_children() if self.profile_tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        pending = self._resume_pending.get("profile") or set()
+        if pending:
+            if self._prompt_resume("profile", len(pending)):
+                checked_emails = pending
+            else:
+                self._resume_pending["profile"] = set()
+                checked_emails = self._get_checked_email_set(self.profile_tree)
+        else:
+            checked_emails = self._get_checked_email_set(self.profile_tree)
+        if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
         self._profile_batch_running = True
@@ -2716,13 +2931,13 @@ class App:
         def _batch_runner():
             try:
                 items = []
-                for item_id in checked_items:
-                    try:
-                        idx = int(item_id) - 1
-                    except Exception:
-                        continue
-                    if 0 <= idx < len(self.profile_accounts):
-                        items.append((item_id, self.profile_accounts[idx]))
+                email_to_iid = self._map_email_to_item_id(self.profile_tree)
+                for acc in self.profile_accounts:
+                    email = (acc.get("uid") or "").strip()
+                    if email in checked_emails:
+                        item_id = email_to_iid.get(email)
+                        if item_id:
+                            items.append((item_id, acc))
 
                 if not items:
                     return
@@ -2789,8 +3004,17 @@ class App:
         self.login_semaphore = threading.BoundedSemaphore(max_threads)
         self.upload_retry_semaphore = threading.BoundedSemaphore(max_threads)
 
-        checked_items = [iid for iid in self.tree.get_children() if self.tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        self._reset_upload_tree_order()
+        pending = self._resume_pending.get("upload") or set()
+        if pending:
+            if self._prompt_resume("upload", len(pending)):
+                checked_emails = pending
+            else:
+                self._resume_pending["upload"] = set()
+                checked_emails = self._get_checked_email_set(self.tree)
+        else:
+            checked_emails = self._get_checked_email_set(self.tree)
+        if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
 
@@ -2805,7 +3029,7 @@ class App:
         taskbar_h = 40  # Reserve space for taskbar
         usable_w = screen_w - (gap * 2)
         usable_h = (screen_h - taskbar_h) - (gap * 2)
-        active_count = len(checked_items)
+        active_count = len(checked_emails)
         
         # Fixed layout: 5 columns, max 2 rows (overflow cycles back to row 1)
         cols = min(5, active_count)  # Max 5 per row
@@ -2840,9 +3064,13 @@ class App:
 
         slot_idx = 0
         max_slots = cols * rows_layout
-        for idx, acc in enumerate(self.accounts, start=1):
-            item_id = str(idx)
-            if item_id not in checked_items:
+        email_to_iid = self._map_email_to_item_id(self.tree)
+        for acc in self.accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
+                continue
+            item_id = email_to_iid.get(email)
+            if not item_id:
                 continue
             self._bind_item_email(item_id, acc.get("uid", ""))
             pos = slot_idx % max_slots
@@ -2913,8 +3141,8 @@ class App:
             return
 
         # Get checked items (should still be checked from previous run)
-        checked_items = [iid for iid in self.tree.get_children() if self.tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        checked_emails = self._get_checked_email_set(self.tree)
+        if not checked_emails:
             return
 
         # Clear executor state
@@ -2949,7 +3177,7 @@ class App:
         taskbar_h = 40
         usable_w = screen_w - (gap * 2)
         usable_h = (screen_h - taskbar_h) - (gap * 2)
-        active_count = len(checked_items)
+        active_count = len(checked_emails)
 
         cols = min(5, active_count)
         rows_layout = min(2, max(1, math.ceil(active_count / cols)))
@@ -2964,11 +3192,15 @@ class App:
         slot_idx = 0
         max_slots = cols * rows_layout
 
-        self._log(f"\n[REPEAT] Starting repeat cycle... (checked: {len(checked_items)} accounts)")
+        self._log(f"\n[REPEAT] Starting repeat cycle... (checked: {len(checked_emails)} accounts)")
 
-        for idx, acc in enumerate(self.accounts, start=1):
-            item_id = str(idx)
-            if item_id not in checked_items:
+        email_to_iid = self._map_email_to_item_id(self.tree)
+        for acc in self.accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
+                continue
+            item_id = email_to_iid.get(email)
+            if not item_id:
                 continue
             self._bind_item_email(item_id, acc.get("uid", ""))
             
@@ -3048,8 +3280,8 @@ class App:
             messagebox.showerror("Loi", "So luong phai > 0")
             return
 
-        checked_items = [iid for iid in self.tree.get_children() if self.tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        checked_emails = self._get_checked_email_set(self.tree)
+        if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
 
@@ -3057,9 +3289,13 @@ class App:
         self.executor = ThreadPoolExecutor(max_workers=max_threads)
 
         futures = []
-        for idx, acc in enumerate(self.accounts, start=1):
-            item_id = str(idx)
-            if item_id not in checked_items:
+        email_to_iid = self._map_email_to_item_id(self.tree)
+        for acc in self.accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
+                continue
+            item_id = email_to_iid.get(email)
+            if not item_id:
                 continue
             futures.append(self.executor.submit(self._scan_worker, item_id, acc))
 
@@ -3102,20 +3338,32 @@ class App:
             messagebox.showerror("Loi", "So luong phai > 0")
             return
 
-        checked_items = [iid for iid in self.fb_tree.get_children() if self.fb_tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        pending = self._resume_pending.get("fb") or set()
+        if pending:
+            if self._prompt_resume("fb", len(pending)):
+                checked_emails = pending
+            else:
+                self._resume_pending["fb"] = set()
+                checked_emails = self._get_checked_email_set(self.fb_tree)
+        else:
+            checked_emails = self._get_checked_email_set(self.fb_tree)
+        if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
 
         self.stop_event.clear()
+        self._reorder_tree_by_accounts(self.fb_tree, self.fb_accounts)
         selected = []
         email_to_item = {}
-        for idx, acc in enumerate(self.fb_accounts, start=1):
-            item_id = str(idx)
-            if item_id not in checked_items:
+        email_to_iid = self._map_email_to_item_id(self.fb_tree)
+        for acc in self.fb_accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
+                continue
+            item_id = email_to_iid.get(email)
+            if not item_id:
                 continue
             selected.append(acc)
-            email = (acc.get("uid") or "").strip()
             if email:
                 email_to_item[email] = item_id
                 self._set_fb_status(item_id, "QUEUED")
@@ -3183,8 +3431,16 @@ class App:
             messagebox.showerror("Loi", "So luong phai > 0")
             return
 
-        checked_items = [iid for iid in self.fb_profile_tree.get_children() if self.fb_profile_tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        pending = self._resume_pending.get("fb_profile") or set()
+        if pending:
+            if self._prompt_resume("fb_profile", len(pending)):
+                checked_emails = pending
+            else:
+                self._resume_pending["fb_profile"] = set()
+                checked_emails = self._get_checked_email_set(self.fb_profile_tree)
+        else:
+            checked_emails = self._get_checked_email_set(self.fb_profile_tree)
+        if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
 
@@ -3202,7 +3458,7 @@ class App:
         taskbar_h = 40
         usable_w = screen_w - (gap * 2)
         usable_h = (screen_h - taskbar_h) - (gap * 2)
-        active_count = len(checked_items)
+        active_count = len(checked_emails)
         cols = min(5, active_count)
         rows_layout = min(2, max(1, math.ceil(active_count / cols)))
         win_w = int((usable_w - gap * (cols - 1)) / cols)
@@ -3213,9 +3469,13 @@ class App:
         futures = []
         slot_idx = 0
         max_slots = cols * rows_layout
-        for idx, acc in enumerate(self.fb_profile_accounts, start=1):
-            item_id = str(idx)
-            if item_id not in checked_items:
+        email_to_iid = self._map_email_to_item_id(self.fb_profile_tree)
+        for acc in self.fb_profile_accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
+                continue
+            item_id = email_to_iid.get(email)
+            if not item_id:
                 continue
             pos = slot_idx % max_slots
             col = pos % cols
@@ -3414,8 +3674,8 @@ class App:
             return
 
         self._fixed_threads = max_threads
-        checked_items = [iid for iid in self.fb_tree.get_children() if self.fb_tree.set(iid, "chk") == "v"]
-        if not checked_items:
+        checked_emails = self._get_checked_email_set(self.fb_tree)
+        if not checked_emails:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
 
@@ -3438,7 +3698,7 @@ class App:
         taskbar_h = 40
         usable_w = screen_w - (gap * 2)
         usable_h = (screen_h - taskbar_h) - (gap * 2)
-        active_count = len(checked_items)
+        active_count = len(checked_emails)
         cols = min(5, active_count)
         rows_layout = min(2, max(1, math.ceil(active_count / cols)))
         win_w = int((usable_w - gap * (cols - 1)) / cols)
@@ -3449,9 +3709,14 @@ class App:
         futures = []
         slot_idx = 0
         max_slots = cols * rows_layout
-        for idx, acc in enumerate(self.fb_accounts, start=1):
-            item_id = str(idx)
-            if item_id not in checked_items:
+        self._reorder_tree_by_accounts(self.fb_tree, self.fb_accounts)
+        email_to_iid = self._map_email_to_item_id(self.fb_tree)
+        for acc in self.fb_accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
+                continue
+            item_id = email_to_iid.get(email)
+            if not item_id:
                 continue
             self._bind_item_email(item_id, acc.get("uid", ""))
             pos = slot_idx % max_slots
@@ -4717,6 +4982,13 @@ class App:
     def stop_jobs(self) -> None:
         self.stop_event.set()
         self._fixed_threads = None
+        try:
+            self._resume_pending["upload"] = self._collect_pending_emails(self.tree, {"UPLOAD OK", "DONE"})
+            self._resume_pending["profile"] = self._collect_pending_emails(self.profile_tree, {"DONE"})
+            self._resume_pending["fb"] = self._collect_pending_emails(self.fb_tree, {"UPLOAD OK", "DONE"})
+            self._resume_pending["fb_profile"] = self._collect_pending_emails(self.fb_profile_tree, {"DONE"})
+        except Exception:
+            pass
         self._reset_batch_pause_state("YTB")
         self._reset_batch_pause_state("FB")
         if self._repeat_after_id:
