@@ -41,7 +41,7 @@ from operation_orchestrator import initialize_orchestrator
 
 ACCOUNTS = []
 PROFILE_BATCH_SIZE = 100
-PROFILE_BATCH_PAUSE_SEC = 600
+PROFILE_BATCH_PAUSE_SEC = 300
 PROFILE_BATCH_STAGGER_SEC = 0.15
 PROFILE_BATCH_PAUSE_CHECK_SEC = 2.0
 FIXED_SCAN_FOLDERS = {
@@ -144,11 +144,15 @@ class App:
         self._fb_drag_start = None
         self._fb_profile_dragging = False
         self._fb_profile_drag_start = None
+        self._extra_proxies = []
+        self._extra_proxy_idx = 0
+        self._extra_proxy_lock = threading.Lock()
         self._cell_editor = None
         self.repeat_var = tk.BooleanVar(value=False)
         self._repeat_after_id = None
         self._repeat_enabled = False
         self._repeat_delay_sec = 0
+        self._fixed_threads = None
         self._retry_round = 0
         self._profile_retry_round = 0
         self._profile_batch_running = False
@@ -246,6 +250,8 @@ class App:
         self.btn_reload.pack(side="left", padx=(8, 0))
         self.btn_import = ttk.Button(top, text="IMPORT", command=self.import_accounts)
         self.btn_import.pack(side="left", padx=(8, 0))
+        self.btn_import_proxy = ttk.Button(top, text="IMPORT PROXY", command=self.import_proxy_list)
+        self.btn_import_proxy.pack(side="left", padx=(8, 0))
         self.btn_scan = ttk.Button(top, text="SCAN", command=self.start_scan)
         self.btn_scan.pack(side="left", padx=(8, 0))
         self.btn_clear_videos = ttk.Button(top, text="CLEAR VIDEOS", command=self.clear_all_email_videos)
@@ -275,7 +281,7 @@ class App:
         upload_table.pack(fill="both", expand=True, padx=8, pady=8)
         self.tree = ttk.Treeview(
             upload_table,
-            columns=("chk", "stt", "email", "pass", "proxy", "status", "followers", "profile_url", "profile_id"),
+            columns=("chk", "stt", "email", "pass", "proxy", "status", "posts", "followers", "profile_url", "profile_id"),
             show="headings",
             selectmode="extended",
         )
@@ -291,6 +297,8 @@ class App:
         self.tree.column("proxy", width=260)
         self.tree.heading("status", text="TRẠNG THÁI")
         self.tree.column("status", width=200)
+        self.tree.heading("posts", text="POSTS")
+        self.tree.column("posts", width=70, anchor="center")
         self.tree.heading("followers", text="FOLLOWERS")
         self.tree.column("followers", width=90, anchor="center")
         self.tree.heading("profile_url", text="PROFILE URL")
@@ -632,10 +640,41 @@ class App:
             self._set_status(item_id, "START...", profile_id=profile_id)
             ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
             if not ok_s:
-                self._set_status(item_id, f"START ERR: {msg_s}")
-                self._log(f"[{acc['uid']}] START ERR: {msg_s}")
-                self._record_failed(item_id, acc, f"START ERR: {msg_s}")
-                return
+                if self._is_proxy_error(msg_s):
+                    try:
+                        close_profile(profile_id, 3)
+                        delete_profile(profile_id, 10)
+                    except Exception:
+                        pass
+                    try:
+                        self.created_profiles.discard(profile_id)
+                    except Exception:
+                        pass
+                    self._delete_profile_path(profile_id)
+                    new_id, new_data_s, _err = self._retry_start_profile_with_new_proxy(
+                        acc,
+                        item_id,
+                        "upload",
+                        self.tree,
+                        lambda s: self._set_status(item_id, s),
+                        win_pos=win_pos,
+                        win_size=win_size,
+                        created_set="created_profiles",
+                    )
+                    if new_id and new_data_s:
+                        profile_id = new_id
+                        data_s = new_data_s
+                        ok_s = True
+                    else:
+                        self._set_status(item_id, f"START ERR: {msg_s}")
+                        self._log(f"[{acc['uid']}] START ERR: {msg_s}")
+                        self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                        return
+                else:
+                    self._set_status(item_id, f"START ERR: {msg_s}")
+                    self._log(f"[{acc['uid']}] START ERR: {msg_s}")
+                    self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                    return
 
             with self.active_lock:
                 self.active_profiles[item_id] = profile_id
@@ -809,6 +848,7 @@ class App:
     def _load_rows(self) -> None:
         self.tree.delete(*self.tree.get_children())
         for idx, row in enumerate(self.accounts, start=1):
+            posts = row.get("posts", "")
             followers = row.get("followers", "")
             profile_url = row.get("profile_url", "")
             self.tree.insert(
@@ -822,6 +862,7 @@ class App:
                     row.get("pass", ""),
                     row.get("proxy", ""),
                     "READY",
+                    "" if posts is None else str(posts),
                     "" if followers is None else str(followers),
                     profile_url,
                     row.get("profile_id", ""),
@@ -1138,6 +1179,7 @@ class App:
             state[email] = {
                 "chk": self.tree.set(iid, "chk"),
                 "status": self.tree.set(iid, "status"),
+                "posts": self.tree.set(iid, "posts"),
                 "followers": self.tree.set(iid, "followers"),
                 "profile_url": self.tree.set(iid, "profile_url"),
                 "profile_id": self.tree.set(iid, "profile_id"),
@@ -1147,6 +1189,7 @@ class App:
         for idx, row in enumerate(self.accounts, start=1):
             email = row.get("uid", "")
             cached = state.get(email, {})
+            posts = cached.get("posts", row.get("posts", ""))
             followers = cached.get("followers", row.get("followers", ""))
             profile_url = cached.get("profile_url", row.get("profile_url", ""))
             status = row.get("status") or cached.get("status", "READY")
@@ -1163,6 +1206,7 @@ class App:
                     row.get("pass", ""),
                     row.get("proxy", ""),
                     status,
+                    "" if posts is None else str(posts),
                     "" if followers is None else str(followers),
                     profile_url,
                     cached.get("profile_id", row.get("profile_id", "")),
@@ -1250,7 +1294,7 @@ class App:
         status_upper = (status or "").upper()
         if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
             self.tree.item(item_id, tags=("status_err",))
-        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE"]):
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "POSTING", "UPLOAD"]):
             self.tree.item(item_id, tags=("status_ok",))
         else:
             self.tree.item(item_id, tags=())
@@ -1259,7 +1303,7 @@ class App:
         status_upper = (status or "").upper()
         if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
             self.profile_tree.item(item_id, tags=("status_err",))
-        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "UPDATED"]):
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "UPDATED", "POSTING", "UPLOAD"]):
             self.profile_tree.item(item_id, tags=("status_ok",))
         else:
             self.profile_tree.item(item_id, tags=())
@@ -1268,7 +1312,7 @@ class App:
         status_upper = (status or "").upper()
         if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
             self.fb_tree.item(item_id, tags=("status_err",))
-        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE"]):
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "POSTING", "UPLOAD"]):
             self.fb_tree.item(item_id, tags=("status_ok",))
         else:
             self.fb_tree.item(item_id, tags=())
@@ -1277,10 +1321,115 @@ class App:
         status_upper = (status or "").upper()
         if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
             self.fb_profile_tree.item(item_id, tags=("status_err",))
-        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "UPDATED"]):
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "UPDATED", "POSTING", "UPLOAD"]):
             self.fb_profile_tree.item(item_id, tags=("status_ok",))
         else:
             self.fb_profile_tree.item(item_id, tags=())
+
+    def _next_proxy(self) -> str:
+        with self._extra_proxy_lock:
+            if not self._extra_proxies:
+                return ""
+            proxy = self._extra_proxies[self._extra_proxy_idx % len(self._extra_proxies)]
+            self._extra_proxy_idx += 1
+            return proxy
+
+    def _is_proxy_error(self, msg: str) -> bool:
+        text = (msg or "").lower()
+        if "proxy" not in text:
+            return False
+        proxy_keywords = [
+            "connect",
+            "connection",
+            "cannot",
+            "can't",
+            "failed",
+            "timeout",
+            "tunnel",
+            "khong the",
+            "không thể",
+            "ket noi",
+            "kết nối",
+        ]
+        return any(k in text for k in proxy_keywords)
+
+    def _set_proxy_cell(self, tree: ttk.Treeview, item_id: str, proxy: str) -> None:
+        try:
+            if tree == self.tree:
+                item_id = self._resolve_upload_item_id(item_id)
+            tree.set(item_id, "proxy", proxy)
+        except Exception:
+            pass
+
+    def _save_cache_by_kind(self, kind: str) -> None:
+        if kind == "upload":
+            self._save_accounts_cache()
+        elif kind == "profile":
+            self._save_profile_accounts_cache()
+        elif kind == "fb":
+            self._save_fb_accounts_cache()
+        elif kind == "fb_profile":
+            self._save_fb_profile_accounts_cache()
+
+    def _replace_proxy_for_account(self, acc: dict, item_id: str, kind: str, tree: ttk.Treeview) -> bool:
+        new_proxy = self._next_proxy()
+        if not new_proxy:
+            self._log("[PROXY] No extra proxies available")
+            return False
+        acc["proxy"] = new_proxy
+        self._set_proxy_cell(tree, item_id, new_proxy)
+        try:
+            self._save_cache_by_kind(kind)
+        except Exception:
+            pass
+        self._log(f"[PROXY] Swapped proxy for {acc.get('uid','')} -> {new_proxy}")
+        return True
+
+    def _retry_start_profile_with_new_proxy(
+        self,
+        acc: dict,
+        item_id: str,
+        kind: str,
+        tree: ttk.Treeview,
+        status_setter,
+        win_pos: str | None = None,
+        win_size: str | None = None,
+        created_set: str = "created_profiles",
+    ) -> tuple[str | None, dict | None, str]:
+        if not self._replace_proxy_for_account(acc, item_id, kind, tree):
+            return None, None, ""
+        ok_c = False
+        data_c = {}
+        msg_c = ""
+        with self.create_lock:
+            for attempt in range(2):
+                ok_c, data_c, msg_c = create_profile(acc["uid"], acc["proxy"], SCOOPZ_URL)
+                if ok_c:
+                    break
+                time.sleep(2 + attempt)
+        if not ok_c:
+            status_setter(f"CREATE ERR: {msg_c}")
+            return None, None, msg_c
+        profile_id = None
+        if isinstance(data_c, dict):
+            profile_id = (data_c.get("data") or {}).get("id") or data_c.get("id") or data_c.get("profile_id")
+        if not profile_id:
+            status_setter("NO PROFILE ID")
+            return None, None, "NO PROFILE ID"
+        self._remember_profile_path(profile_id, data_c)
+        try:
+            getattr(self, created_set).add(profile_id)
+        except Exception:
+            pass
+        status_setter("START...")
+        if win_pos is None:
+            ok_s, data_s, msg_s = start_profile(profile_id)
+        else:
+            ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
+        if not ok_s:
+            status_setter(f"START ERR: {msg_s}")
+            return None, None, msg_s
+        return profile_id, data_s, ""
 
     def _clear_status_tags(self) -> None:
         try:
@@ -1342,13 +1491,15 @@ class App:
                     self._log(f"[CLEAR] DEL ERR: {path} | {e}")
         self._log(f"[CLEAR] Deleted {deleted} video files.")
 
-    def _set_profile_info(self, item_id: str, profile_url: str, followers) -> None:
+    def _set_profile_info(self, item_id: str, profile_url: str, followers, posts=None) -> None:
         def _update():
             resolved_id = self._resolve_upload_item_id(item_id)
             if profile_url:
                 self.tree.set(resolved_id, "profile_url", profile_url)
             if followers is not None:
                 self.tree.set(resolved_id, "followers", str(followers))
+            if posts is not None:
+                self.tree.set(resolved_id, "posts", str(posts))
         self.root.after(0, _update)
         try:
             email = self._lookup_item_email(item_id)
@@ -1364,6 +1515,8 @@ class App:
                             acc["profile_url"] = profile_url
                         if followers is not None:
                             acc["followers"] = followers
+                        if posts is not None:
+                            acc["posts"] = posts
                         break
                 self._save_accounts_cache()
                 if followers is not None:
@@ -2123,6 +2276,7 @@ class App:
             old = existing_by_uid.get(uid)
             if old:
                 acc["followers"] = old.get("followers")
+                acc["posts"] = old.get("posts")
                 acc["profile_url"] = old.get("profile_url", "")
             new_accounts.append(acc)
 
@@ -2134,6 +2288,42 @@ class App:
         self._load_rows()
         self._save_accounts_cache()
         self._log(f"[IMPORT] Loaded {len(new_accounts)} accounts")
+
+    def import_proxy_list(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Import proxy list",
+            filetypes=[
+                ("Text/CSV", "*.txt;*.csv;*.tsv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            messagebox.showerror("Import Proxy", f"Loi doc file: {e}")
+            return
+        proxies = []
+        for raw in content.splitlines():
+            line = (raw or "").strip()
+            if not line:
+                continue
+            # Accept first field if CSV/TSV
+            for sep in (",", "\t", ";", " "):
+                if sep in line:
+                    line = line.split(sep, 1)[0].strip()
+                    break
+            if line:
+                proxies.append(line)
+        if not proxies:
+            messagebox.showinfo("Import Proxy", "Khong tim thay proxy hop le.")
+            return
+        with self._extra_proxy_lock:
+            self._extra_proxies = proxies
+            self._extra_proxy_idx = 0
+        self._log(f"[PROXY] Loaded {len(proxies)} proxies")
 
     def import_profile_accounts(self) -> None:
         path = filedialog.askopenfilename(
@@ -2347,6 +2537,7 @@ class App:
             messagebox.showerror("Lỗi", "Số luồng phải > 0")
             return
 
+        self._fixed_threads = max_threads
         self.stop_event.clear()
         self._profile_retry_round = 0
         with self.profile_failed_lock:
@@ -2359,10 +2550,19 @@ class App:
 
         def _sleep_with_stop(total_sec: float) -> None:
             end_time = time.time() + max(0.0, total_sec)
+            next_log = 0.0
             while time.time() < end_time:
                 if self.stop_event.is_set():
                     break
-                time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, max(0.0, end_time - time.time())))
+                remaining = max(0.0, end_time - time.time())
+                # Log countdown every 10s, and each second for last 5s
+                now = time.time()
+                if remaining <= 5 or now >= next_log:
+                    mm = int(remaining) // 60
+                    ss = int(remaining) % 60
+                    self._log(f"[PROFILE BATCH] Resume in {mm:02d}:{ss:02d}")
+                    next_log = now + (1.0 if remaining <= 5 else 10.0)
+                time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, remaining))
 
         def _run_batch(batch_items: list) -> None:
             if not batch_items or self.stop_event.is_set():
@@ -2438,12 +2638,19 @@ class App:
                 )
             release_at = state["release_at"]
 
+        next_log = 0.0
         while True:
             wait_s = release_at - time.time()
             if wait_s <= 0:
                 return not self.stop_event.is_set()
             if self.stop_event.is_set():
                 return False
+            now = time.time()
+            if wait_s <= 5 or now >= next_log:
+                mm = int(wait_s) // 60
+                ss = int(wait_s) % 60
+                self._log(f"[{key} BATCH] Resume in {mm:02d}:{ss:02d}")
+                next_log = now + (1.0 if wait_s <= 5 else 10.0)
             time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, wait_s))
 
             try:
@@ -2568,6 +2775,7 @@ class App:
             messagebox.showerror("Lỗi", "Số luồng phải > 0")
             return
 
+        self._fixed_threads = max_threads
         self.stop_event.clear()
         self._reset_batch_pause_state("YTB")
         self._clear_status_tags()
@@ -2698,7 +2906,7 @@ class App:
             return
         
         try:
-            max_threads = int(self.entry_threads.get())
+            max_threads = int(self._fixed_threads or int(self.entry_threads.get()))
             if max_threads <= 0:
                 raise ValueError
         except Exception:
@@ -2980,6 +3188,7 @@ class App:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
             return
 
+        self._fixed_threads = max_threads
         self.stop_event.clear()
         self.executor = ThreadPoolExecutor(max_workers=max_threads)
         self.profile_semaphore = threading.BoundedSemaphore(max_threads)
@@ -3069,8 +3278,37 @@ class App:
             self._set_fb_profile_status(item_id, "START...")
             ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
             if not ok_s:
-                self._set_fb_profile_status(item_id, f"START ERR: {msg_s}")
-                return
+                if self._is_proxy_error(msg_s):
+                    try:
+                        close_profile(profile_id, 3)
+                        delete_profile(profile_id, 10)
+                    except Exception:
+                        pass
+                    try:
+                        self.created_profiles.discard(profile_id)
+                    except Exception:
+                        pass
+                    self._delete_profile_path(profile_id)
+                    new_id, new_data_s, _err = self._retry_start_profile_with_new_proxy(
+                        acc,
+                        item_id,
+                        "fb_profile",
+                        self.fb_profile_tree,
+                        lambda s: self._set_fb_profile_status(item_id, s),
+                        win_pos=win_pos,
+                        win_size=win_size,
+                        created_set="created_profiles",
+                    )
+                    if new_id and new_data_s:
+                        profile_id = new_id
+                        data_s = new_data_s
+                        ok_s = True
+                    else:
+                        self._set_fb_profile_status(item_id, f"START ERR: {msg_s}")
+                        return
+                else:
+                    self._set_fb_profile_status(item_id, f"START ERR: {msg_s}")
+                    return
             driver_path, remote = extract_driver_info(data_s)
             if not (driver_path and remote):
                 self._set_fb_profile_status(item_id, "STARTED (no debug)")
@@ -3175,6 +3413,7 @@ class App:
             messagebox.showerror("Loi", "Videos phai > 0")
             return
 
+        self._fixed_threads = max_threads
         checked_items = [iid for iid in self.fb_tree.get_children() if self.fb_tree.set(iid, "chk") == "v"]
         if not checked_items:
             messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
@@ -3368,9 +3607,39 @@ class App:
         self._set_fb_status(item_id, "START...")
         ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
         if not ok_s:
-            self._set_fb_status(item_id, f"START ERR: {msg_s}")
-            self._record_failed(item_id, acc, f"START ERR: {msg_s}")
-            return
+            if self._is_proxy_error(msg_s):
+                try:
+                    close_profile(profile_id, 3)
+                    delete_profile(profile_id, 10)
+                except Exception:
+                    pass
+                try:
+                    self.created_profiles.discard(profile_id)
+                except Exception:
+                    pass
+                self._delete_profile_path(profile_id)
+                new_id, new_data_s, _err = self._retry_start_profile_with_new_proxy(
+                    acc,
+                    item_id,
+                    "fb",
+                    self.fb_tree,
+                    lambda s: self._set_fb_status(item_id, s),
+                    win_pos=win_pos,
+                    win_size=win_size,
+                    created_set="created_profiles",
+                )
+                if new_id and new_data_s:
+                    profile_id = new_id
+                    data_s = new_data_s
+                    ok_s = True
+                else:
+                    self._set_fb_status(item_id, f"START ERR: {msg_s}")
+                    self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                    return
+            else:
+                self._set_fb_status(item_id, f"START ERR: {msg_s}")
+                self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                return
 
         with self.active_lock:
             self.active_profiles[item_id] = profile_id
@@ -3741,20 +4010,41 @@ class App:
         self._set_status(item_id, "START...", profile_id=profile_id)
         ok_s, data_s, msg_s = start_profile(profile_id)
         if not ok_s:
-            self._set_status(item_id, f"START ERR: {msg_s}")
-            self._log(f"[{acc['uid']}] START ERR: {msg_s}")
-            self._record_failed(item_id, acc, f"START ERR: {msg_s}")
-            try:
-                close_profile(profile_id, 3)
-                delete_profile(profile_id, 10)
-            except Exception:
-                pass
-            try:
-                self.created_profiles.discard(profile_id)
-            except Exception:
-                pass
-            self._delete_profile_path(profile_id)
-            return None, None, None
+            if self._is_proxy_error(msg_s):
+                try:
+                    close_profile(profile_id, 3)
+                    delete_profile(profile_id, 10)
+                except Exception:
+                    pass
+                try:
+                    self.created_profiles.discard(profile_id)
+                except Exception:
+                    pass
+                self._delete_profile_path(profile_id)
+                new_id, new_data_s, _err = self._retry_start_profile_with_new_proxy(
+                    acc,
+                    item_id,
+                    "upload",
+                    self.tree,
+                    lambda s: self._set_status(item_id, s),
+                    win_pos=None,
+                    win_size=None,
+                    created_set="created_profiles",
+                )
+                if new_id and new_data_s:
+                    profile_id = new_id
+                    data_s = new_data_s
+                    ok_s = True
+                else:
+                    self._set_status(item_id, f"START ERR: {msg_s}")
+                    self._log(f"[{acc['uid']}] START ERR: {msg_s}")
+                    self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                    return None, None, None
+            else:
+                self._set_status(item_id, f"START ERR: {msg_s}")
+                self._log(f"[{acc['uid']}] START ERR: {msg_s}")
+                self._record_failed(item_id, acc, f"START ERR: {msg_s}")
+                return None, None, None
 
         driver_path, remote = extract_driver_info(data_s)
         if not driver_path or not remote:
@@ -4128,10 +4418,22 @@ class App:
                     self._delete_uploaded_video(path_or_err, acc["uid"])
                     success_count += 1
                     try:
-                        followers, profile_url = fetch_followers(driver_path, remote, self._log)
-                        if followers is not None:
-                            self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
-                            self._set_profile_info(item_id, profile_url, followers)
+                        followers = None
+                        profile_url = ""
+                        posts = None
+                        for attempt in range(3):
+                            followers, profile_url, posts = fetch_followers(driver_path, remote, self._log)
+                            if followers is not None or posts is not None:
+                                break
+                            time.sleep(2 + attempt)
+                        if followers is not None or posts is not None:
+                            if followers is not None:
+                                self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                            if posts is not None:
+                                self._log(f"[{acc['uid']}] POSTS: {posts}")
+                            self._set_profile_info(item_id, profile_url, followers, posts)
+                        else:
+                            self._log(f"[{acc['uid']}] FOLLOW ERR: empty")
                     except Exception as e:
                         self._log(f"[{acc['uid']}] FOLLOW ERR: {e}")
                     time.sleep(10.0)
@@ -4155,10 +4457,20 @@ class App:
             driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc)
             if not driver_path or not remote:
                 return
-            followers, profile_url = fetch_followers(driver_path, remote, self._log)
-            if followers is not None:
-                self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
-                self._set_profile_info(item_id, profile_url, followers)
+            followers = None
+            profile_url = ""
+            posts = None
+            for attempt in range(3):
+                followers, profile_url, posts = fetch_followers(driver_path, remote, self._log)
+                if followers is not None or posts is not None:
+                    break
+                time.sleep(2 + attempt)
+            if followers is not None or posts is not None:
+                if followers is not None:
+                    self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                if posts is not None:
+                    self._log(f"[{acc['uid']}] POSTS: {posts}")
+                self._set_profile_info(item_id, profile_url, followers, posts)
                 self._set_status(item_id, "FOLLOW OK")
             else:
                 self._set_status(item_id, "FOLLOW ERR")
@@ -4236,10 +4548,41 @@ class App:
             self._set_profile_status(item_id, "START...")
             ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
             if not ok_s:
-                self._set_profile_status(item_id, f"START ERR: {msg_s}")
-                self._log(f"[{acc['uid']}] START ERR: {msg_s}")
-                self._record_profile_failed(item_id, acc, f"START ERR: {msg_s}")
-                return
+                if self._is_proxy_error(msg_s):
+                    try:
+                        close_profile(profile_id, 3)
+                        delete_profile(profile_id, 10)
+                    except Exception:
+                        pass
+                    try:
+                        self.profile_created_profiles.discard(profile_id)
+                    except Exception:
+                        pass
+                    self._delete_profile_path(profile_id)
+                    new_id, new_data_s, _err = self._retry_start_profile_with_new_proxy(
+                        acc,
+                        item_id,
+                        "profile",
+                        self.profile_tree,
+                        lambda s: self._set_profile_status(item_id, s),
+                        win_pos=win_pos,
+                        win_size=win_size,
+                        created_set="profile_created_profiles",
+                    )
+                    if new_id and new_data_s:
+                        profile_id = new_id
+                        data_s = new_data_s
+                        ok_s = True
+                    else:
+                        self._set_profile_status(item_id, f"START ERR: {msg_s}")
+                        self._log(f"[{acc['uid']}] START ERR: {msg_s}")
+                        self._record_profile_failed(item_id, acc, f"START ERR: {msg_s}")
+                        return
+                else:
+                    self._set_profile_status(item_id, f"START ERR: {msg_s}")
+                    self._log(f"[{acc['uid']}] START ERR: {msg_s}")
+                    self._record_profile_failed(item_id, acc, f"START ERR: {msg_s}")
+                    return
 
             driver_path, remote = extract_driver_info(data_s)
             status = "STARTED" if driver_path and remote else "STARTED (no debug)"
@@ -4373,6 +4716,7 @@ class App:
 
     def stop_jobs(self) -> None:
         self.stop_event.set()
+        self._fixed_threads = None
         self._reset_batch_pause_state("YTB")
         self._reset_batch_pause_state("FB")
         if self._repeat_after_id:
@@ -4535,6 +4879,13 @@ class App:
         self._set_status(item_id, "START...", profile_id=profile_id)
         ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
         if not ok_s:
+            if self._is_proxy_error(msg_s):
+                swapped = self._replace_proxy_for_account(acc, item_id, "upload", self.tree)
+                if swapped:
+                    self._set_status(item_id, f"START ERR: {msg_s} (proxy replaced)")
+                    self._log(f"[{acc['uid']}] START ERR: {msg_s} (proxy replaced)")
+                    self._record_failed(item_id, acc, f"START ERR: {msg_s} (proxy replaced)")
+                    return
             self._set_status(item_id, f"START ERR: {msg_s}")
             self._log(f"[{acc['uid']}] START ERR: {msg_s}")
             self._record_failed(item_id, acc, f"START ERR: {msg_s}")

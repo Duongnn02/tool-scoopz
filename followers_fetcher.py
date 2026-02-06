@@ -12,7 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 Logger = Callable[[str], None]
 
 
-def _parse_followers(text: str) -> int:
+def _parse_count(text: str) -> int:
     val = (text or "").strip().lower().replace(",", "")
     if not val:
         return 0
@@ -32,7 +32,7 @@ def _parse_followers(text: str) -> int:
         return 0
 
 
-def fetch_followers(driver_path: str, remote_debugging_address: str, logger: Logger) -> Tuple[int | None, str]:
+def fetch_followers(driver_path: str, remote_debugging_address: str, logger: Logger) -> Tuple[int | None, str, int | None]:
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", remote_debugging_address.strip())
     service = Service(driver_path)
@@ -66,18 +66,31 @@ def fetch_followers(driver_path: str, remote_debugging_address: str, logger: Log
                 )
             )
             txt = (foll_el.text or "").strip()
-            followers = _parse_followers(txt)
+            followers = _parse_count(txt)
         except Exception as e:
             if logger:
                 logger(f"[FOLLOW] Read followers err: {e}")
             followers = None
 
         try:
+            posts_el = wait.until(
+                EC.visibility_of_element_located(
+                    (By.XPATH, "//div[.//span[normalize-space()='Posts' or normalize-space()='Post']]/span[contains(@class,'font-bold')]")
+                )
+            )
+            txt = (posts_el.text or "").strip()
+            posts = _parse_count(txt)
+        except Exception as e:
+            if logger:
+                logger(f"[FOLLOW] Read posts err: {e}")
+            posts = None
+
+        try:
             profile_url = (driver.current_url or "").strip()
         except Exception:
             profile_url = ""
 
-        return followers, profile_url
+        return followers, profile_url, posts
     finally:
         try:
             driver.quit()
