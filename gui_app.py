@@ -140,6 +140,10 @@ class App:
         self._profile_dragging = False
         self._profile_drag_start = None
         self._profile_context_item = None
+        self._fb_dragging = False
+        self._fb_drag_start = None
+        self._fb_profile_dragging = False
+        self._fb_profile_drag_start = None
         self._cell_editor = None
         self.repeat_var = tk.BooleanVar(value=False)
         self._repeat_after_id = None
@@ -396,6 +400,8 @@ class App:
         ttk.Button(fb_top, text="Deselect All", command=self._deselect_all_fb_accounts).pack(side="left")
 
         self.fb_tree.bind("<Button-1>", self._on_fb_tree_click)
+        self.fb_tree.bind("<B1-Motion>", self._on_fb_tree_drag)
+        self.fb_tree.bind("<ButtonRelease-1>", self._on_fb_tree_release)
 
         fb_profile_table = ttk.Frame(self.tab_fb_profile)
         fb_profile_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -439,6 +445,8 @@ class App:
         ttk.Button(fb_profile_top, text="Deselect All", command=self._deselect_all_fb_profile_accounts).pack(side="left")
 
         self.fb_profile_tree.bind("<Button-1>", self._on_fb_profile_tree_click)
+        self.fb_profile_tree.bind("<B1-Motion>", self._on_fb_profile_tree_drag)
+        self.fb_profile_tree.bind("<ButtonRelease-1>", self._on_fb_profile_tree_release)
 
         interact_top = ttk.Frame(self.tab_interact)
         interact_top.pack(fill="x", padx=8, pady=(8, 0))
@@ -1686,6 +1694,29 @@ class App:
         if column == "#1" and row:
             self._toggle_checked_fb(row)
             return "break"
+        if row:
+            self._fb_dragging = True
+            self._fb_drag_start = row
+
+    def _on_fb_tree_drag(self, event) -> None:
+        if not self._fb_dragging or not self._fb_drag_start:
+            return
+        row = self.fb_tree.identify_row(event.y)
+        if not row:
+            return
+        children = list(self.fb_tree.get_children())
+        try:
+            start_idx = children.index(self._fb_drag_start)
+            cur_idx = children.index(row)
+        except ValueError:
+            return
+        lo = min(start_idx, cur_idx)
+        hi = max(start_idx, cur_idx)
+        self.fb_tree.selection_set(children[lo : hi + 1])
+
+    def _on_fb_tree_release(self, event) -> None:
+        self._fb_dragging = False
+        self._fb_drag_start = None
 
     def _toggle_checked_fb_profile(self, item_id: str) -> None:
         cur = self.fb_profile_tree.set(item_id, "chk")
@@ -1723,6 +1754,29 @@ class App:
         if column == "#1" and row:
             self._toggle_checked_fb_profile(row)
             return "break"
+        if row:
+            self._fb_profile_dragging = True
+            self._fb_profile_drag_start = row
+
+    def _on_fb_profile_tree_drag(self, event) -> None:
+        if not self._fb_profile_dragging or not self._fb_profile_drag_start:
+            return
+        row = self.fb_profile_tree.identify_row(event.y)
+        if not row:
+            return
+        children = list(self.fb_profile_tree.get_children())
+        try:
+            start_idx = children.index(self._fb_profile_drag_start)
+            cur_idx = children.index(row)
+        except ValueError:
+            return
+        lo = min(start_idx, cur_idx)
+        hi = max(start_idx, cur_idx)
+        self.fb_profile_tree.selection_set(children[lo : hi + 1])
+
+    def _on_fb_profile_tree_release(self, event) -> None:
+        self._fb_profile_dragging = False
+        self._fb_profile_drag_start = None
 
     def _get_selected_accounts(self):
         items = []
@@ -2010,6 +2064,7 @@ class App:
             messagebox.showerror("Import", f"Loi doc file: {e}")
             return
 
+        existing_by_uid = {str(a.get("uid") or "").strip(): a for a in self.accounts}
         new_accounts = []
         for row in rows:
             if len(row) < 4:
@@ -2022,7 +2077,12 @@ class App:
                 continue
             if not uid:
                 continue
-            new_accounts.append({"uid": uid, "pass": pwd, "proxy": proxy, "youtube": yt})
+            acc = {"uid": uid, "pass": pwd, "proxy": proxy, "youtube": yt}
+            old = existing_by_uid.get(uid)
+            if old:
+                acc["followers"] = old.get("followers")
+                acc["profile_url"] = old.get("profile_url", "")
+            new_accounts.append(acc)
 
         if not new_accounts:
             messagebox.showinfo("Import", "Khong tim thay dong du lieu hop le.")
