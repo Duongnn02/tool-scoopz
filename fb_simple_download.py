@@ -183,7 +183,9 @@ def download_one_facebook(
     timeout_s: int = 120,
 ) -> Tuple[bool, str, str, str]:
     orchestrator = get_orchestrator()
-    orchestrator.acquire_download_lock(email)
+    acquired = orchestrator.acquire_download_lock(email, timeout_s=timeout_s, logger=logger)
+    if not acquired:
+        return False, f"download lock timeout after {timeout_s}s", "", ""
     try:
         email_safe = _safe_email(email)
         out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "video", email_safe))
@@ -224,4 +226,5 @@ def download_one_facebook(
                 return False, f"fb-dlp loi: {e}", "", ""
         return False, "fb-dlp loi: cannot download video", "", ""
     finally:
-        orchestrator.release_download_lock(email)
+        if acquired:
+            orchestrator.release_download_lock(email)

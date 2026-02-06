@@ -4329,7 +4329,7 @@ class App:
                         row_url,
                         self._log_progress,
                         cookie_path=os.path.join(_THIS_DIR, "cookiefb.txt"),
-                        timeout_s=120,
+                        timeout_s=30,
                     )
                     if ok_dl:
                         break
@@ -4999,7 +4999,7 @@ class App:
                     self._log_progress,
                     cookie_path=COOKIES_FILE,
                     fallback_cookie_path=COOKIES_FILE_FALLBACK,
-                    timeout_s=300,
+                    timeout_s=30,
                 )
                 mark_id = vid_id or row_id
                 if not ok_dl:
@@ -5656,7 +5656,7 @@ class App:
                                 self._log_progress,
                                 cookie_path=COOKIES_FILE,
                                 fallback_cookie_path=COOKIES_FILE_FALLBACK,
-                                timeout_s=120,
+                                timeout_s=30,
                             )
                             if ok_dl:
                                 break

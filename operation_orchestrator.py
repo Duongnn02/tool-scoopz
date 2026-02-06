@@ -143,7 +143,7 @@ class OperationOrchestrator:
     
     # ==================== DOWNLOAD ORCHESTRATION ====================
     
-    def acquire_download_lock(self, account: str) -> bool:
+    def acquire_download_lock(self, account: str, timeout_s: Optional[float] = None, logger: Optional[Callable] = None) -> bool:
         """
         Acquire download lock based on strategy.
         SEQUENTIAL: Block until others finish
@@ -151,14 +151,37 @@ class OperationOrchestrator:
         CONCURRENT: Minimal coordination
         """
         if self.download_strategy == DownloadStrategy.SEQUENTIAL:
-            self.download_lock.acquire()
-            self._log(f"[{account}] Download: Sequential lock acquired")
-            return True
+            step = 5.0
+            start = time.time()
+            while True:
+                if self.download_lock.acquire(timeout=step):
+                    self._log(f"[{account}] Download: Sequential lock acquired")
+                    if logger:
+                        logger(f"[DL] {account} Download lock acquired")
+                    return True
+                waited = time.time() - start
+                if logger:
+                    logger(f"[DL] {account} waiting for download lock {int(waited)}s")
+                if timeout_s is not None and waited >= timeout_s:
+                    if logger:
+                        logger(f"[DL] {account} download lock timeout after {int(waited)}s")
+                    return False
         elif self.download_strategy == DownloadStrategy.STAGGERED:
-            # Wait for previous download to finish + delay
-            self.download_lock.acquire()
-            self._log(f"[{account}] Download: Staggered start")
-            return True
+            step = 5.0
+            start = time.time()
+            while True:
+                if self.download_lock.acquire(timeout=step):
+                    self._log(f"[{account}] Download: Staggered start")
+                    if logger:
+                        logger(f"[DL] {account} Download lock acquired")
+                    return True
+                waited = time.time() - start
+                if logger:
+                    logger(f"[DL] {account} waiting for download lock {int(waited)}s")
+                if timeout_s is not None and waited >= timeout_s:
+                    if logger:
+                        logger(f"[DL] {account} download lock timeout after {int(waited)}s")
+                    return False
         else:  # CONCURRENT
             self._log(f"[{account}] Download: Concurrent start (no lock)")
             return True

@@ -202,7 +202,9 @@ def download_one(
 ) -> Tuple[bool, str, str, str]:
     # Acquire download lock for sequential processing
     orchestrator = get_orchestrator()
-    orchestrator.acquire_download_lock(email)
+    acquired = orchestrator.acquire_download_lock(email, timeout_s=timeout_s, logger=logger)
+    if not acquired:
+        return False, f"download lock timeout after {timeout_s}s", "", ""
     
     try:
         _check_ffmpeg(logger)
@@ -276,5 +278,5 @@ def download_one(
                 return False, f"VIDEO SKIPPED: {e}", "", ""
             return False, f"yt-dlp loi: {e}", "", ""
     finally:
-        # Always release lock
-        orchestrator.release_download_lock(email)
+        if acquired:
+            orchestrator.release_download_lock(email)
