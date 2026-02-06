@@ -1056,25 +1056,37 @@ class App:
 
     def _update_counts(self) -> None:
         try:
-            self._count_var.set(self._format_total_with_run("Total", len(self.accounts), "upload"))
+            self._count_var.set(
+                self._format_total_with_run("Total", self._unique_count(self.accounts), "upload")
+            )
         except Exception:
             pass
         try:
             self._profile_count_var.set(
-                self._format_total_with_run("Total Profile", len(self.profile_accounts), "profile")
+                self._format_total_with_run("Total Profile", self._unique_count(self.profile_accounts), "profile")
             )
         except Exception:
             pass
         try:
-            self._fb_count_var.set(self._format_total_with_run("Total FB", len(self.fb_accounts), "fb"))
+            self._fb_count_var.set(
+                self._format_total_with_run("Total FB", self._unique_count(self.fb_accounts), "fb")
+            )
         except Exception:
             pass
         try:
             self._fb_profile_count_var.set(
-                self._format_total_with_run("Total FB Profile", len(self.fb_profile_accounts), "fb_profile")
+                self._format_total_with_run(
+                    "Total FB Profile", self._unique_count(self.fb_profile_accounts), "fb_profile"
+                )
             )
         except Exception:
             pass
+
+    def _unique_count(self, accounts: list) -> int:
+        try:
+            return len({(acc.get("uid") or "").strip() for acc in accounts if acc.get("uid")})
+        except Exception:
+            return len(accounts)
 
     def _format_total_with_run(self, label: str, total: int, kind: str) -> str:
         done = 0
@@ -1393,9 +1405,13 @@ class App:
                 "tags": self.tree.item(iid, "tags"),
             }
         self.tree.delete(*self.tree.get_children())
+        seen = set()
         out_idx = 1
         for row in self.accounts:
             email = row.get("uid", "")
+            if email in seen:
+                continue
+            seen.add(email)
             cached = state.get(email, {})
             posts = cached.get("posts", row.get("posts", ""))
             followers = cached.get("followers", row.get("followers", ""))
