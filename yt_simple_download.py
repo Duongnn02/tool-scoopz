@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import multiprocessing as mp
 from typing import Callable, Tuple
 
 import yt_dlp
@@ -51,6 +52,10 @@ def _make_progress_hook(logger=None, email: str = ""):
         else:
             print(msg)
     return _hook
+
+
+def _silent_logger(_msg: str) -> None:
+    return
 
 
 def pick_js_runtimes_dict() -> dict:
@@ -131,6 +136,62 @@ def _download_once(url: str, out_dir: str, logger: Logger, email: str, timeout_s
     return True, path, vid, title
 
 
+def _download_once_worker(
+    q: "mp.Queue",
+    url: str,
+    out_dir: str,
+    email: str,
+    timeout_s: int,
+    cookie_file: str,
+) -> None:
+    try:
+        ok, path, vid, title = _download_once(
+            url,
+            out_dir,
+            _silent_logger,
+            email,
+            timeout_s,
+            cookie_file=cookie_file,
+        )
+        q.put((ok, path, vid, title))
+    except Exception as e:
+        q.put((False, str(e), "", ""))
+
+
+def _download_once_with_timeout(
+    url: str,
+    out_dir: str,
+    email: str,
+    timeout_s: int,
+    cookie_file: str = "",
+) -> Tuple[bool, str, str, str]:
+    ctx = mp.get_context("spawn")
+    q: "mp.Queue" = ctx.Queue()
+    p = ctx.Process(
+        target=_download_once_worker,
+        args=(q, url, out_dir, email, timeout_s, cookie_file),
+    )
+    p.daemon = True
+    p.start()
+    p.join(timeout_s)
+    if p.is_alive():
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        try:
+            p.join(5)
+        except Exception:
+            pass
+        return False, f"timeout after {timeout_s}s", "", ""
+    try:
+        if not q.empty():
+            return q.get_nowait()
+    except Exception:
+        pass
+    return False, "download failed", "", ""
+
+
 def download_one(
     email: str,
     url: str,
@@ -158,7 +219,13 @@ def download_one(
         logger(f"[DL] START {email} {url}")
         try:
             # First try without cookie
-            ok, path, vid, title = _download_once(url, out_dir, logger, email, timeout_s, cookie_file="")
+            ok, path, vid, title = _download_once_with_timeout(
+                url,
+                out_dir,
+                email,
+                timeout_s,
+                cookie_file="",
+            )
             if ok:
                 return True, path, vid, title
             return False, path, vid, title
@@ -168,7 +235,13 @@ def download_one(
                 for cookie_file in cookie_candidates:
                     try:
                         logger(f"[DL] Retry with cookie: {cookie_file}")
-                        return _download_once(url, out_dir, logger, email, timeout_s, cookie_file=cookie_file)
+                        return _download_once_with_timeout(
+                            url,
+                            out_dir,
+                            email,
+                            timeout_s,
+                            cookie_file=cookie_file,
+                        )
                     except Exception as e2:
                         err_str = str(e2)
                         if looks_like_need_cookie(err_str) or "403" in err_str.lower() or "forbidden" in err_str.lower():

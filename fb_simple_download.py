@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import multiprocessing as mp
 from typing import Callable, Tuple
 
 import yt_dlp
@@ -56,6 +57,10 @@ def _make_progress_hook(logger=None, email: str = ""):
             print(msg)
 
     return _hook
+
+
+def _silent_logger(_msg: str) -> None:
+    return
 
 
 def _resolve_output_path(info: dict, out_dir: str, ydl: yt_dlp.YoutubeDL) -> str:
@@ -114,6 +119,62 @@ def _download_once(
     return True, path, vid, title
 
 
+def _download_once_worker(
+    q: "mp.Queue",
+    url: str,
+    out_dir: str,
+    email: str,
+    timeout_s: int,
+    cookie_file: str,
+) -> None:
+    try:
+        ok, path, vid, title = _download_once(
+            url,
+            out_dir,
+            _silent_logger,
+            email,
+            timeout_s,
+            cookie_file=cookie_file,
+        )
+        q.put((ok, path, vid, title))
+    except Exception as e:
+        q.put((False, str(e), "", ""))
+
+
+def _download_once_with_timeout(
+    url: str,
+    out_dir: str,
+    email: str,
+    timeout_s: int,
+    cookie_file: str = "",
+) -> Tuple[bool, str, str, str]:
+    ctx = mp.get_context("spawn")
+    q: "mp.Queue" = ctx.Queue()
+    p = ctx.Process(
+        target=_download_once_worker,
+        args=(q, url, out_dir, email, timeout_s, cookie_file),
+    )
+    p.daemon = True
+    p.start()
+    p.join(timeout_s)
+    if p.is_alive():
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        try:
+            p.join(5)
+        except Exception:
+            pass
+        return False, f"timeout after {timeout_s}s", "", ""
+    try:
+        if not q.empty():
+            return q.get_nowait()
+    except Exception:
+        pass
+    return False, "download failed", "", ""
+
+
 def download_one_facebook(
     email: str,
     url: str,
@@ -136,7 +197,13 @@ def download_one_facebook(
 
         for cookie_file in (first_cookie, second_cookie):
             try:
-                return _download_once(url, out_dir, logger, email, timeout_s, cookie_file=cookie_file)
+                return _download_once_with_timeout(
+                    url,
+                    out_dir,
+                    email,
+                    timeout_s,
+                    cookie_file=cookie_file,
+                )
             except Exception as e:
                 err = str(e).lower()
                 restricted = any(
