@@ -246,12 +246,7 @@ class App:
         self.entry_search_email.bind("<FocusOut>", self._search_focus_out)
         self.btn_search_email = ttk.Button(top2, text="FIND", command=self._search_email)
         self.btn_search_email.pack(side="left", padx=(0, 12))
-        self.btn_sort_follow = ttk.Button(top2, text="SORT FOLLOW", command=lambda: self._sort_tree_by_column(self.tree, "followers"))
-        self.btn_sort_follow.pack(side="left", padx=(0, 6))
-        self.btn_sort_posts = ttk.Button(top2, text="SORT POSTS", command=lambda: self._sort_tree_by_column(self.tree, "posts"))
-        self.btn_sort_posts.pack(side="left", padx=(0, 6))
-        self.btn_sort_reset = ttk.Button(top2, text="RESET ORDER", command=self._reset_upload_tree_order)
-        self.btn_sort_reset.pack(side="left", padx=(0, 12))
+        self._sort_state = {}
 
         self.lbl_total = ttk.Label(top2, textvariable=self._count_var)
         self.lbl_total.pack(side="left", padx=(0, 10))
@@ -320,9 +315,9 @@ class App:
         self.tree.column("proxy", width=260)
         self.tree.heading("status", text="TRẠNG THÁI")
         self.tree.column("status", width=200)
-        self.tree.heading("posts", text="POSTS")
+        self.tree.heading("posts", text="POSTS", command=lambda: self._toggle_upload_sort("posts"))
         self.tree.column("posts", width=70, anchor="center")
-        self.tree.heading("followers", text="FOLLOWERS")
+        self.tree.heading("followers", text="FOLLOWERS", command=lambda: self._toggle_upload_sort("followers"))
         self.tree.column("followers", width=90, anchor="center")
         self.tree.heading("profile_url", text="PROFILE URL")
         self.tree.column("profile_url", width=260)
@@ -1500,7 +1495,7 @@ class App:
         except Exception:
             pass
 
-    def _sort_tree_by_column(self, tree: ttk.Treeview, col: str) -> None:
+    def _sort_tree_by_column(self, tree: ttk.Treeview, col: str, descending: bool = True) -> None:
         def _to_num(val) -> int:
             if val is None or val == "":
                 return -1
@@ -1517,7 +1512,7 @@ class App:
 
         try:
             items = list(tree.get_children())
-            items.sort(key=lambda iid: _to_num(tree.set(iid, col)), reverse=True)
+            items.sort(key=lambda iid: _to_num(tree.set(iid, col)), reverse=descending)
             for idx, iid in enumerate(items):
                 tree.move(iid, "", idx)
         except Exception:
@@ -1526,6 +1521,20 @@ class App:
     def _reset_upload_tree_order(self) -> None:
         # Rebuild upload tree in original accounts order
         self._rebuild_tree_from_accounts()
+
+    def _toggle_upload_sort(self, col: str) -> None:
+        # Cycle: desc -> asc -> reset
+        state = self._sort_state.get(col)
+        if state is None:
+            self._sort_state[col] = "desc"
+            self._sort_tree_by_column(self.tree, col, descending=True)
+            return
+        if state == "desc":
+            self._sort_state[col] = "asc"
+            self._sort_tree_by_column(self.tree, col, descending=False)
+            return
+        self._sort_state[col] = None
+        self._reset_upload_tree_order()
 
     def _get_checked_email_set(self, tree: ttk.Treeview) -> set:
         emails = set()
