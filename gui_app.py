@@ -149,12 +149,15 @@ class App:
         self._extra_proxy_idx = 0
         self._extra_proxy_lock = threading.Lock()
         self._cell_editor = None
-        self.repeat_var = tk.BooleanVar(value=False)
+        self.repeat_var = tk.BooleanVar(value=True)
         self._repeat_after_id = None
+        self._repeat_countdown_after_id = None
         self._repeat_enabled = False
         self._repeat_delay_sec = 0
         self._repeat_cycle_pending = False
         self._cycle_count = 0
+        self._run_upload_after_fb = False
+        self._force_upload_only = False
         self._fixed_threads = None
         self._retry_round = 0
         self._profile_retry_round = 0
@@ -194,6 +197,9 @@ class App:
             "LOGIN...",
             "RESTART...",
         }
+        self._auto_scroll_block_until = {}
+        self._auto_scroll_catchup_after_id = {}
+        self._last_active_item = {}
 
         self._build_ui()
         self._load_extra_proxy_list()
@@ -261,8 +267,17 @@ class App:
         self.lbl_fb_profile_total = ttk.Label(top2, textvariable=self._fb_profile_count_var)
         self.lbl_fb_profile_total.pack(side="left", padx=(0, 10))
         self._cycle_var = tk.StringVar(value="Vòng lặp: 0")
-        self.lbl_cycle = ttk.Label(top2, textvariable=self._cycle_var)
-        self.lbl_cycle.pack(side="left")
+        self._pause100_var = tk.StringVar(value="Đợi 5p/100: -")
+        self._next_cycle_var = tk.StringVar(value="Đợi vòng mới: -")
+
+        top2b = ttk.Frame(self.root)
+        top2b.pack(fill="x", padx=8, pady=(0, 6))
+        self.lbl_cycle = ttk.Label(top2b, textvariable=self._cycle_var)
+        self.lbl_cycle.pack(side="left", padx=(0, 10))
+        self.lbl_pause100 = ttk.Label(top2b, textvariable=self._pause100_var)
+        self.lbl_pause100.pack(side="left", padx=(0, 10))
+        self.lbl_next_cycle = ttk.Label(top2b, textvariable=self._next_cycle_var)
+        self.lbl_next_cycle.pack(side="left")
 
         self.btn_start = ttk.Button(top, text="START", command=self.start_jobs)
         self.btn_start.pack(side="left", padx=(0, 8))
@@ -331,7 +346,11 @@ class App:
         self.tree.heading("profile_id", text="PROFILE ID")
         self.tree.column("profile_id", width=240)
 
-        upload_scroll = ttk.Scrollbar(upload_table, orient="vertical", command=self.tree.yview)
+        def _on_upload_scroll(*args):
+            self._mark_user_scroll(self.tree)
+            self.tree.yview(*args)
+
+        upload_scroll = ttk.Scrollbar(upload_table, orient="vertical", command=_on_upload_scroll)
         self.tree.configure(yscrollcommand=upload_scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         upload_scroll.grid(row=0, column=1, sticky="ns")
@@ -344,6 +363,9 @@ class App:
         self.tree.bind("<B1-Motion>", self._on_tree_drag)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_release)
         self.tree.bind("<Button-3>", self._on_tree_right_click)
+        self.tree.bind("<MouseWheel>", lambda e, t=self.tree: self._mark_user_scroll(t))
+        self.tree.bind("<Button-4>", lambda e, t=self.tree: self._mark_user_scroll(t))
+        self.tree.bind("<Button-5>", lambda e, t=self.tree: self._mark_user_scroll(t))
 
         profile_table = ttk.Frame(self.tab_profile)
         profile_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -368,7 +390,11 @@ class App:
         self.profile_tree.heading("status", text="TRẠNG THÁI")
         self.profile_tree.column("status", width=200)
 
-        profile_scroll = ttk.Scrollbar(profile_table, orient="vertical", command=self.profile_tree.yview)
+        def _on_profile_scroll(*args):
+            self._mark_user_scroll(self.profile_tree)
+            self.profile_tree.yview(*args)
+
+        profile_scroll = ttk.Scrollbar(profile_table, orient="vertical", command=_on_profile_scroll)
         self.profile_tree.configure(yscrollcommand=profile_scroll.set)
         self.profile_tree.grid(row=0, column=0, sticky="nsew")
         profile_scroll.grid(row=0, column=1, sticky="ns")
@@ -390,6 +416,9 @@ class App:
         self.profile_tree.bind("<B1-Motion>", self._on_profile_tree_drag)
         self.profile_tree.bind("<ButtonRelease-1>", self._on_profile_tree_release)
         self.profile_tree.bind("<Button-3>", self._on_profile_tree_right_click)
+        self.profile_tree.bind("<MouseWheel>", lambda e, t=self.profile_tree: self._mark_user_scroll(t))
+        self.profile_tree.bind("<Button-4>", lambda e, t=self.profile_tree: self._mark_user_scroll(t))
+        self.profile_tree.bind("<Button-5>", lambda e, t=self.profile_tree: self._mark_user_scroll(t))
 
         fb_table = ttk.Frame(self.tab_fb)
         fb_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -422,7 +451,11 @@ class App:
         self.fb_tree.heading("profile_id", text="PROFILE ID")
         self.fb_tree.column("profile_id", width=240)
 
-        fb_scroll = ttk.Scrollbar(fb_table, orient="vertical", command=self.fb_tree.yview)
+        def _on_fb_scroll(*args):
+            self._mark_user_scroll(self.fb_tree)
+            self.fb_tree.yview(*args)
+
+        fb_scroll = ttk.Scrollbar(fb_table, orient="vertical", command=_on_fb_scroll)
         self.fb_tree.configure(yscrollcommand=fb_scroll.set)
         self.fb_tree.grid(row=0, column=0, sticky="nsew")
         fb_scroll.grid(row=0, column=1, sticky="ns")
@@ -446,6 +479,9 @@ class App:
         self.fb_tree.bind("<B1-Motion>", self._on_fb_tree_drag)
         self.fb_tree.bind("<ButtonRelease-1>", self._on_fb_tree_release)
         self.fb_tree.bind("<Button-3>", self._on_fb_tree_right_click)
+        self.fb_tree.bind("<MouseWheel>", lambda e, t=self.fb_tree: self._mark_user_scroll(t))
+        self.fb_tree.bind("<Button-4>", lambda e, t=self.fb_tree: self._mark_user_scroll(t))
+        self.fb_tree.bind("<Button-5>", lambda e, t=self.fb_tree: self._mark_user_scroll(t))
 
         fb_profile_table = ttk.Frame(self.tab_fb_profile)
         fb_profile_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -470,7 +506,11 @@ class App:
         self.fb_profile_tree.heading("status", text="TRẠNG THÁI")
         self.fb_profile_tree.column("status", width=200)
 
-        fb_profile_scroll = ttk.Scrollbar(fb_profile_table, orient="vertical", command=self.fb_profile_tree.yview)
+        def _on_fb_profile_scroll(*args):
+            self._mark_user_scroll(self.fb_profile_tree)
+            self.fb_profile_tree.yview(*args)
+
+        fb_profile_scroll = ttk.Scrollbar(fb_profile_table, orient="vertical", command=_on_fb_profile_scroll)
         self.fb_profile_tree.configure(yscrollcommand=fb_profile_scroll.set)
         self.fb_profile_tree.grid(row=0, column=0, sticky="nsew")
         fb_profile_scroll.grid(row=0, column=1, sticky="ns")
@@ -492,6 +532,9 @@ class App:
         self.fb_profile_tree.bind("<B1-Motion>", self._on_fb_profile_tree_drag)
         self.fb_profile_tree.bind("<ButtonRelease-1>", self._on_fb_profile_tree_release)
         self.fb_profile_tree.bind("<Button-3>", self._on_fb_profile_tree_right_click)
+        self.fb_profile_tree.bind("<MouseWheel>", lambda e, t=self.fb_profile_tree: self._mark_user_scroll(t))
+        self.fb_profile_tree.bind("<Button-4>", lambda e, t=self.fb_profile_tree: self._mark_user_scroll(t))
+        self.fb_profile_tree.bind("<Button-5>", lambda e, t=self.fb_profile_tree: self._mark_user_scroll(t))
 
         interact_top = ttk.Frame(self.tab_interact)
         interact_top.pack(fill="x", padx=8, pady=(8, 0))
@@ -578,6 +621,8 @@ class App:
         self.menu.add_command(label="Login selected", command=self.menu_login_selected)
         self.menu.add_command(label="Upload selected", command=self.menu_upload_selected)
         self.menu.add_command(label="Get followers", command=self.menu_follow_selected)
+        self.menu.add_separator()
+        self.menu.add_command(label="Replace proxy errors", command=lambda: self._replace_proxy_errors("upload"))
 
         self.profile_menu = tk.Menu(self.root, tearoff=0)
         self.profile_menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected_profile(True))
@@ -592,6 +637,8 @@ class App:
         self.fb_menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected_fb(False))
         self.fb_menu.add_command(label="Tick all", command=self._select_all_fb_accounts)
         self.fb_menu.add_command(label="Untick all", command=self._deselect_all_fb_accounts)
+        self.fb_menu.add_separator()
+        self.fb_menu.add_command(label="Replace proxy errors", command=lambda: self._replace_proxy_errors("fb"))
 
         self.fb_profile_menu = tk.Menu(self.root, tearoff=0)
         self.fb_profile_menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected_fb_profile(True))
@@ -1161,6 +1208,49 @@ class App:
         except Exception:
             pass
 
+    def _set_pause100_label(self, remaining_sec: float) -> None:
+        try:
+            if remaining_sec <= 0:
+                self._pause100_var.set("Đợi 5p/100: -")
+                return
+            mm = int(remaining_sec) // 60
+            ss = int(remaining_sec) % 60
+            self._pause100_var.set(f"Đợi 5p/100: {mm:02d}:{ss:02d}")
+        except Exception:
+            pass
+
+    def _stop_next_cycle_countdown(self) -> None:
+        if self._repeat_countdown_after_id:
+            try:
+                self.root.after_cancel(self._repeat_countdown_after_id)
+            except Exception:
+                pass
+            self._repeat_countdown_after_id = None
+        try:
+            self._next_cycle_var.set("Đợi vòng mới: -")
+        except Exception:
+            pass
+
+    def _start_next_cycle_countdown(self, total_sec: int) -> None:
+        self._stop_next_cycle_countdown()
+        end_time = time.time() + max(0, int(total_sec or 0))
+
+        def _tick():
+            if self.stop_event.is_set():
+                self._stop_next_cycle_countdown()
+                return
+            remaining = max(0, end_time - time.time())
+            if remaining <= 0:
+                self._next_cycle_var.set("Đợi vòng mới: 00:00")
+                self._repeat_countdown_after_id = None
+                return
+            mm = int(remaining) // 60
+            ss = int(remaining) % 60
+            self._next_cycle_var.set(f"Đợi vòng mới: {mm:02d}:{ss:02d}")
+            self._repeat_countdown_after_id = self.root.after(1000, _tick)
+
+        _tick()
+
     def _reset_cycle_count(self) -> None:
         self._cycle_count = 0
         self._set_cycle_label()
@@ -1349,8 +1439,34 @@ class App:
 
         self.root.after(0, _update)
 
+    def _mark_user_scroll(self, tree: ttk.Treeview) -> None:
+        try:
+            self._auto_scroll_block_until[tree] = time.time() + 5.0
+            # reset catch-up timer
+            after_id = self._auto_scroll_catchup_after_id.get(tree)
+            if after_id:
+                try:
+                    self.root.after_cancel(after_id)
+                except Exception:
+                    pass
+            def _catch_up():
+                # only auto-scroll if user is idle
+                if self._auto_scroll_block_until.get(tree, 0) > time.time():
+                    return
+                item_id = self._last_active_item.get(tree)
+                if item_id:
+                    try:
+                        tree.see(item_id)
+                    except Exception:
+                        pass
+            self._auto_scroll_catchup_after_id[tree] = self.root.after(5000, _catch_up)
+        except Exception:
+            pass
+
     def _auto_scroll_if_needed(self, tree: ttk.Treeview, item_id: str, status: str) -> None:
         try:
+            if self._auto_scroll_block_until.get(tree, 0) > time.time():
+                return
             status_upper = (status or "").upper()
             active_keys = [
                 "START",
@@ -1364,6 +1480,7 @@ class App:
             ]
             if not any(key in status_upper for key in active_keys):
                 return
+            self._last_active_item[tree] = item_id
             if tree.bbox(item_id) is not None:
                 return
             tree.see(item_id)
@@ -1468,10 +1585,10 @@ class App:
                     out_idx,
                     email,
                     row.get("pass", ""),
-                    row.get("proxy", ""),
                     status,
                     "" if posts is None else str(posts),
                     "" if followers is None else str(followers),
+                    row.get("proxy", ""),
                     profile_url,
                     cached.get("profile_id", row.get("profile_id", "")),
                 ),
@@ -1860,6 +1977,39 @@ class App:
             pass
         self._log(f"[PROXY] Swapped proxy for {acc.get('uid','')} -> {new_proxy}")
         return True
+
+    def _replace_proxy_errors(self, kind: str) -> None:
+        if not self._extra_proxies:
+            messagebox.showinfo("Proxy", "Danh sach proxy rong. Hay IMPORT PROXY truoc.")
+            return
+        if kind == "fb":
+            tree = self.fb_tree
+            accounts = self.fb_accounts
+            set_status = self._set_fb_status
+        else:
+            tree = self.tree
+            accounts = self.accounts
+            set_status = self._set_status
+
+        replaced = 0
+        email_to_iid = self._map_email_to_item_id(tree)
+        for acc in accounts:
+            email = (acc.get("uid") or "").strip()
+            if not email:
+                continue
+            iid = email_to_iid.get(email)
+            if not iid:
+                continue
+            status = tree.set(iid, "status")
+            if not self._is_proxy_error(status):
+                continue
+            if self._replace_proxy_for_account(acc, iid, kind, tree):
+                replaced += 1
+                try:
+                    set_status(iid, "PROXY REPLACED")
+                except Exception:
+                    pass
+        self._log(f"[PROXY] Replaced {replaced} proxy errors ({kind})")
 
     def _retry_start_profile_with_new_proxy(
         self,
@@ -2895,15 +3045,19 @@ class App:
         self._log(f"[IMPORT] Loaded {len(new_accounts)} accounts")
 
     def import_proxy_list(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Import proxy list",
-            filetypes=[
-                ("Text/CSV", "*.txt;*.csv;*.tsv"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not path:
+        path = self._extra_proxy_file
+        try:
+            if not os.path.exists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("")
+        except Exception as e:
+            messagebox.showerror("Import Proxy", f"Loi tao file proxy: {e}")
             return
+        try:
+            os.startfile(path)
+        except Exception:
+            pass
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -2923,7 +3077,10 @@ class App:
             if line:
                 proxies.append(line)
         if not proxies:
-            messagebox.showinfo("Import Proxy", "Khong tim thay proxy hop le.")
+            messagebox.showinfo(
+                "Import Proxy",
+                "Da tao/mo file proxy. Hay dan proxy vao file roi bam IMPORT PROXY lai.",
+            )
             return
         with self._extra_proxy_lock:
             self._extra_proxies = proxies
@@ -3260,8 +3417,10 @@ class App:
         while True:
             wait_s = release_at - time.time()
             if wait_s <= 0:
+                self._set_pause100_label(0)
                 return not self.stop_event.is_set()
             if self.stop_event.is_set():
+                self._set_pause100_label(0)
                 return False
             now = time.time()
             if wait_s <= 5 or now >= next_log:
@@ -3269,6 +3428,7 @@ class App:
                 ss = int(wait_s) % 60
                 self._log(f"[{key} BATCH] Resume in {mm:02d}:{ss:02d}")
                 next_log = now + (1.0 if wait_s <= 5 else 10.0)
+            self._set_pause100_label(wait_s)
             time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, wait_s))
 
             try:
@@ -3375,11 +3535,19 @@ class App:
         if self._is_fb_profile_tab():
             self.start_fb_profile_jobs()
             return
-        if self._is_fb_tab():
-            self.start_fb_jobs()
-            return
         if self.executor is not None:
             return
+        if not self._force_upload_only:
+            upload_checked = self._get_checked_email_set(self.tree)
+            fb_checked = self._get_checked_email_set(self.fb_tree)
+            if upload_checked:
+                self._run_upload_after_fb = bool(fb_checked)
+            elif fb_checked:
+                # no upload checked, run FB directly
+                self._run_upload_after_fb = False
+                self.start_fb_jobs()
+                return
+        self._force_upload_only = False
         self._force_close_all_profiles()
         self._reset_all_statuses()
         self._clear_all_logs()
@@ -3525,9 +3693,16 @@ class App:
                     return
                 self._log(f"[RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
-            
+
+            if self._run_upload_after_fb and not self.stop_event.is_set():
+                self._run_upload_after_fb = False
+                self._force_upload_only = True
+                self.start_fb_jobs()
+                return
+
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = 5 * 60 * 1000
+                self._start_next_cycle_countdown(300)
 
                 def _repeat_start():
                     if self.stop_event.is_set():
@@ -3663,6 +3838,7 @@ class App:
             # Schedule next repeat cycle
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = 5 * 60 * 1000
+                self._start_next_cycle_countdown(300)
 
                 def _repeat_again():
                     if self.stop_event.is_set():
@@ -4180,6 +4356,10 @@ class App:
                 self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             self._reset_run("fb")
+            if self._run_upload_after_fb and not self.stop_event.is_set():
+                self._run_upload_after_fb = False
+                self._force_upload_only = True
+                self.start_jobs()
 
         threading.Thread(target=_waiter, daemon=True).start()
 
@@ -4251,6 +4431,10 @@ class App:
                 self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             self._reset_run("fb")
+            if self._run_upload_after_fb and not self.stop_event.is_set():
+                self._run_upload_after_fb = False
+                self._force_upload_only = True
+                self.start_jobs()
 
         threading.Thread(target=_retry_waiter, daemon=True).start()
 
@@ -5475,6 +5659,8 @@ class App:
         self.stop_event.set()
         self._fixed_threads = None
         self._reset_cycle_count()
+        self._set_pause100_label(0)
+        self._stop_next_cycle_countdown()
         try:
             self._resume_pending["upload"] = self._collect_pending_emails(self.tree, {"UPLOAD OK", "DONE"})
             self._resume_pending["profile"] = self._collect_pending_emails(self.profile_tree, {"DONE"})
