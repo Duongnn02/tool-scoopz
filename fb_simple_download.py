@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 import os
 import re
@@ -14,21 +14,22 @@ Logger = Callable[[str], None]
 
 
 def _sanitize_fb_title(raw_title: str) -> str:
-    title = (raw_title or "").strip()
+    title = (raw_title or '').strip()
     if not title:
-        return ""
-    parts = [p.strip() for p in title.split("·")]
-    if len(parts) <= 1:
-        return title
+        return ''
+    # Normalize separators (FB often uses '|' or '·')
+    normalized = title.replace('Â·', '|')
+    parts = [p.strip() for p in normalized.split('|')]
 
     metrics_pattern = re.compile(
-        r"^\s*[\d.,]+(?:\s*[KMB])?\s*(views?|reactions?|comments?|shares?|lượt xem|lượt thích|bình luận|chia sẻ)\s*$",
+        r'^\\s*[\\d.,]+(?:\\s*[KMB])?\\s*(views?|reactions?|comments?|shares?|lÆ°á»£t xem|lÆ°á»£t thÃ­ch|bÃ¬nh luáº­n|chia sáº»)?\\s*$',
         re.IGNORECASE,
     )
     kept = [p for p in parts if p and not metrics_pattern.match(p)]
-    cleaned = " · ".join(kept).strip()
-    return cleaned
-
+    if not kept:
+        return ''
+    # Prefer the first non-metric segment (usually the title)
+    return kept[0].strip()
 
 def _safe_email(email: str) -> str:
     return (

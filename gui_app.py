@@ -145,6 +145,10 @@ class App:
         self._fb_drag_start = None
         self._fb_profile_dragging = False
         self._fb_profile_drag_start = None
+        self._all_dragging = False
+        self._all_drag_start = None
+        self._all_context_item = None
+        self._from_all_tab = False
         self._extra_proxies = []
         self._extra_proxy_idx = 0
         self._extra_proxy_lock = threading.Lock()
@@ -159,6 +163,7 @@ class App:
         self._run_upload_after_fb = False
         self._force_upload_only = False
         self._fixed_threads = None
+        self._max_retry_rounds = 1
         self._retry_round = 0
         self._profile_retry_round = 0
         self._profile_batch_running = False
@@ -296,12 +301,14 @@ class App:
         self.btn_clear_videos.pack(side="left", padx=(8, 0))
 
         self.notebook = ttk.Notebook(self.root)
+        self.tab_all = ttk.Frame(self.notebook)
         self.tab_upload = ttk.Frame(self.notebook)
         self.tab_profile = ttk.Frame(self.notebook)
         self.tab_fb = ttk.Frame(self.notebook)
         self.tab_fb_profile = ttk.Frame(self.notebook)
         self.tab_interact = ttk.Frame(self.notebook)
         self.tab_stats = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_all, text="TỔNG")
         self.notebook.add(self.tab_upload, text="YOUTUBE")
         self.notebook.add(self.tab_profile, text="PROFILE")
         self.notebook.add(self.tab_fb, text="FACEBOOK")
@@ -309,6 +316,69 @@ class App:
         self.notebook.add(self.tab_interact, text="INTERACT")
         self.notebook.add(self.tab_stats, text="THỐNG KÊ")
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+        all_table = ttk.Frame(self.tab_all)
+        all_table.pack(fill="both", expand=True, padx=8, pady=8)
+        self.all_tree = ttk.Treeview(
+            all_table,
+            columns=(
+                "chk",
+                "stt",
+                "social",
+                "email",
+                "pass",
+                "status",
+                "posts",
+                "followers",
+                "proxy",
+                "profile_url",
+                "profile_id",
+            ),
+            show="headings",
+            selectmode="extended",
+        )
+        self.all_tree.heading("chk", text="v")
+        self.all_tree.column("chk", width=40, anchor="center")
+        self.all_tree.heading("stt", text="STT")
+        self.all_tree.column("stt", width=50, anchor="center")
+        self.all_tree.heading("social", text="MẠNG")
+        self.all_tree.column("social", width=70, anchor="center")
+        self.all_tree.heading("email", text="EMAIL")
+        self.all_tree.column("email", width=240)
+        self.all_tree.heading("pass", text="PASS")
+        self.all_tree.column("pass", width=130)
+        self.all_tree.heading("status", text="TRẠNG THÁI")
+        self.all_tree.column("status", width=200)
+        self.all_tree.heading("posts", text="POSTS")
+        self.all_tree.column("posts", width=70, anchor="center")
+        self.all_tree.heading("followers", text="FOLLOWERS")
+        self.all_tree.column("followers", width=90, anchor="center")
+        self.all_tree.heading("proxy", text="PROXY")
+        self.all_tree.column("proxy", width=260)
+        self.all_tree.heading("profile_url", text="PROFILE URL")
+        self.all_tree.column("profile_url", width=260)
+        self.all_tree.heading("profile_id", text="PROFILE ID")
+        self.all_tree.column("profile_id", width=240)
+
+        def _on_all_scroll(*args):
+            self._mark_user_scroll(self.all_tree)
+            self.all_tree.yview(*args)
+
+        all_scroll = ttk.Scrollbar(all_table, orient="vertical", command=_on_all_scroll)
+        self.all_tree.configure(yscrollcommand=all_scroll.set)
+        self.all_tree.grid(row=0, column=0, sticky="nsew")
+        all_scroll.grid(row=0, column=1, sticky="ns")
+        all_table.grid_rowconfigure(0, weight=1)
+        all_table.grid_columnconfigure(0, weight=1)
+        self.all_tree.tag_configure("status_ok", foreground="green")
+        self.all_tree.tag_configure("status_err", foreground="red")
+        self.all_tree.bind("<Button-1>", self._on_all_tree_click)
+        self.all_tree.bind("<B1-Motion>", self._on_all_tree_drag)
+        self.all_tree.bind("<ButtonRelease-1>", self._on_all_tree_release)
+        self.all_tree.bind("<Button-3>", self._on_all_tree_right_click)
+        self.all_tree.bind("<MouseWheel>", lambda e, t=self.all_tree: self._mark_user_scroll(t))
+        self.all_tree.bind("<Button-4>", lambda e, t=self.all_tree: self._mark_user_scroll(t))
+        self.all_tree.bind("<Button-5>", lambda e, t=self.all_tree: self._mark_user_scroll(t))
 
         # Add Select All / Deselect All buttons for tab_upload
         btn_frame_upload = ttk.Frame(self.tab_upload)
@@ -645,6 +715,18 @@ class App:
         self.fb_profile_menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected_fb_profile(False))
         self.fb_profile_menu.add_command(label="Tick all", command=self._select_all_fb_profile_accounts)
         self.fb_profile_menu.add_command(label="Untick all", command=self._deselect_all_fb_profile_accounts)
+
+        self.all_menu = tk.Menu(self.root, tearoff=0)
+        self.all_menu.add_command(label="Tick selected", command=lambda: self._set_checked_selected_all(True))
+        self.all_menu.add_command(label="Untick selected", command=lambda: self._set_checked_selected_all(False))
+        self.all_menu.add_command(label="Tick all", command=self._select_all_all_accounts)
+        self.all_menu.add_command(label="Untick all", command=self._deselect_all_all_accounts)
+        self.all_menu.add_separator()
+        self.all_menu.add_command(label="Login selected", command=self.menu_all_login_selected)
+        self.all_menu.add_command(label="Upload selected", command=self.menu_all_upload_selected)
+        self.all_menu.add_command(label="Get followers", command=self.menu_all_follow_selected)
+        self.all_menu.add_separator()
+        self.all_menu.add_command(label="Replace proxy errors", command=self.menu_all_replace_proxy_errors)
 
         self.log_box = tk.Text(self.root, height=6, state="disabled")
         self.log_box.pack(fill="both", expand=False, padx=8, pady=(0, 8))
@@ -1058,6 +1140,7 @@ class App:
                 ),
             )
         self._update_counts()
+        self._load_all_rows()
 
     def _load_profile_rows(self) -> None:
         self.profile_accounts = self._dedupe_accounts(self.profile_accounts)
@@ -1104,6 +1187,49 @@ class App:
                 ),
             )
         self._update_counts()
+        self._load_all_rows()
+
+    def _load_all_rows(self) -> None:
+        if not hasattr(self, "all_tree"):
+            return
+        cached_chk = {}
+        try:
+            for iid in self.all_tree.get_children():
+                email = (self.all_tree.set(iid, "email") or "").strip()
+                social = (self.all_tree.set(iid, "social") or "").strip().upper()
+                if email and social:
+                    cached_chk[(social, email)] = self.all_tree.set(iid, "chk")
+            self.all_tree.delete(*self.all_tree.get_children())
+        except Exception:
+            return
+        rows = []
+        for acc in self.accounts or []:
+            rows.append(("YTB", acc))
+        for acc in (getattr(self, "fb_accounts", None) or []):
+            rows.append(("FB", acc))
+        for idx, (social, row) in enumerate(rows, start=1):
+            chk = cached_chk.get((social, row.get("uid", "")), "v")
+            posts = row.get("posts", "")
+            followers = row.get("followers", "")
+            profile_url = row.get("profile_url", "")
+            self.all_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(
+                    chk,
+                    idx,
+                    social,
+                    row.get("uid", ""),
+                    row.get("pass", ""),
+                    row.get("status", "READY"),
+                    "" if posts is None else str(posts),
+                    "" if followers is None else str(followers),
+                    row.get("proxy", ""),
+                    profile_url,
+                    row.get("profile_id", ""),
+                ),
+            )
 
     def _load_fb_profile_rows(self) -> None:
         self.fb_profile_accounts = self._dedupe_accounts(self.fb_profile_accounts)
@@ -1401,6 +1527,12 @@ class App:
             self._apply_status_tag(resolved_id, status)
             self._auto_scroll_if_needed(self.tree, resolved_id, status)
             try:
+                email = (self.tree.set(resolved_id, "email") or "").strip()
+                if email:
+                    self._update_all_row("YTB", email, status=status, profile_id=profile_id)
+            except Exception:
+                pass
+            try:
                 email = self.tree.set(resolved_id, "email")
                 if email:
                     for acc in self.accounts:
@@ -1428,6 +1560,12 @@ class App:
             self.fb_tree.set(item_id, "status", status)
             self._apply_fb_status_tag(item_id, status)
             self._auto_scroll_if_needed(self.fb_tree, item_id, status)
+            try:
+                email = (self.fb_tree.set(item_id, "email") or "").strip()
+                if email:
+                    self._update_all_row("FB", email, status=status)
+            except Exception:
+                pass
 
         self.root.after(0, _update)
 
@@ -1488,11 +1626,14 @@ class App:
             pass
 
     def _record_failed(self, item_id: str, acc: dict, reason: str) -> None:
-        with self.failed_accounts_lock:
-            for iid, _acc in self.failed_accounts:
-                if iid == item_id:
-                    return
-            self.failed_accounts.append((item_id, acc))
+        reason_upper = (reason or "").upper()
+        is_blocked = "BLOCKED" in reason_upper
+        if not is_blocked:
+            with self.failed_accounts_lock:
+                for iid, _acc in self.failed_accounts:
+                    if iid == item_id:
+                        return
+                self.failed_accounts.append((item_id, acc))
         try:
             log_path = os.path.join(_THIS_DIR, "logs", "failed_accounts.log")
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -1506,11 +1647,14 @@ class App:
             pass
 
     def _record_profile_failed(self, item_id: str, acc: dict, reason: str) -> None:
-        with self.profile_failed_lock:
-            for iid, _acc in self.profile_failed_accounts:
-                if iid == item_id:
-                    return
-            self.profile_failed_accounts.append((item_id, acc))
+        reason_upper = (reason or "").upper()
+        is_blocked = "BLOCKED" in reason_upper
+        if not is_blocked:
+            with self.profile_failed_lock:
+                for iid, _acc in self.profile_failed_accounts:
+                    if iid == item_id:
+                        return
+                self.profile_failed_accounts.append((item_id, acc))
         try:
             log_path = os.path.join(_THIS_DIR, "logs", "failed_profile_accounts.log")
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -1574,7 +1718,7 @@ class App:
             followers = cached.get("followers", row.get("followers", ""))
             profile_url = cached.get("profile_url", row.get("profile_url", ""))
             status = row.get("status") or cached.get("status", "READY")
-            chk = "v" if email in FIXED_SCAN_EMAILS else cached.get("chk", "v")
+            chk = cached.get("chk", "v")
             tags = cached.get("tags", ())
             self.tree.insert(
                 "",
@@ -1796,6 +1940,56 @@ class App:
             pass
         return emails
 
+    def _get_checked_all_rows(self) -> list:
+        rows = []
+        try:
+            for iid in self.all_tree.get_children():
+                if self.all_tree.set(iid, "chk") != "v":
+                    continue
+                email = (self.all_tree.set(iid, "email") or "").strip()
+                social = (self.all_tree.set(iid, "social") or "").strip().upper()
+                if email and social:
+                    rows.append((social, email))
+        except Exception:
+            pass
+        return rows
+
+    def _update_all_row(
+        self,
+        social: str,
+        email: str,
+        status: str | None = None,
+        posts=None,
+        followers=None,
+        profile_url: str | None = None,
+        profile_id: str | None = None,
+    ) -> None:
+        try:
+            social = (social or "").strip().upper()
+            email = (email or "").strip()
+            if not social or not email:
+                return
+            for iid in self.all_tree.get_children():
+                if (self.all_tree.set(iid, "social") or "").strip().upper() != social:
+                    continue
+                if (self.all_tree.set(iid, "email") or "").strip() != email:
+                    continue
+                if status is not None and status != "":
+                    self.all_tree.set(iid, "status", status)
+                    self._apply_all_status_tag(iid, status)
+                    self._auto_scroll_if_needed(self.all_tree, iid, status)
+                if posts is not None:
+                    self.all_tree.set(iid, "posts", str(posts))
+                if followers is not None:
+                    self.all_tree.set(iid, "followers", str(followers))
+                if profile_url:
+                    self.all_tree.set(iid, "profile_url", profile_url)
+                if profile_id:
+                    self.all_tree.set(iid, "profile_id", profile_id)
+                break
+        except Exception:
+            pass
+
     def _map_email_to_item_id(self, tree: ttk.Treeview) -> dict:
         mapping = {}
         try:
@@ -1872,6 +2066,15 @@ class App:
             self.fb_tree.item(item_id, tags=("status_ok",))
         else:
             self.fb_tree.item(item_id, tags=())
+
+    def _apply_all_status_tag(self, item_id: str, status: str) -> None:
+        status_upper = (status or "").upper()
+        if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
+            self.all_tree.item(item_id, tags=("status_err",))
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "POSTING", "UPLOAD"]):
+            self.all_tree.item(item_id, tags=("status_ok",))
+        else:
+            self.all_tree.item(item_id, tags=())
 
     def _apply_fb_profile_status_tag(self, item_id: str, status: str) -> None:
         status_upper = (status or "").upper()
@@ -2226,6 +2429,18 @@ class App:
                 self.tree.set(resolved_id, "followers", str(followers))
             if posts is not None:
                 self.tree.set(resolved_id, "posts", str(posts))
+            try:
+                email = (self.tree.set(resolved_id, "email") or "").strip()
+                if email:
+                    self._update_all_row(
+                        "YTB",
+                        email,
+                        profile_url=profile_url,
+                        followers=followers,
+                        posts=posts,
+                    )
+            except Exception:
+                pass
         self.root.after(0, _update)
         try:
             email = self._lookup_item_email(item_id)
@@ -2260,6 +2475,19 @@ class App:
                     self.fb_tree.set(item_id, "posts", str(posts))
                 if profile_id:
                     self.fb_tree.set(item_id, "profile_id", profile_id)
+                try:
+                    email = (self.fb_tree.set(item_id, "email") or "").strip()
+                    if email:
+                        self._update_all_row(
+                            "FB",
+                            email,
+                            profile_url=profile_url,
+                            followers=followers,
+                            posts=posts,
+                            profile_id=profile_id,
+                        )
+                except Exception:
+                    pass
             except Exception:
                 pass
         self.root.after(0, _update)
@@ -2360,6 +2588,18 @@ class App:
         cur = self.tree.set(item_id, "chk")
         self.tree.set(item_id, "chk", "" if cur == "v" else "v")
 
+    def _toggle_checked_all(self, item_id: str) -> None:
+        cur = self.all_tree.set(item_id, "chk")
+        self.all_tree.set(item_id, "chk", "" if cur == "v" else "v")
+
+    def _set_checked_by_email(self, tree: ttk.Treeview, emails: set) -> None:
+        try:
+            for iid in tree.get_children():
+                email = (tree.set(iid, "email") or "").strip()
+                tree.set(iid, "chk", "v" if email in emails else "")
+        except Exception:
+            pass
+
     def _select_all_accounts(self) -> None:
         """Select all accounts (mark all as checked)"""
         count = 0
@@ -2375,6 +2615,25 @@ class App:
             self.tree.set(item_id, "chk", "")
             count += 1
         self._log(f"[SELECT] UPLOAD deselect all ({count})")
+
+    def _select_all_all_accounts(self) -> None:
+        count = 0
+        for item_id in self.all_tree.get_children():
+            self.all_tree.set(item_id, "chk", "v")
+            count += 1
+        self._log(f"[SELECT] ALL select all ({count})")
+
+    def _deselect_all_all_accounts(self) -> None:
+        count = 0
+        for item_id in self.all_tree.get_children():
+            self.all_tree.set(item_id, "chk", "")
+            count += 1
+        self._log(f"[SELECT] ALL deselect all ({count})")
+
+    def _set_checked_selected_all(self, checked: bool) -> None:
+        mark = "v" if checked else ""
+        for item_id in self.all_tree.selection():
+            self.all_tree.set(item_id, "chk", mark)
 
     def _set_checked_selected(self, checked: bool) -> None:
         mark = "v" if checked else ""
@@ -2414,7 +2673,7 @@ class App:
                 return
             if col_name == "email":
                 self.accounts[idx]["uid"] = new_value
-            elif col_name in ("pass", "proxy"):
+            elif col_name in ("pass", "proxy", "youtube"):
                 self.accounts[idx][col_name] = new_value
             self._save_accounts_cache()
         elif tree == self.profile_tree:
@@ -2515,6 +2774,48 @@ class App:
                 self.tree.selection_set(row)
             self._context_item = row
             self.menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_all_tree_click(self, event) -> None:
+        region = self.all_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.all_tree.identify_column(event.x)
+        row = self.all_tree.identify_row(event.y)
+        if column == "#1":
+            if row:
+                self._toggle_checked_all(row)
+                return "break"
+        if row:
+            self._all_dragging = True
+            self._all_drag_start = row
+
+    def _on_all_tree_drag(self, event) -> None:
+        if not self._all_dragging or not self._all_drag_start:
+            return
+        row = self.all_tree.identify_row(event.y)
+        if not row:
+            return
+        children = list(self.all_tree.get_children())
+        try:
+            start_idx = children.index(self._all_drag_start)
+            cur_idx = children.index(row)
+        except ValueError:
+            return
+        lo = min(start_idx, cur_idx)
+        hi = max(start_idx, cur_idx)
+        self.all_tree.selection_set(children[lo : hi + 1])
+
+    def _on_all_tree_release(self, event) -> None:
+        self._all_dragging = False
+        self._all_drag_start = None
+
+    def _on_all_tree_right_click(self, event) -> None:
+        row = self.all_tree.identify_row(event.y)
+        if row:
+            if row not in self.all_tree.selection():
+                self.all_tree.selection_set(row)
+            self._all_context_item = row
+            self.all_menu.tk_popup(event.x_root, event.y_root)
 
     def _toggle_checked_profile(self, item_id: str) -> None:
         cur = self.profile_tree.set(item_id, "chk")
@@ -2766,6 +3067,23 @@ class App:
                 items.append((iid, acc))
         return items
 
+    def _get_selected_all_rows(self):
+        items = []
+        for iid in self.all_tree.selection():
+            email = (self.all_tree.set(iid, "email") or "").strip()
+            social = (self.all_tree.set(iid, "social") or "").strip().upper()
+            if email and social:
+                items.append((social, email))
+        return items
+
+    def _get_context_all_rows(self):
+        if self._all_context_item:
+            email = (self.all_tree.set(self._all_context_item, "email") or "").strip()
+            social = (self.all_tree.set(self._all_context_item, "social") or "").strip().upper()
+            if email and social:
+                return [(social, email)]
+        return []
+
     def _get_checked_profile_accounts(self):
         items = []
         acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.profile_accounts}
@@ -2835,6 +3153,76 @@ class App:
             self._bind_item_email(item_id, acc.get("uid", ""))
             pool.submit(self._follow_only_worker, item_id, acc)
 
+    def menu_all_login_selected(self) -> None:
+        if self.executor is not None:
+            self._log("[MENU] Dang chay job, hay STOP truoc.")
+            return
+        selected = self._get_context_all_rows() or self._get_selected_all_rows() or self._get_checked_all_rows()
+        if not selected:
+            return
+        ytb_emails = [email for social, email in selected if social == "YTB"]
+        if not ytb_emails:
+            return
+        max_threads = max(1, int(self.entry_threads.get() or 1))
+        pool = ThreadPoolExecutor(max_workers=max_threads)
+        acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.accounts}
+        email_to_iid = self._map_email_to_item_id(self.tree)
+        for email in ytb_emails:
+            acc = acc_by_email.get(email)
+            item_id = email_to_iid.get(email)
+            if acc and item_id:
+                self._bind_item_email(item_id, acc.get("uid", ""))
+                pool.submit(self._login_only_worker, item_id, acc)
+
+    def menu_all_upload_selected(self) -> None:
+        if self.executor is not None:
+            self._log("[MENU] Dang chay job, hay STOP truoc.")
+            return
+        selected = self._get_context_all_rows() or self._get_selected_all_rows() or self._get_checked_all_rows()
+        if not selected:
+            return
+        ytb_emails = [email for social, email in selected if social == "YTB"]
+        fb_emails = [email for social, email in selected if social == "FB"]
+        if ytb_emails:
+            max_threads = max(1, int(self.entry_threads.get() or 1))
+            pool = ThreadPoolExecutor(max_workers=max_threads)
+            acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.accounts}
+            email_to_iid = self._map_email_to_item_id(self.tree)
+            for email in ytb_emails:
+                acc = acc_by_email.get(email)
+                item_id = email_to_iid.get(email)
+                if acc and item_id:
+                    self._bind_item_email(item_id, acc.get("uid", ""))
+                    pool.submit(self._upload_only_worker, item_id, acc)
+        if fb_emails:
+            self._set_checked_by_email(self.fb_tree, set(fb_emails))
+            self.start_fb_jobs()
+
+    def menu_all_follow_selected(self) -> None:
+        if self.executor is not None:
+            self._log("[MENU] Dang chay job, hay STOP truoc.")
+            return
+        selected = self._get_context_all_rows() or self._get_selected_all_rows() or self._get_checked_all_rows()
+        if not selected:
+            return
+        ytb_emails = [email for social, email in selected if social == "YTB"]
+        if not ytb_emails:
+            return
+        max_threads = max(1, int(self.entry_threads.get() or 1))
+        pool = ThreadPoolExecutor(max_workers=max_threads)
+        acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.accounts}
+        email_to_iid = self._map_email_to_item_id(self.tree)
+        for email in ytb_emails:
+            acc = acc_by_email.get(email)
+            item_id = email_to_iid.get(email)
+            if acc and item_id:
+                self._bind_item_email(item_id, acc.get("uid", ""))
+                pool.submit(self._follow_only_worker, item_id, acc)
+
+    def menu_all_replace_proxy_errors(self) -> None:
+        self._replace_proxy_errors("upload")
+        self._replace_proxy_errors("fb")
+
     def menu_profile_selected(self) -> None:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
@@ -2888,6 +3276,15 @@ class App:
             with open(self._accounts_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
+                # Normalize specific YouTube URLs that should always point to Shorts.
+                try:
+                    for acc in data:
+                        if acc.get("uid") == "opendauria@hotmail.com":
+                            yt = (acc.get("youtube") or "").strip()
+                            if yt == "https://www.youtube.com/@Vice_Verses":
+                                acc["youtube"] = "https://www.youtube.com/@Vice_Verses/shorts"
+                except Exception:
+                    pass
                 return data
         except Exception:
             return []
@@ -3033,6 +3430,8 @@ class App:
                 acc["followers"] = old.get("followers")
                 acc["posts"] = old.get("posts")
                 acc["profile_url"] = old.get("profile_url", "")
+                acc["profile_id"] = old.get("profile_id", "")
+                acc["status"] = old.get("status", acc.get("status"))
             new_accounts.append(acc)
 
         if not new_accounts:
@@ -3183,6 +3582,7 @@ class App:
             messagebox.showerror("Import", f"Loi doc file: {e}")
             return
 
+        existing_by_uid = {str(a.get("uid") or "").strip(): a for a in self.fb_accounts}
         new_accounts = []
         for row in rows:
             if len(row) < 4:
@@ -3195,7 +3595,15 @@ class App:
                 continue
             if not uid:
                 continue
-            new_accounts.append({"uid": uid, "pass": pwd, "proxy": proxy, "facebook": fb_link})
+            acc = {"uid": uid, "pass": pwd, "proxy": proxy, "facebook": fb_link}
+            old = existing_by_uid.get(uid)
+            if old:
+                acc["followers"] = old.get("followers")
+                acc["posts"] = old.get("posts")
+                acc["profile_url"] = old.get("profile_url", "")
+                acc["profile_id"] = old.get("profile_id", "")
+                acc["status"] = old.get("status", acc.get("status"))
+            new_accounts.append(acc)
 
         if not new_accounts:
             messagebox.showinfo("Import", "Khong tim thay dong du lieu hop le.")
@@ -3268,6 +3676,12 @@ class App:
     def _is_profile_tab(self) -> bool:
         try:
             return self.notebook.nametowidget(self.notebook.select()) == self.tab_profile
+        except Exception:
+            return False
+
+    def _is_all_tab(self) -> bool:
+        try:
+            return self.notebook.nametowidget(self.notebook.select()) == self.tab_all
         except Exception:
             return False
 
@@ -3442,12 +3856,14 @@ class App:
                 self.profile_failed_accounts = []
 
             while failed_list and not self.stop_event.is_set():
-                if self._profile_retry_round >= 3:
-                    self._log(f"[PROFILE RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+                if self._profile_retry_round >= self._max_retry_rounds:
+                    self._log(
+                        f"[PROFILE RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})"
+                    )
                     break
                 self._profile_retry_round += 1
                 self._log(
-                    f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {self._profile_retry_round}/3)..."
+                    f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {self._profile_retry_round}/{self._max_retry_rounds})..."
                 )
 
                 self.executor = ThreadPoolExecutor(max_workers=max_threads)
@@ -3529,6 +3945,18 @@ class App:
 
 
     def start_jobs(self) -> None:
+        if self._is_all_tab():
+            checked = self._get_checked_all_rows()
+            if not checked:
+                messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
+                return
+            self._from_all_tab = True
+            ytb_set = {email for social, email in checked if social == "YTB"}
+            fb_set = {email for social, email in checked if social == "FB"}
+            self._set_checked_by_email(self.tree, ytb_set)
+            self._set_checked_by_email(self.fb_tree, fb_set)
+        else:
+            self._from_all_tab = False
         if self._is_profile_tab():
             self.start_profile_jobs()
             return
@@ -3541,7 +3969,7 @@ class App:
             upload_checked = self._get_checked_email_set(self.tree)
             fb_checked = self._get_checked_email_set(self.fb_tree)
             if upload_checked:
-                self._run_upload_after_fb = bool(fb_checked)
+                self._run_upload_after_fb = False
             elif fb_checked:
                 # no upload checked, run FB directly
                 self._run_upload_after_fb = False
@@ -3685,20 +4113,20 @@ class App:
             
             # If failed accounts exist, retry them immediately (only during run)
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < 3:
+                if self._retry_round < self._max_retry_rounds:
                     self._retry_round += 1
-                    self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
+                    self._log(
+                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                    )
                     # Don't use the last loop's win_pos/win_size; let _retry_failed_accounts calculate its own layout
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
-                self._log(f"[RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+                self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
 
-            if self._run_upload_after_fb and not self.stop_event.is_set():
-                self._run_upload_after_fb = False
-                self._force_upload_only = True
-                self.start_fb_jobs()
-                return
+            # Do not auto-switch to FB from YTB
+            if self._from_all_tab:
+                self._from_all_tab = False
 
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = 5 * 60 * 1000
@@ -3826,12 +4254,14 @@ class App:
 
             # Retry failed accounts
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < 3:
+                if self._retry_round < self._max_retry_rounds:
                     self._retry_round += 1
-                    self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
+                    self._log(
+                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                    )
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
-                self._log(f"[RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+                self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
 
             self._clear_failed_log()
 
@@ -4345,21 +4775,22 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < 3:
+                if self._retry_round < self._max_retry_rounds:
                     self._retry_round += 1
-                    self._log(f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
+                    self._log(
+                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                    )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_fb_accounts(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+                self._log(f"[FB RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             self._reset_run("fb")
-            if self._run_upload_after_fb and not self.stop_event.is_set():
-                self._run_upload_after_fb = False
-                self._force_upload_only = True
-                self.start_jobs()
+            if self._from_all_tab:
+                self._from_all_tab = False
+                return
 
         threading.Thread(target=_waiter, daemon=True).start()
 
@@ -4370,7 +4801,7 @@ class App:
         self._log(f"[FB RETRY] Retrying {len(failed_accounts)} failed accounts...")
         try:
             for item_id, _acc in failed_accounts:
-                self._set_fb_status(item_id, f"RETRY {self._retry_round}/3")
+                self._set_fb_status(item_id, f"RETRY {self._retry_round}/{self._max_retry_rounds}")
         except Exception:
             pass
 
@@ -4418,23 +4849,22 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < 3:
+                if self._retry_round < self._max_retry_rounds:
                     self._retry_round += 1
                     self._log(
-                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)..."
+                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
                     )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_fb_accounts(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[FB RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+                self._log(f"[FB RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             self._reset_run("fb")
-            if self._run_upload_after_fb and not self.stop_event.is_set():
-                self._run_upload_after_fb = False
-                self._force_upload_only = True
-                self.start_jobs()
+            if self._from_all_tab:
+                self._from_all_tab = False
+                return
 
         threading.Thread(target=_retry_waiter, daemon=True).start()
 
@@ -4756,7 +5186,7 @@ class App:
         self._clear_status_tags()
         try:
             for item_id, _acc in failed_accounts:
-                self._set_status(item_id, f"RETRY {self._retry_round}/3")
+                self._set_status(item_id, f"RETRY {self._retry_round}/{self._max_retry_rounds}")
         except Exception:
             pass
         
@@ -4817,12 +5247,14 @@ class App:
             except Exception:
                 pass
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < 3:
+                if self._retry_round < self._max_retry_rounds:
                     self._retry_round += 1
-                    self._log(f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/3)...")
+                    self._log(
+                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                    )
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
-                self._log(f"[RETRY] Stop retry after 3 rounds (remaining: {len(failed_list)})")
+                self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = int(self._repeat_delay_sec * 1000)
@@ -4890,10 +5322,10 @@ class App:
                 failed_list = self.profile_failed_accounts.copy()
                 self.profile_failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._profile_retry_round < 3:
+                if self._profile_retry_round < self._max_retry_rounds:
                     self._profile_retry_round += 1
                     self._log(
-                        f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {self._profile_retry_round}/3)..."
+                        f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {self._profile_retry_round}/{self._max_retry_rounds})..."
                     )
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_profile_accounts(fl, max_threads))
                     return
@@ -6100,7 +6532,7 @@ class App:
                             if not ok_p:
                                 if up_status == "account_blocked" or "Kh?ng th?y tr?ng th?i Uploading/Uploaded" in (up_msg or ""):
                                     self._set_status(item_id, "ACCOUNT BLOCKED")
-                                    self._log(f"[{acc['uid']}] ACCOUNT BLOCKED - retry this account")
+                                    self._log(f"[{acc['uid']}] ACCOUNT BLOCKED - skip retry")
                                     self.error_logger.log_upload_error(acc['uid'], path_or_err, "Account blocked")
                                     self._record_failed(item_id, acc, "ACCOUNT BLOCKED")
                                     break
