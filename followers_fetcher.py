@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import time
+import os
 from typing import Callable, Tuple
 
 from selenium import webdriver
@@ -32,7 +33,65 @@ def _parse_count(text: str) -> int:
         return 0
 
 
-def fetch_followers(driver_path: str, remote_debugging_address: str, logger: Logger) -> Tuple[int | None, str, int | None]:
+def _find_stat_count(driver, labels: list[str]) -> int | None:
+    # Try to locate a stat label and read its sibling bold number.
+    for label in labels:
+        lbl = label.lower()
+        try:
+            label_el = driver.find_element(
+                By.XPATH,
+                "//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')="
+                f"'{lbl}']",
+            )
+            try:
+                num_el = label_el.find_element(
+                    By.XPATH, "preceding-sibling::span[contains(@class,'font-bold')][1]"
+                )
+            except Exception:
+                num_el = label_el.find_element(
+                    By.XPATH, "../span[contains(@class,'font-bold')][1]"
+                )
+            txt = (num_el.text or "").strip()
+            return _parse_count(txt)
+        except Exception:
+            continue
+    return None
+
+
+def _safe_email(email: str) -> str:
+    return (
+        (email or "unknown")
+        .strip()
+        .replace("@", "_at_")
+        .replace(".", "_")
+        .replace(":", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+
+def _save_profile_html(driver, email: str, logger: Logger) -> None:
+    if not email:
+        return
+    try:
+        base = os.path.join(os.path.dirname(__file__), "html_snapshots")
+        os.makedirs(base, exist_ok=True)
+        name = _safe_email(email)
+        path = os.path.join(base, f"{name}.html")
+        html = driver.page_source or ""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        if logger:
+            logger(f"[FOLLOW] Save HTML err: {e}")
+
+
+def fetch_followers(
+    driver_path: str,
+    remote_debugging_address: str,
+    logger: Logger,
+    email: str = "",
+) -> Tuple[int | None, str, int | None]:
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", remote_debugging_address.strip())
     service = Service(driver_path)
@@ -59,6 +118,18 @@ def fetch_followers(driver_path: str, remote_debugging_address: str, logger: Log
         except Exception:
             pass
 
+        # Save profile HTML only after profile stats are present
+        try:
+            wait.until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//span[normalize-space()='Followers' or normalize-space()='Follower']")
+                )
+            )
+            _save_profile_html(driver, email, logger)
+        except Exception as e:
+            if logger:
+                logger(f"[FOLLOW] Save HTML skipped: {e}")
+
         try:
             foll_el = wait.until(
                 EC.visibility_of_element_located(
@@ -73,40 +144,12 @@ def fetch_followers(driver_path: str, remote_debugging_address: str, logger: Log
             followers = None
 
         posts = None
-        # Try to read posts from common profile stats block
+        # Try read posts from label-based lookup
         try:
-            stats_root = wait.until(
-                EC.presence_of_element_located(
-                    (
-                        By.XPATH,
-                        "//div[contains(@class,'items-center') and .//span[normalize-space()='Posts' or normalize-space()='Post']]",
-                    )
-                )
-            )
-            spans = stats_root.find_elements(By.XPATH, ".//span[contains(@class,'font-bold')]")
-            if spans:
-                txt = (spans[0].text or "").strip()
-                posts = _parse_count(txt)
+            posts = _find_stat_count(driver, ["posts", "post", "videos", "video"])
         except Exception as e:
             if logger:
-                logger(f"[FOLLOW] Posts block err: {e}")
-            posts = None
-        # Fallback: find exact 'Posts' label and get previous bold span
-        if posts is None:
-            try:
-                posts_lbl = driver.find_element(
-                    By.XPATH,
-                    "//span[normalize-space()='Posts' or normalize-space()='Post']",
-                )
-                try:
-                    prev = posts_lbl.find_element(By.XPATH, "preceding-sibling::span[contains(@class,'font-bold')][1]")
-                except Exception:
-                    prev = posts_lbl.find_element(By.XPATH, "../span[contains(@class,'font-bold')][1]")
-                txt = (prev.text or "").strip()
-                posts = _parse_count(txt)
-            except Exception as e:
-                if logger:
-                    logger(f"[FOLLOW] Read posts err: {e}")
+                logger(f"[FOLLOW] Read posts err: {e}")
 
         try:
             profile_url = (driver.current_url or "").strip()

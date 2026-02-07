@@ -149,7 +149,7 @@ def _force_click(driver, el) -> bool:
     return False
 
 
-def _parse_followers(text: str) -> Optional[int]:
+def _parse_stat_count(text: str) -> Optional[int]:
     txt = (text or "").strip().replace(",", "").upper()
     if not txt:
         return None
@@ -164,6 +164,34 @@ def _parse_followers(text: str) -> Optional[int]:
             return int(txt)
     except Exception:
         return None
+    return None
+
+
+def _parse_followers(text: str) -> Optional[int]:
+    return _parse_stat_count(text)
+
+
+def _find_stat_count(driver, labels: list[str]) -> Optional[int]:
+    for label in labels:
+        lbl = label.lower()
+        try:
+            label_el = driver.find_element(
+                By.XPATH,
+                "//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')="
+                f"'{lbl}']",
+            )
+            try:
+                num_el = label_el.find_element(
+                    By.XPATH, "preceding-sibling::span[contains(@class,'font-bold')][1]"
+                )
+            except Exception:
+                num_el = label_el.find_element(
+                    By.XPATH, "../span[contains(@class,'font-bold')][1]"
+                )
+            txt = (num_el.text or "").strip()
+            return _parse_stat_count(txt)
+        except Exception:
+            continue
     return None
 
 
@@ -656,7 +684,7 @@ def _is_post_enabled(el) -> bool:
     return True
 
 
-def _save_html_snapshot(driver, acc_email: str, logger: Logger) -> None:
+def _save_html_snapshot(driver, acc_email: str, logger: Logger, full_page: bool = False) -> None:
     if not acc_email:
         return
     safe_name = acc_email.replace("@", "_at_").replace(".", "_")
@@ -668,12 +696,13 @@ def _save_html_snapshot(driver, acc_email: str, logger: Logger) -> None:
     out_path = os.path.join(out_dir, f"{safe_name}.html")
     try:
         html = driver.page_source or ""
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            main = soup.find("main")
-            html = str(main) if main else html
-        except Exception:
-            pass
+        if not full_page:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                main = soup.find("main")
+                html = str(main) if main else html
+            except Exception:
+                pass
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(html)
         _log(logger, f"[UPLOAD] Saved HTML snapshot: {out_path}")
@@ -1041,12 +1070,13 @@ def upload_prepare(
 
 def upload_post_async(
     driver, 
-    logger: Logger, 
+    logger: Logger,
+    acc_email: str = "",
     max_total_s: int = 180,
     post_button_semaphore: Optional[threading.BoundedSemaphore] = None  # ⭐ Serial POST button handling
-) -> Tuple[str, str, str, int | None]:
+) -> Tuple[str, str, str, int | None, int | None]:
     if driver is None:
-        return "error", "No driver", "", None
+        return "error", "No driver", "", None, None
     try:
         start_time = time.time()
         def _remaining() -> float:
@@ -1060,10 +1090,10 @@ def upload_post_async(
 
         try:
             if _remaining() <= 0:
-                return "timeout", "Post timeout", "", None
+                return "timeout", "Post timeout", "", None, None
             post_btn = WebDriverWait(driver, max(1, int(_remaining()))).until(lambda d: _find_enabled_post())
         except TimeoutException:
-            return "timeout", "Post button not enabled"
+            return "timeout", "Post button not enabled", "", None, None
 
         # ⭐ SERIAL POST BUTTON HANDLING: Only 1 thread clicks POST at a time
         acquired = False
@@ -1072,7 +1102,7 @@ def upload_post_async(
             acquired = post_button_semaphore.acquire(timeout=30)
             if not acquired:
                 _log(logger, f"[UPLOAD-POST] ✗ Timeout waiting for POST button slot (30s) - other thread using button")
-                return "error", "POST button slot timeout", "", None
+                return "error", "POST button slot timeout", "", None, None
             _log(logger, f"[UPLOAD-POST] ✓ Got POST button slot, proceeding...")
 
         try:
@@ -1092,18 +1122,18 @@ def upload_post_async(
                     _log(logger, f"[UPLOAD-POST] ✓ POST button clicked (JS)")
                 except Exception as e:
                     _log(logger, f"[UPLOAD-POST] ✗ Click POST error: {e}")
-                    return "error", f"Click Post error: {e}", "", None
+                    return "error", f"Click Post error: {e}", "", None, None
 
             try:
                 if _remaining() <= 0:
-                    return "timeout", "Post timeout", "", None
+                    return "timeout", "Post timeout", "", None, None
                 WebDriverWait(driver, max(1, int(_remaining()))).until(
                     EC.visibility_of_element_located((By.XPATH, "//*[contains(., 'Successfully posted')]"))
                 )
                 _log(logger, f"[UPLOAD-POST] ✓ Successfully posted message found")
             except TimeoutException:
                 _log(logger, f"[UPLOAD-POST] ✗ Post result timeout")
-                return "timeout", "Post result timeout", "", None
+                return "timeout", "Post result timeout", "", None, None
         finally:
             # ⭐ ALWAYS release POST button slot when done
             if acquired and post_button_semaphore:
@@ -1112,6 +1142,7 @@ def upload_post_async(
 
         profile_url = ""
         followers = None
+        posts = None
         try:
             back_btn = None
             try:
@@ -1119,6 +1150,7 @@ def upload_post_async(
             except Exception:
                 back_btn = None
             if back_btn is not None:
+                _log(logger, "[UPLOAD-POST] Clicking Back to profile...")
                 _force_click(driver, back_btn)
                 time.sleep(1.2)
         except Exception:
@@ -1140,6 +1172,17 @@ def upload_post_async(
                     profile_url = ""
         except Exception:
             profile_url = ""
+
+        # Save profile HTML after we are back on profile page (overwrite upload snapshot)
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//span[normalize-space()='Followers' or normalize-space()='Follower']")
+                )
+            )
+            _save_html_snapshot(driver, acc_email, logger, full_page=True)
+        except Exception:
+            pass
         try:
             foll_el = WebDriverWait(driver, 8).until(
                 EC.visibility_of_element_located(
@@ -1150,7 +1193,11 @@ def upload_post_async(
             followers = _parse_followers(txt)
         except Exception:
             followers = None
+        try:
+            posts = _find_stat_count(driver, ["posts", "post", "videos", "video"])
+        except Exception:
+            posts = None
 
-        return "success", "", profile_url, followers
+        return "success", "", profile_url, followers, posts
     except Exception as e:
-        return "error", f"Post error: {e}", "", None
+        return "error", f"Post error: {e}", "", None, None

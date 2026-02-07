@@ -153,6 +153,8 @@ class App:
         self._repeat_after_id = None
         self._repeat_enabled = False
         self._repeat_delay_sec = 0
+        self._repeat_cycle_pending = False
+        self._cycle_count = 0
         self._fixed_threads = None
         self._retry_round = 0
         self._profile_retry_round = 0
@@ -257,7 +259,10 @@ class App:
         self.lbl_fb_total = ttk.Label(top2, textvariable=self._fb_count_var)
         self.lbl_fb_total.pack(side="left", padx=(0, 10))
         self.lbl_fb_profile_total = ttk.Label(top2, textvariable=self._fb_profile_count_var)
-        self.lbl_fb_profile_total.pack(side="left")
+        self.lbl_fb_profile_total.pack(side="left", padx=(0, 10))
+        self._cycle_var = tk.StringVar(value="Vòng lặp: 0")
+        self.lbl_cycle = ttk.Label(top2, textvariable=self._cycle_var)
+        self.lbl_cycle.pack(side="left")
 
         self.btn_start = ttk.Button(top, text="START", command=self.start_jobs)
         self.btn_start.pack(side="left", padx=(0, 8))
@@ -282,9 +287,9 @@ class App:
         self.tab_fb_profile = ttk.Frame(self.notebook)
         self.tab_interact = ttk.Frame(self.notebook)
         self.tab_stats = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_upload, text="UPLOAD")
+        self.notebook.add(self.tab_upload, text="YOUTUBE")
         self.notebook.add(self.tab_profile, text="PROFILE")
-        self.notebook.add(self.tab_fb, text="FB")
+        self.notebook.add(self.tab_fb, text="FACEBOOK")
         self.notebook.add(self.tab_fb_profile, text="FB PROFILE")
         self.notebook.add(self.tab_interact, text="INTERACT")
         self.notebook.add(self.tab_stats, text="THỐNG KÊ")
@@ -301,7 +306,7 @@ class App:
         upload_table.pack(fill="both", expand=True, padx=8, pady=8)
         self.tree = ttk.Treeview(
             upload_table,
-            columns=("chk", "stt", "email", "pass", "proxy", "status", "posts", "followers", "profile_url", "profile_id"),
+            columns=("chk", "stt", "email", "pass", "status", "posts", "followers", "proxy", "profile_url", "profile_id"),
             show="headings",
             selectmode="extended",
         )
@@ -313,14 +318,14 @@ class App:
         self.tree.column("email", width=240)
         self.tree.heading("pass", text="PASS")
         self.tree.column("pass", width=130)
-        self.tree.heading("proxy", text="PROXY")
-        self.tree.column("proxy", width=260)
         self.tree.heading("status", text="TRẠNG THÁI")
         self.tree.column("status", width=200)
         self.tree.heading("posts", text="POSTS", command=lambda: self._toggle_upload_sort("posts"))
         self.tree.column("posts", width=70, anchor="center")
         self.tree.heading("followers", text="FOLLOWERS", command=lambda: self._toggle_upload_sort("followers"))
         self.tree.column("followers", width=90, anchor="center")
+        self.tree.heading("proxy", text="PROXY")
+        self.tree.column("proxy", width=260)
         self.tree.heading("profile_url", text="PROFILE URL")
         self.tree.column("profile_url", width=260)
         self.tree.heading("profile_id", text="PROFILE ID")
@@ -390,7 +395,7 @@ class App:
         fb_table.pack(fill="both", expand=True, padx=8, pady=8)
         self.fb_tree = ttk.Treeview(
             fb_table,
-            columns=("chk", "stt", "email", "pass", "proxy", "facebook", "status"),
+            columns=("chk", "stt", "email", "pass", "status", "posts", "followers", "proxy", "facebook", "profile_url", "profile_id"),
             show="headings",
             selectmode="extended",
         )
@@ -402,12 +407,20 @@ class App:
         self.fb_tree.column("email", width=240)
         self.fb_tree.heading("pass", text="PASS")
         self.fb_tree.column("pass", width=130)
+        self.fb_tree.heading("status", text="TRẠNG THÁI")
+        self.fb_tree.column("status", width=200)
+        self.fb_tree.heading("posts", text="POSTS", command=lambda: self._toggle_fb_sort("posts"))
+        self.fb_tree.column("posts", width=70, anchor="center")
+        self.fb_tree.heading("followers", text="FOLLOWERS", command=lambda: self._toggle_fb_sort("followers"))
+        self.fb_tree.column("followers", width=90, anchor="center")
         self.fb_tree.heading("proxy", text="PROXY")
         self.fb_tree.column("proxy", width=260)
         self.fb_tree.heading("facebook", text="FB REELS")
         self.fb_tree.column("facebook", width=320)
-        self.fb_tree.heading("status", text="TRẠNG THÁI")
-        self.fb_tree.column("status", width=200)
+        self.fb_tree.heading("profile_url", text="PROFILE URL")
+        self.fb_tree.column("profile_url", width=260)
+        self.fb_tree.heading("profile_id", text="PROFILE ID")
+        self.fb_tree.column("profile_id", width=240)
 
         fb_scroll = ttk.Scrollbar(fb_table, orient="vertical", command=self.fb_tree.yview)
         self.fb_tree.configure(yscrollcommand=fb_scroll.set)
@@ -989,10 +1002,10 @@ class App:
                     idx,
                     row.get("uid", ""),
                     row.get("pass", ""),
-                    row.get("proxy", ""),
-                    "READY",
+                    row.get("status", "READY"),
                     "" if posts is None else str(posts),
                     "" if followers is None else str(followers),
+                    row.get("proxy", ""),
                     profile_url,
                     row.get("profile_id", ""),
                 ),
@@ -1034,9 +1047,13 @@ class App:
                     idx,
                     row.get("uid", ""),
                     row.get("pass", ""),
+                    row.get("status", "READY"),
+                    "" if row.get("posts") is None else str(row.get("posts")),
+                    "" if row.get("followers") is None else str(row.get("followers")),
                     row.get("proxy", ""),
                     row.get("facebook", ""),
-                    row.get("status", "READY"),
+                    row.get("profile_url", ""),
+                    row.get("profile_id", ""),
                 ),
             )
         self._update_counts()
@@ -1110,18 +1127,6 @@ class App:
         return out
 
     def _format_total_with_run(self, label: str, total: int, kind: str) -> str:
-        done = 0
-        total_run = 0
-        try:
-            with self._run_counts_lock:
-                rc = self._run_counts.get(kind) or {}
-                done = int(rc.get("done", 0) or 0)
-                total_run = int(rc.get("total", 0) or 0)
-        except Exception:
-            done = 0
-            total_run = 0
-        if total_run > 0:
-            return f"{label}: {total} | Run: {done}/{total_run}"
         return f"{label}: {total}"
 
     def _set_run_total(self, kind: str, total: int) -> None:
@@ -1149,6 +1154,20 @@ class App:
         except Exception:
             pass
         self._update_counts()
+    def _set_cycle_label(self) -> None:
+        try:
+            text = f"Vòng lặp: {self._cycle_count}"
+            self._cycle_var.set(text)
+        except Exception:
+            pass
+
+    def _reset_cycle_count(self) -> None:
+        self._cycle_count = 0
+        self._set_cycle_label()
+
+    def _increment_cycle(self) -> None:
+        self._cycle_count = max(0, int(self._cycle_count or 0)) + 1
+        self._set_cycle_label()
 
     def _mark_run_done(self, kind: str, email: str) -> None:
         if not email:
@@ -1627,6 +1646,26 @@ class App:
         self._sort_state[col] = None
         self._reset_upload_tree_order()
 
+    def _reset_fb_tree_order(self) -> None:
+        try:
+            self._reorder_tree_by_accounts(self.fb_tree, self.fb_accounts)
+        except Exception:
+            pass
+
+    def _toggle_fb_sort(self, col: str) -> None:
+        key = f"fb_{col}"
+        state = self._sort_state.get(key)
+        if state is None:
+            self._sort_state[key] = "desc"
+            self._sort_tree_by_column(self.fb_tree, col, descending=True)
+            return
+        if state == "desc":
+            self._sort_state[key] = "asc"
+            self._sort_tree_by_column(self.fb_tree, col, descending=False)
+            return
+        self._sort_state[key] = None
+        self._reset_fb_tree_order()
+
     def _get_checked_email_set(self, tree: ttk.Treeview) -> set:
         emails = set()
         try:
@@ -2057,6 +2096,42 @@ class App:
                         break
                 self._save_accounts_cache()
                 # Keep original order; no auto sort after fetching followers
+        except Exception:
+            pass
+
+    def _set_fb_profile_info(self, item_id: str, profile_url: str = "", followers=None, posts=None, profile_id: str = "") -> None:
+        def _update():
+            try:
+                if profile_url:
+                    self.fb_tree.set(item_id, "profile_url", profile_url)
+                if followers is not None:
+                    self.fb_tree.set(item_id, "followers", str(followers))
+                if posts is not None:
+                    self.fb_tree.set(item_id, "posts", str(posts))
+                if profile_id:
+                    self.fb_tree.set(item_id, "profile_id", profile_id)
+            except Exception:
+                pass
+        self.root.after(0, _update)
+        try:
+            email = ""
+            try:
+                email = (self.fb_tree.set(item_id, "email") or "").strip()
+            except Exception:
+                email = ""
+            if email:
+                for acc in self.fb_accounts:
+                    if acc.get("uid") == email:
+                        if profile_url:
+                            acc["profile_url"] = profile_url
+                        if followers is not None:
+                            acc["followers"] = followers
+                        if posts is not None:
+                            acc["posts"] = posts
+                        if profile_id:
+                            acc["profile_id"] = profile_id
+                        break
+                self._save_fb_accounts_cache()
         except Exception:
             pass
 
@@ -3326,6 +3401,12 @@ class App:
         self.stop_event.clear()
         self._reset_batch_pause_state("YTB")
         self._clear_status_tags()
+        if self._repeat_cycle_pending:
+            self._repeat_cycle_pending = False
+            self._increment_cycle()
+        else:
+            self._cycle_count = 1
+            self._set_cycle_label()
         self._retry_round = 0
         # Clear failed accounts list at start of new cycle
         with self.failed_accounts_lock:
@@ -3446,16 +3527,14 @@ class App:
             self._clear_failed_log()
             
             if self._repeat_enabled and not self.stop_event.is_set():
-                delay_ms = int(self._repeat_delay_sec * 1000)
-                if delay_ms < 0:
-                    delay_ms = 0
+                delay_ms = 5 * 60 * 1000
 
                 def _repeat_start():
                     if self.stop_event.is_set():
                         return
                     self._repeat_after_id = None
-                    # Use repeat cycle instead of full restart for smoother operation
-                    self._do_repeat_cycle()
+                    self._repeat_cycle_pending = True
+                    self.start_jobs()
 
                 self._repeat_after_id = self.root.after(delay_ms, _repeat_start)
             self._reset_run("upload")
@@ -3466,6 +3545,7 @@ class App:
         """Repeat cycle for smooth continuous upload without recalculating layout"""
         if self.executor is not None:
             return
+        self._increment_cycle()
         
         try:
             max_threads = int(self._fixed_threads or int(self.entry_threads.get()))
@@ -3582,18 +3662,17 @@ class App:
 
             # Schedule next repeat cycle
             if self._repeat_enabled and not self.stop_event.is_set():
-                delay_ms = int(self._repeat_delay_sec * 1000)
-                if delay_ms < 0:
-                    delay_ms = 0
+                delay_ms = 5 * 60 * 1000
 
                 def _repeat_again():
                     if self.stop_event.is_set():
                         return
                     self._repeat_after_id = None
-                    self._do_repeat_cycle()
+                    self._repeat_cycle_pending = True
+                    self.start_jobs()
 
                 self._repeat_after_id = self.root.after(delay_ms, _repeat_again)
-                self._log(f"[REPEAT] Next cycle in {self._repeat_delay_sec:.0f} seconds...")
+                self._log("[REPEAT] Next cycle in 300 seconds...")
             self._reset_run("upload")
 
         threading.Thread(target=_repeat_waiter, daemon=True).start()
@@ -4222,6 +4301,7 @@ class App:
                 self._set_fb_status(item_id, "NO PROFILE ID")
                 self._record_failed(item_id, acc, "NO PROFILE ID")
                 return
+            self._set_fb_profile_info(item_id, profile_id=profile_id)
             self._remember_profile_path(profile_id, data_c)
             self.created_profiles.add(profile_id)
     
@@ -4439,9 +4519,10 @@ class App:
                     break
     
                 self._set_fb_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
-                st, msg, _purl, _foll = upload_post_async(
+                st, msg, _purl, _foll, _posts = upload_post_async(
                     drv,
                     self._log,
+                    acc_email=acc.get("uid", ""),
                     max_total_s=180,
                     post_button_semaphore=self.post_button_semaphore,
                 )
@@ -4450,6 +4531,7 @@ class App:
                         mark_uploaded(acc["uid"], mark_id)
                     except Exception:
                         pass
+                    self._set_fb_profile_info(item_id, _purl, _foll, _posts)
                     self._set_fb_status(item_id, "UPLOAD OK")
                     self._delete_uploaded_video(path_or_err, acc["uid"])
                     success_count += 1
@@ -4567,6 +4649,7 @@ class App:
                     if self.stop_event.is_set():
                         return
                     self._repeat_after_id = None
+                    self._repeat_cycle_pending = True
                     self.start_jobs()
 
                 self._repeat_after_id = self.root.after(delay_ms, _repeat_start)
@@ -5068,13 +5151,19 @@ class App:
                     return
 
                 self._set_status(item_id, "POSTING...")
-                st, msg, purl, foll = upload_post_async(drv, self._log, max_total_s=180, post_button_semaphore=self.post_button_semaphore)
+                st, msg, purl, foll, posts = upload_post_async(
+                    drv,
+                    self._log,
+                    acc_email=acc.get("uid", ""),
+                    max_total_s=180,
+                    post_button_semaphore=self.post_button_semaphore,
+                )
                 if st == "success":
                     try:
                         mark_uploaded(acc["uid"], mark_id)
                     except Exception:
                         pass
-                    self._set_profile_info(item_id, purl, foll)
+                    self._set_profile_info(item_id, purl, foll, posts)
                     self._set_status(item_id, "UPLOAD OK")
                     self._log(f"[{acc['uid']}] UPLOAD OK")
                     self._delete_uploaded_video(path_or_err, acc["uid"])
@@ -5084,7 +5173,7 @@ class App:
                         profile_url = ""
                         posts = None
                         for attempt in range(3):
-                            followers, profile_url, posts = fetch_followers(driver_path, remote, self._log)
+                            followers, profile_url, posts = fetch_followers(driver_path, remote, self._log, acc.get("uid", ""))
                             if followers is not None or posts is not None:
                                 break
                             time.sleep(2 + attempt)
@@ -5123,7 +5212,7 @@ class App:
             profile_url = ""
             posts = None
             for attempt in range(3):
-                followers, profile_url, posts = fetch_followers(driver_path, remote, self._log)
+                followers, profile_url, posts = fetch_followers(driver_path, remote, self._log, acc.get("uid", ""))
                 if followers is not None or posts is not None:
                     break
                 time.sleep(2 + attempt)
@@ -5385,6 +5474,7 @@ class App:
         self._clear_all_logs()
         self.stop_event.set()
         self._fixed_threads = None
+        self._reset_cycle_count()
         try:
             self._resume_pending["upload"] = self._collect_pending_emails(self.tree, {"UPLOAD OK", "DONE"})
             self._resume_pending["profile"] = self._collect_pending_emails(self.profile_tree, {"DONE"})
@@ -5837,13 +5927,19 @@ class App:
                                     break
                             else:
                                 self._set_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
-                                st, msg, purl, foll = upload_post_async(drv, self._log, max_total_s=180, post_button_semaphore=self.post_button_semaphore)
+                                st, msg, purl, foll, posts = upload_post_async(
+                                    drv,
+                                    self._log,
+                                    acc_email=acc.get("uid", ""),
+                                    max_total_s=180,
+                                    post_button_semaphore=self.post_button_semaphore,
+                                )
                                 if st == "success":
                                     try:
                                         mark_uploaded(acc["uid"], mark_id)
                                     except Exception:
                                         pass
-                                    self._set_profile_info(item_id, purl, foll)
+                                    self._set_profile_info(item_id, purl, foll, posts)
                                     self._set_status(item_id, "UPLOAD OK")
                                     self._log(f"[{acc['uid']}] UPLOAD OK")
                                     self._delete_uploaded_video(path_or_err, acc["uid"])
