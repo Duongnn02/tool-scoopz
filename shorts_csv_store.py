@@ -161,6 +161,8 @@ def update_title_if_empty(email: str, video_id: str, title: str) -> bool:
         return False
 
 
+
+
 def load_shorts(email: str):
     csv_path = _get_csv_path(email)
     rows = []
