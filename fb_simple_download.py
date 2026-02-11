@@ -81,7 +81,8 @@ def _download_once(
 ) -> Tuple[bool, str, str, str]:
     opts = {
         "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
-        "format": "bv*+ba/b",
+        "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "fps", "tbr", "vcodec:h264", "acodec:aac"],
         "merge_output_format": "mp4",
         "noplaylist": True,
         "socket_timeout": timeout_s,

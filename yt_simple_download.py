@@ -70,7 +70,8 @@ def pick_js_runtimes_dict() -> dict:
 def build_opts(js_runtimes: dict, out_dir: str, use_cookie: bool, cookie_file: str, logger=None, email: str = "", timeout_s: int = 120):
     opts = {
         "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
-        "format": "bv*+ba/b",
+        "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "fps", "tbr", "vcodec:h264", "acodec:aac"],
         "merge_output_format": "mp4",
         "noplaylist": True,
         "socket_timeout": timeout_s,

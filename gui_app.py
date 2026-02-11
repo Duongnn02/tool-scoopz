@@ -152,6 +152,7 @@ class App:
         self._from_all_tab = False
         self._all_pending_fb_emails = set()
         self._all_repeat_snapshot = None
+        self._all_filter_active = False
         self._extra_proxies = []
         self._extra_proxy_idx = 0
         self._extra_proxy_lock = threading.Lock()
@@ -324,6 +325,9 @@ class App:
         all_top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Button(all_top, text="Select All", command=self._select_all_all_accounts).pack(side="left", padx=(0, 4))
         ttk.Button(all_top, text="Deselect All", command=self._deselect_all_all_accounts).pack(side="left")
+        ttk.Button(all_top, text="Lọc lỗi", command=self._filter_all_errors).pack(side="left", padx=(8, 4))
+        ttk.Button(all_top, text="Hiện tất cả", command=self._clear_all_filter).pack(side="left")
+        ttk.Button(all_top, text="SCAN", command=self.start_scan).pack(side="left", padx=(8, 0))
 
         all_table = ttk.Frame(self.tab_all)
         all_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -339,6 +343,7 @@ class App:
                 "posts",
                 "followers",
                 "proxy",
+                "link",
                 "profile_url",
                 "profile_id",
             ),
@@ -363,6 +368,8 @@ class App:
         self.all_tree.column("followers", width=90, anchor="center")
         self.all_tree.heading("proxy", text="PROXY")
         self.all_tree.column("proxy", width=260)
+        self.all_tree.heading("link", text="LINK")
+        self.all_tree.column("link", width=280)
         self.all_tree.heading("profile_url", text="PROFILE URL")
         self.all_tree.column("profile_url", width=260)
         self.all_tree.heading("profile_id", text="PROFILE ID")
@@ -1151,7 +1158,7 @@ class App:
                 ),
             )
         self._update_counts()
-        self._load_all_rows()
+        self._load_all_rows(only_errors=self._all_filter_active)
 
     def _load_profile_rows(self) -> None:
         self.profile_accounts = self._dedupe_accounts(self.profile_accounts)
@@ -1198,9 +1205,9 @@ class App:
                 ),
             )
         self._update_counts()
-        self._load_all_rows()
+        self._load_all_rows(only_errors=self._all_filter_active)
 
-    def _load_all_rows(self) -> None:
+    def _load_all_rows(self, only_errors: bool = False) -> None:
         if not hasattr(self, "all_tree"):
             return
         cached_chk = {}
@@ -1223,6 +1230,15 @@ class App:
             posts = row.get("posts", "")
             followers = row.get("followers", "")
             profile_url = row.get("profile_url", "")
+            link_val = row.get("youtube", "") if social == "YTB" else row.get("facebook", "")
+            status_val = row.get("status", "READY")
+            if only_errors:
+                status_upper = (status_val or "").upper()
+                if not any(
+                    key in status_upper
+                    for key in ["HẾT VIDEO", "HET VIDEO", "START ERR", "PROXY", "CREATE ERR"]
+                ):
+                    continue
             self.all_tree.insert(
                 "",
                 "end",
@@ -1233,10 +1249,11 @@ class App:
                     social,
                     row.get("uid", ""),
                     row.get("pass", ""),
-                    row.get("status", "READY"),
+                    status_val,
                     "" if posts is None else str(posts),
                     "" if followers is None else str(followers),
                     row.get("proxy", ""),
+                    link_val,
                     profile_url,
                     row.get("profile_id", ""),
                 ),
@@ -1931,7 +1948,7 @@ class App:
 
     def _reset_all_tree_order(self) -> None:
         try:
-            self._load_all_rows()
+            self._load_all_rows(only_errors=self._all_filter_active)
         except Exception:
             pass
 
@@ -1994,6 +2011,14 @@ class App:
         except Exception:
             pass
         return rows
+
+    def _filter_all_errors(self) -> None:
+        self._all_filter_active = True
+        self._load_all_rows(only_errors=True)
+
+    def _clear_all_filter(self) -> None:
+        self._all_filter_active = False
+        self._load_all_rows(only_errors=False)
 
     def _update_all_row(
         self,
@@ -2741,6 +2766,60 @@ class App:
             elif col_name in ("pass", "proxy", "facebook"):
                 self.fb_profile_accounts[idx][col_name] = new_value
             self._save_fb_profile_accounts_cache()
+        elif tree == self.all_tree:
+            social = (self.all_tree.set(item_id, "social") or "").strip().upper()
+            email = (self.all_tree.set(item_id, "email") or "").strip()
+            if social and email:
+                if col_name == "proxy":
+                    if social == "YTB":
+                        for acc in self.accounts:
+                            if acc.get("uid") == email:
+                                acc["proxy"] = new_value
+                                break
+                        self._save_accounts_cache()
+                        try:
+                            iid = self._map_email_to_item_id(self.tree).get(email)
+                            if iid:
+                                self.tree.set(iid, "proxy", new_value)
+                        except Exception:
+                            pass
+                    elif social == "FB":
+                        for acc in self.fb_accounts:
+                            if acc.get("uid") == email:
+                                acc["proxy"] = new_value
+                                break
+                        self._save_fb_accounts_cache()
+                        try:
+                            iid = self._map_email_to_item_id(self.fb_tree).get(email)
+                            if iid:
+                                self.fb_tree.set(iid, "proxy", new_value)
+                        except Exception:
+                            pass
+                elif col_name == "link":
+                    if social == "YTB":
+                        for acc in self.accounts:
+                            if acc.get("uid") == email:
+                                acc["youtube"] = new_value
+                                break
+                        self._save_accounts_cache()
+                        try:
+                            iid = self._map_email_to_item_id(self.tree).get(email)
+                            if iid:
+                                self.tree.set(iid, "youtube", new_value)
+                        except Exception:
+                            pass
+                    elif social == "FB":
+                        for acc in self.fb_accounts:
+                            if acc.get("uid") == email:
+                                acc["facebook"] = new_value
+                                break
+                        self._save_fb_accounts_cache()
+                        try:
+                            iid = self._map_email_to_item_id(self.fb_tree).get(email)
+                            if iid:
+                                self.fb_tree.set(iid, "facebook", new_value)
+                        except Exception:
+                            pass
 
     def _begin_cell_edit(self, tree: ttk.Treeview, item_id: str, col_name: str) -> None:
         self._close_cell_editor(save=True)
@@ -2822,6 +2901,15 @@ class App:
             return
         column = self.all_tree.identify_column(event.x)
         row = self.all_tree.identify_row(event.y)
+        if row:
+            try:
+                col_idx = int(column[1:]) - 1
+                col_name = self.all_tree["columns"][col_idx]
+            except Exception:
+                col_name = ""
+            if col_name in {"proxy", "link"}:
+                self._begin_cell_edit(self.all_tree, row, col_name)
+                return "break"
         if column == "#1":
             if row:
                 self._toggle_checked_all(row)
@@ -4199,6 +4287,12 @@ class App:
         if self.executor is not None:
             return
         if snapshot is None:
+            if self._repeat_cycle_pending:
+                self._repeat_cycle_pending = False
+                self._increment_cycle()
+            else:
+                self._cycle_count = 1
+                self._set_cycle_label()
             checked = self._get_checked_all_rows()
             if not checked:
                 messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
@@ -4206,6 +4300,12 @@ class App:
             ytb_emails = [email for social, email in checked if social == "YTB"]
             fb_emails = [email for social, email in checked if social == "FB"]
         else:
+            if self._repeat_cycle_pending:
+                self._repeat_cycle_pending = False
+                self._increment_cycle()
+            else:
+                self._cycle_count = 1
+                self._set_cycle_label()
             ytb_emails = list(snapshot.get("ytb_emails") or [])
             fb_emails = list(snapshot.get("fb_emails") or [])
             if not ytb_emails and not fb_emails:
@@ -4242,6 +4342,12 @@ class App:
                 messagebox.showerror("Loi", "Videos phai > 0")
                 return
 
+        if self._repeat_cycle_pending:
+            self._repeat_cycle_pending = False
+            self._increment_cycle()
+        else:
+            self._cycle_count = 1
+            self._set_cycle_label()
         self._fixed_threads = max_threads
         self.stop_event.clear()
         self._reset_batch_pause_state("YTB")
@@ -4807,6 +4913,9 @@ class App:
         if self._is_fb_profile_tab():
             self._log("[FB PROFILE] Khong co scan o tab nay.")
             return
+        if self._is_all_tab():
+            self.start_all_scan()
+            return
         if self._is_fb_tab():
             self.start_fb_scan()
             return
@@ -5363,6 +5472,57 @@ class App:
                     self.start_fb_jobs()
 
                 self._repeat_after_id = self.root.after(delay_ms, _repeat_start)
+
+        threading.Thread(target=_waiter, daemon=True).start()
+
+    def start_all_scan(self) -> None:
+        if self.executor is not None:
+            return
+        checked = self._get_checked_all_rows()
+        if not checked:
+            messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
+            return
+        ytb_emails = [email for social, email in checked if social == "YTB"]
+        fb_emails = [email for social, email in checked if social == "FB"]
+
+        try:
+            max_threads = int(self.entry_threads.get())
+            if max_threads <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Loi", "So luong phai > 0")
+            return
+
+        self.stop_event.clear()
+        self.executor = ThreadPoolExecutor(max_workers=max_threads)
+
+        futures = []
+        ytb_by_email = {str(a.get("uid") or "").strip(): a for a in self.accounts}
+        fb_by_email = {str(a.get("uid") or "").strip(): a for a in self.fb_accounts}
+        ytb_email_to_iid = self._map_email_to_item_id(self.tree)
+        fb_email_to_iid = self._map_email_to_item_id(self.fb_tree)
+
+        for email in ytb_emails:
+            acc = ytb_by_email.get(email)
+            item_id = ytb_email_to_iid.get(email)
+            if not acc or not item_id:
+                continue
+            futures.append(self.executor.submit(self._scan_worker, item_id, acc))
+
+        for email in fb_emails:
+            acc = fb_by_email.get(email)
+            item_id = fb_email_to_iid.get(email)
+            if not acc or not item_id:
+                continue
+            futures.append(self.executor.submit(self._fb_scan_worker, item_id, acc))
+
+        def _waiter():
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+            self.executor = None
 
         threading.Thread(target=_waiter, daemon=True).start()
 
