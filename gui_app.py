@@ -4150,10 +4150,6 @@ class App:
             if not batch_items or self.stop_event.is_set():
                 return
 
-            self._profile_retry_round = 0
-            with self.profile_failed_lock:
-                self.profile_failed_accounts = []
-
             try:
                 screen_w = self.root.winfo_screenwidth()
                 screen_h = self.root.winfo_screenheight()
@@ -4164,39 +4160,106 @@ class App:
             taskbar_h = 40
             usable_w = screen_w - (gap * 2)
             usable_h = (screen_h - taskbar_h) - (gap * 2)
-            active_count = len(batch_items)
-            cols = min(5, active_count)
-            rows_layout = min(2, max(1, math.ceil(active_count / cols)))
-            win_w = int((usable_w - gap * (cols - 1)) / cols)
-            win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
-            win_w = max(150, min(280, win_w))
-            win_h = max(420, min(600, win_h))
 
-            slot_idx = 0
-            max_slots = cols * rows_layout
-            self.executor = ThreadPoolExecutor(max_workers=max_threads)
-            self.profile_semaphore = threading.BoundedSemaphore(max_threads)
-            futures = []
-            for item_id, acc in batch_items:
-                if self.stop_event.is_set():
-                    break
-                pos = slot_idx % max_slots
-                col = pos % cols
-                row = pos // cols
-                x = gap + col * (win_w + gap)
-                y = gap + row * (win_h + gap)
-                win_pos = f"{x},{y}"
-                win_size = f"{win_w},{win_h}"
-                futures.append(self.executor.submit(self._profile_open_worker, item_id, acc, win_pos, win_size))
-                slot_idx += 1
-                if PROFILE_BATCH_STAGGER_SEC > 0:
-                    time.sleep(PROFILE_BATCH_STAGGER_SEC)
+            retry_round = 0
+            current_items = list(batch_items)
+            while current_items and not self.stop_event.is_set():
+                active_count = len(current_items)
+                cols = min(5, active_count)
+                rows_layout = min(2, max(1, math.ceil(active_count / cols)))
+                win_w = int((usable_w - gap * (cols - 1)) / cols)
+                win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+                win_w = max(150, min(280, win_w))
+                win_h = max(420, min(600, win_h))
 
-            for f in as_completed(futures):
+                with self.profile_failed_lock:
+                    self.profile_failed_accounts = []
+
+                self.executor = ThreadPoolExecutor(max_workers=max_threads)
+                self.profile_semaphore = threading.BoundedSemaphore(max_threads)
+                futures = []
+                max_slots = cols * rows_layout
+                for idx, (item_id, acc) in enumerate(current_items):
+                    if self.stop_event.is_set():
+                        break
+                    pos = idx % max_slots
+                    col = pos % cols
+                    row = pos // cols
+                    x = gap + col * (win_w + gap)
+                    y = gap + row * (win_h + gap)
+                    win_pos = f"{x},{y}"
+                    win_size = f"{win_w},{win_h}"
+                    futures.append(self.executor.submit(self._profile_open_worker, item_id, acc, win_pos, win_size))
+                    if PROFILE_BATCH_STAGGER_SEC > 0:
+                        time.sleep(PROFILE_BATCH_STAGGER_SEC)
+
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
+
                 try:
-                    f.result()
+                    self.executor.shutdown(wait=True)
                 except Exception:
                     pass
+                self.executor = None
+
+                with self.profile_failed_lock:
+                    failed_list = self.profile_failed_accounts.copy()
+                    self.profile_failed_accounts = []
+
+                if not failed_list or self.stop_event.is_set():
+                    break
+
+                retry_round += 1
+                if retry_round > self._max_retry_rounds:
+                    self._log(
+                        f"[PROFILE RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})"
+                    )
+                    break
+                self._log(
+                    f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {retry_round}/{self._max_retry_rounds})..."
+                )
+                current_items = failed_list
+
+            self._clear_profile_failed_log()
+
+        def _batch_runner():
+            try:
+                items = []
+                email_to_iid = self._map_email_to_item_id(self.profile_tree)
+                for acc in self.profile_accounts:
+                    email = (acc.get("uid") or "").strip()
+                    if email in checked_emails:
+                        item_id = email_to_iid.get(email)
+                        if item_id:
+                            items.append((item_id, acc))
+
+                if not items:
+                    return
+
+                total = len(items)
+                batch_size = max(1, int(PROFILE_BATCH_SIZE))
+                for start_idx in range(0, total, batch_size):
+                    if self.stop_event.is_set():
+                        break
+                    batch = items[start_idx : start_idx + batch_size]
+                    batch_no = (start_idx // batch_size) + 1
+                    total_batches = math.ceil(total / batch_size)
+                    self._log(f"[PROFILE BATCH] Start batch {batch_no}/{total_batches} ({len(batch)} profiles)")
+                    _run_batch(batch)
+                    if self.stop_event.is_set():
+                        break
+                    if start_idx + batch_size < total:
+                        self._log(f"[PROFILE BATCH] Pause {PROFILE_BATCH_PAUSE_SEC}s before next batch")
+                        _sleep_with_stop(PROFILE_BATCH_PAUSE_SEC)
+                self._log("[PROFILE BATCH] Done")
+            finally:
+                self._profile_batch_running = False
+                self._reset_run("profile")
+
+        threading.Thread(target=_batch_runner, daemon=True).start()
 
     def _reset_batch_pause_state(self, lane: str) -> None:
         key = (lane or "").upper()
@@ -4237,42 +4300,6 @@ class App:
                 next_log = now + (1.0 if wait_s <= 5 else 10.0)
             self._set_pause100_label(wait_s)
             time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, wait_s))
-
-        def _batch_runner():
-            try:
-                items = []
-                email_to_iid = self._map_email_to_item_id(self.profile_tree)
-                for acc in self.profile_accounts:
-                    email = (acc.get("uid") or "").strip()
-                    if email in checked_emails:
-                        item_id = email_to_iid.get(email)
-                        if item_id:
-                            items.append((item_id, acc))
-
-                if not items:
-                    return
-
-                total = len(items)
-                batch_size = max(1, int(PROFILE_BATCH_SIZE))
-                for start_idx in range(0, total, batch_size):
-                    if self.stop_event.is_set():
-                        break
-                    batch = items[start_idx : start_idx + batch_size]
-                    batch_no = (start_idx // batch_size) + 1
-                    total_batches = math.ceil(total / batch_size)
-                    self._log(f"[PROFILE BATCH] Start batch {batch_no}/{total_batches} ({len(batch)} profiles)")
-                    _run_batch(batch)
-                    if self.stop_event.is_set():
-                        break
-                    if start_idx + batch_size < total:
-                        self._log(f"[PROFILE BATCH] Pause {PROFILE_BATCH_PAUSE_SEC}s before next batch")
-                        _sleep_with_stop(PROFILE_BATCH_PAUSE_SEC)
-                self._log("[PROFILE BATCH] Done")
-            finally:
-                self._profile_batch_running = False
-                self._reset_run("profile")
-
-        threading.Thread(target=_batch_runner, daemon=True).start()
 
     def start_all_jobs_mixed(self, snapshot: dict | None = None) -> None:
         if self.executor is not None:
