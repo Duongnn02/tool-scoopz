@@ -153,6 +153,11 @@ class App:
         self._all_pending_fb_emails = set()
         self._all_repeat_snapshot = None
         self._all_filter_active = False
+        self._all_retry_round = 0
+        self._fallback_caption_file = os.path.join(_THIS_DIR, "fallback_captions.txt")
+        self._fallback_captions = []
+        self._fallback_caption_idx = 0
+        self._fallback_caption_lock = threading.Lock()
         self._extra_proxies = []
         self._extra_proxy_idx = 0
         self._extra_proxy_lock = threading.Lock()
@@ -211,6 +216,7 @@ class App:
         self._last_active_item = {}
 
         self._build_ui()
+        self._load_fallback_captions()
         self._load_extra_proxy_list()
         self.accounts = self._load_accounts_cache() or ACCOUNTS
         self._load_rows()
@@ -1997,6 +2003,33 @@ class App:
         if len(txt) <= max_len:
             return txt
         return txt[:max_len].rstrip()
+
+    def _load_fallback_captions(self) -> None:
+        try:
+            if not os.path.exists(self._fallback_caption_file):
+                with open(self._fallback_caption_file, "w", encoding="utf-8") as f:
+                    f.write("")
+            with open(self._fallback_caption_file, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+            with self._fallback_caption_lock:
+                self._fallback_captions = lines
+                self._fallback_caption_idx = 0
+        except Exception:
+            pass
+
+    def _get_fallback_caption(self) -> str:
+        with self._fallback_caption_lock:
+            if not self._fallback_captions:
+                return ""
+            cap = self._fallback_captions[self._fallback_caption_idx % len(self._fallback_captions)]
+            self._fallback_caption_idx = (self._fallback_caption_idx + 1) % len(self._fallback_captions)
+            return cap
+
+    def _build_caption(self, title: str, max_len: int = 1000) -> str:
+        caption = (title or "").strip()
+        if not caption:
+            caption = self._get_fallback_caption()
+        return self._limit_caption(caption, max_len)
 
     def _get_checked_all_rows(self) -> list:
         rows = []
@@ -4297,8 +4330,13 @@ class App:
             if not checked:
                 messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
                 return
-            ytb_emails = [email for social, email in checked if social == "YTB"]
-            fb_emails = [email for social, email in checked if social == "FB"]
+            checked_set = {(s, e) for s, e in checked}
+            ordered_rows = []
+            for iid in self.all_tree.get_children():
+                social = (self.all_tree.set(iid, "social") or "").strip().upper()
+                email = (self.all_tree.set(iid, "email") or "").strip()
+                if (social, email) in checked_set:
+                    ordered_rows.append((social, email))
         else:
             if self._repeat_cycle_pending:
                 self._repeat_cycle_pending = False
@@ -4306,13 +4344,14 @@ class App:
             else:
                 self._cycle_count = 1
                 self._set_cycle_label()
-            ytb_emails = list(snapshot.get("ytb_emails") or [])
-            fb_emails = list(snapshot.get("fb_emails") or [])
-            if not ytb_emails and not fb_emails:
+            ordered_rows = list(snapshot.get("ordered_rows") or [])
+            if not ordered_rows:
                 messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
                 return
         self._from_all_tab = True
 
+        ytb_emails = [email for social, email in ordered_rows if social == "YTB"]
+        fb_emails = [email for social, email in ordered_rows if social == "FB"]
         self._set_checked_by_email(self.tree, set(ytb_emails))
         self._set_checked_by_email(self.fb_tree, set(fb_emails))
 
@@ -4353,6 +4392,7 @@ class App:
         self._reset_batch_pause_state("YTB")
         self._reset_batch_pause_state("FB")
         self._retry_round = 0
+        self._all_retry_round = 0
         with self.failed_accounts_lock:
             self.failed_accounts = []
 
@@ -4390,37 +4430,37 @@ class App:
         ytb_email_to_iid = self._map_email_to_item_id(self.tree)
         fb_email_to_iid = self._map_email_to_item_id(self.fb_tree)
 
-        for email in ytb_emails:
-            acc = ytb_by_email.get(email)
-            item_id = ytb_email_to_iid.get(email)
-            if not acc or not item_id:
-                continue
-            self._bind_item_email(item_id, acc.get("uid", ""))
-            pos = slot_idx % max_slots
-            col = pos % cols
-            row = pos // cols
-            x = gap + col * (win_w + gap)
-            y = gap + row * (win_h + gap)
-            win_pos = f"{x},{y}"
-            win_size = f"{win_w},{win_h}"
-            futures.append(self.executor.submit(self._worker_one, item_id, acc, win_pos, win_size, max_videos))
-            slot_idx += 1
-
-        for email in fb_emails:
-            acc = fb_by_email.get(email)
-            item_id = fb_email_to_iid.get(email)
-            if not acc or not item_id:
-                continue
-            self._bind_item_email(item_id, acc.get("uid", ""))
-            pos = slot_idx % max_slots
-            col = pos % cols
-            row = pos // cols
-            x = gap + col * (win_w + gap)
-            y = gap + row * (win_h + gap)
-            win_pos = f"{x},{y}"
-            win_size = f"{win_w},{win_h}"
-            futures.append(self.executor.submit(self._fb_worker_one, item_id, acc, win_pos, win_size, max_videos))
-            slot_idx += 1
+        for social, email in ordered_rows:
+            if social == "YTB":
+                acc = ytb_by_email.get(email)
+                item_id = ytb_email_to_iid.get(email)
+                if not acc or not item_id:
+                    continue
+                self._bind_item_email(item_id, acc.get("uid", ""))
+                pos = slot_idx % max_slots
+                col = pos % cols
+                row = pos // cols
+                x = gap + col * (win_w + gap)
+                y = gap + row * (win_h + gap)
+                win_pos = f"{x},{y}"
+                win_size = f"{win_w},{win_h}"
+                futures.append(self.executor.submit(self._worker_one, item_id, acc, win_pos, win_size, max_videos))
+                slot_idx += 1
+            elif social == "FB":
+                acc = fb_by_email.get(email)
+                item_id = fb_email_to_iid.get(email)
+                if not acc or not item_id:
+                    continue
+                self._bind_item_email(item_id, acc.get("uid", ""))
+                pos = slot_idx % max_slots
+                col = pos % cols
+                row = pos // cols
+                x = gap + col * (win_w + gap)
+                y = gap + row * (win_h + gap)
+                win_pos = f"{x},{y}"
+                win_size = f"{win_w},{win_h}"
+                futures.append(self.executor.submit(self._fb_worker_one, item_id, acc, win_pos, win_size, max_videos))
+                slot_idx += 1
 
         self._repeat_enabled = bool(self.repeat_var.get())
         try:
@@ -4432,8 +4472,7 @@ class App:
         self._repeat_delay_sec = delay_min * 60.0
         if snapshot is None:
             self._all_repeat_snapshot = {
-                "ytb_emails": list(ytb_emails),
-                "fb_emails": list(fb_emails),
+                "ordered_rows": list(ordered_rows),
                 "max_threads": max_threads,
                 "max_videos": max_videos,
             }
@@ -4449,17 +4488,17 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < self._max_retry_rounds:
-                    self._retry_round += 1
+                if self._all_retry_round < 2:
+                    self._all_retry_round += 1
                     self._log(
-                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._all_retry_round}/2)..."
                     )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_all_mixed(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[ALL RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
+                self._log(f"[ALL RETRY] Stop retry after 2 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             self._reset_run("upload")
             self._reset_run("fb")
@@ -4505,9 +4544,23 @@ class App:
 
         ytb_emails = {str(a.get("uid") or "").strip() for a in self.accounts}
         fb_emails = {str(a.get("uid") or "").strip() for a in self.fb_accounts}
+        order_map = {}
+        try:
+            for idx, iid in enumerate(self.all_tree.get_children()):
+                social = (self.all_tree.set(iid, "social") or "").strip().upper()
+                email = (self.all_tree.set(iid, "email") or "").strip()
+                order_map[(social, email)] = idx
+        except Exception:
+            pass
         slot_idx = 0
         max_slots = cols * rows_layout
+        ordered_failed = []
         for item_id, acc in failed_accounts:
+            email = (acc.get("uid") or "").strip()
+            social = "FB" if email in fb_emails else "YTB"
+            ordered_failed.append((order_map.get((social, email), 10**9), item_id, acc))
+        ordered_failed.sort(key=lambda x: x[0])
+        for _ord, item_id, acc in ordered_failed:
             if self.stop_event.is_set():
                 break
             email = (acc.get("uid") or "").strip()
@@ -4535,17 +4588,17 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < self._max_retry_rounds:
-                    self._retry_round += 1
+                if self._all_retry_round < 2:
+                    self._all_retry_round += 1
                     self._log(
-                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._all_retry_round}/2)..."
                     )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_all_mixed(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[ALL RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
+                self._log(f"[ALL RETRY] Stop retry after 2 rounds (remaining: {len(failed_list)})")
             self._clear_failed_log()
             self._reset_run("upload")
             self._reset_run("fb")
@@ -5838,7 +5891,7 @@ class App:
                             continue
                 except Exception:
                     pass
-                caption = self._limit_caption(title or "", 1000)
+                caption = self._build_caption(title, 1000)
                 self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
                 with self.upload_retry_semaphore:
                     ok_p = False
@@ -6675,7 +6728,7 @@ class App:
                         self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
                     return
 
-                caption = title or ""
+                caption = self._build_caption(title, 1000)
                 token = self._enqueue_upload_turn()
                 if not self._wait_upload_turn(token):
                     return
@@ -7405,7 +7458,7 @@ class App:
                                     pass
                             self._set_status(item_id, f"DOWNLOAD OK {success_count+1}/{max_videos}")
                             self._log(f"[{acc['uid']}] DOWNLOAD OK")
-                            caption = self._limit_caption(title or "", 1000)
+                            caption = self._build_caption(title, 1000)
     
                             # Smart delay before upload
                             self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
