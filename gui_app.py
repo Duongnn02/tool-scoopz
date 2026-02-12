@@ -412,7 +412,7 @@ class App:
         upload_table.pack(fill="both", expand=True, padx=8, pady=8)
         self.tree = ttk.Treeview(
             upload_table,
-            columns=("chk", "stt", "email", "pass", "status", "posts", "followers", "proxy", "profile_url", "profile_id"),
+            columns=("chk", "stt", "email", "pass", "status", "posts", "followers", "proxy", "youtube", "profile_url", "profile_id"),
             show="headings",
             selectmode="extended",
         )
@@ -432,6 +432,8 @@ class App:
         self.tree.column("followers", width=90, anchor="center")
         self.tree.heading("proxy", text="PROXY")
         self.tree.column("proxy", width=260)
+        self.tree.heading("youtube", text="YOUTUBE")
+        self.tree.column("youtube", width=280)
         self.tree.heading("profile_url", text="PROFILE URL")
         self.tree.column("profile_url", width=260)
         self.tree.heading("profile_id", text="PROFILE ID")
@@ -1159,6 +1161,7 @@ class App:
                     "" if posts is None else str(posts),
                     "" if followers is None else str(followers),
                     row.get("proxy", ""),
+                    row.get("youtube", ""),
                     profile_url,
                     row.get("profile_id", ""),
                 ),
@@ -1716,6 +1719,7 @@ class App:
                 "status": self.tree.set(iid, "status"),
                 "posts": self.tree.set(iid, "posts"),
                 "followers": self.tree.set(iid, "followers"),
+                "youtube": self.tree.set(iid, "youtube"),
                 "profile_url": self.tree.set(iid, "profile_url"),
                 "profile_id": self.tree.set(iid, "profile_id"),
                 "tags": self.tree.item(iid, "tags"),
@@ -1748,6 +1752,7 @@ class App:
                     "" if posts is None else str(posts),
                     "" if followers is None else str(followers),
                     row.get("proxy", ""),
+                    cached.get("youtube", row.get("youtube", "")),
                     profile_url,
                     cached.get("profile_id", row.get("profile_id", "")),
                 ),
@@ -2446,13 +2451,28 @@ class App:
             self.log_box.configure(state="disabled")
         self.root.after(0, _append)
 
-    def _start_download_watchdog(self, email: str, label: str, interval_s: int = 30) -> threading.Event:
+    def _start_download_watchdog(
+        self,
+        email: str,
+        label: str,
+        interval_s: int = 30,
+        max_seconds: int = 600,
+        on_timeout=None,
+    ) -> threading.Event:
         stop_evt = threading.Event()
         start = time.time()
 
         def _watch() -> None:
             while not stop_evt.wait(interval_s):
                 elapsed = int(time.time() - start)
+                if max_seconds > 0 and elapsed >= max_seconds:
+                    self._log(f"[{email}] {label} TIMEOUT after {elapsed}s")
+                    if callable(on_timeout):
+                        try:
+                            on_timeout(elapsed)
+                        except Exception:
+                            pass
+                    break
                 self._log(f"[{email}] {label} still running {elapsed}s")
 
         threading.Thread(target=_watch, daemon=True).start()
@@ -2889,7 +2909,7 @@ class App:
                 col_name = self.tree["columns"][col_idx]
             except Exception:
                 col_name = ""
-            if col_name in {"email", "pass", "proxy"}:
+            if col_name in {"email", "pass", "proxy", "youtube"}:
                 self._begin_cell_edit(self.tree, row, col_name)
                 return "break"
         if column == "#1":
@@ -4217,68 +4237,6 @@ class App:
                 next_log = now + (1.0 if wait_s <= 5 else 10.0)
             self._set_pause100_label(wait_s)
             time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, wait_s))
-
-            try:
-                self.executor.shutdown(wait=True)
-            except Exception:
-                pass
-            self.executor = None
-
-            with self.profile_failed_lock:
-                failed_list = self.profile_failed_accounts.copy()
-                self.profile_failed_accounts = []
-
-            while failed_list and not self.stop_event.is_set():
-                if self._profile_retry_round >= self._max_retry_rounds:
-                    self._log(
-                        f"[PROFILE RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})"
-                    )
-                    break
-                self._profile_retry_round += 1
-                self._log(
-                    f"[PROFILE RETRY] Retrying {len(failed_list)} failed accounts (round {self._profile_retry_round}/{self._max_retry_rounds})..."
-                )
-
-                self.executor = ThreadPoolExecutor(max_workers=max_threads)
-                futures = []
-                active_count = len(failed_list)
-                cols = min(5, active_count)
-                rows_layout = max(1, (active_count + cols - 1) // cols)
-                win_w = int((usable_w - gap * (cols - 1)) / cols)
-                win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
-                win_w = max(150, min(280, win_w))
-                win_h = max(420, min(600, win_h))
-                for idx, (item_id, acc) in enumerate(failed_list):
-                    if self.stop_event.is_set():
-                        break
-                    pos = idx % (cols * rows_layout)
-                    col = pos % cols
-                    row = pos // cols
-                    x = gap + col * (win_w + gap)
-                    y = gap + row * (win_h + gap)
-                    retry_win_pos = f"{x},{y}"
-                    retry_win_size = f"{win_w},{win_h}"
-                    futures.append(self.executor.submit(self._profile_open_worker, item_id, acc, retry_win_pos, retry_win_size))
-                    if PROFILE_BATCH_STAGGER_SEC > 0:
-                        time.sleep(PROFILE_BATCH_STAGGER_SEC)
-
-                for f in as_completed(futures):
-                    try:
-                        f.result()
-                    except Exception:
-                        pass
-
-                try:
-                    self.executor.shutdown(wait=True)
-                except Exception:
-                    pass
-                self.executor = None
-
-                with self.profile_failed_lock:
-                    failed_list = self.profile_failed_accounts.copy()
-                    self.profile_failed_accounts = []
-
-            self._clear_profile_failed_log()
 
         def _batch_runner():
             try:
@@ -5813,7 +5771,13 @@ class App:
                 vid_id = ""
                 title = ""
                 download_start_ts = time.time()
-                watchdog = self._start_download_watchdog(acc["uid"], "FB DOWNLOAD")
+                download_timed_out = threading.Event()
+                watchdog = self._start_download_watchdog(
+                    acc["uid"],
+                    "FB DOWNLOAD",
+                    max_seconds=600,
+                    on_timeout=lambda _e: download_timed_out.set(),
+                )
                 while True:
                     ok_dl, path_or_err, vid_id, title = download_one_facebook(
                         acc["uid"],
@@ -5847,6 +5811,14 @@ class App:
                     self._log(f"[{acc['uid']}] FB DOWNLOAD END OK after {elapsed}s")
                 else:
                     self._log(f"[{acc['uid']}] FB DOWNLOAD END ERR after {elapsed}s: {path_or_err}")
+                if download_timed_out.is_set():
+                    self._set_fb_status(item_id, "DOWNLOAD TIMEOUT")
+                    try:
+                        self.error_logger.log_download_error(acc["uid"], row_url, "DOWNLOAD TIMEOUT (watchdog 600s)")
+                    except Exception:
+                        pass
+                    self._record_failed(item_id, acc, "DOWNLOAD TIMEOUT")
+                    skip_account = True
                 mark_id = vid_id or row_id or _extract_fb_video_id(row_url)
                 if not ok_dl:
                     err_text = str(path_or_err)
@@ -7360,7 +7332,13 @@ class App:
                         skip_current = False
                         skip_account = False
                         download_start_ts = time.time()
-                        watchdog = self._start_download_watchdog(acc["uid"], "DOWNLOAD")
+                        download_timed_out = threading.Event()
+                        watchdog = self._start_download_watchdog(
+                            acc["uid"],
+                            "DOWNLOAD",
+                            max_seconds=600,
+                            on_timeout=lambda _e: download_timed_out.set(),
+                        )
                         while True:
                             ok_dl, path_or_err, vid_id, title = download_one(
                                 acc["uid"],
@@ -7439,6 +7417,14 @@ class App:
                             self._log(f"[{acc['uid']}] DOWNLOAD END OK after {elapsed}s")
                         else:
                             self._log(f"[{acc['uid']}] DOWNLOAD END ERR after {elapsed}s: {path_or_err}")
+                        if download_timed_out.is_set():
+                            self._set_status(item_id, "DOWNLOAD TIMEOUT")
+                            try:
+                                self.error_logger.log_download_error(acc["uid"], row_url, "DOWNLOAD TIMEOUT (watchdog 600s)")
+                            except Exception:
+                                pass
+                            self._record_failed(item_id, acc, "DOWNLOAD TIMEOUT")
+                            skip_account = True
 
                         if skip_account:
                             break
