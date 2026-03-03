@@ -303,6 +303,8 @@ class App:
         self.btn_reload.pack(side="left", padx=(8, 0))
         self.btn_import = ttk.Button(top, text="IMPORT", command=self.import_accounts)
         self.btn_import.pack(side="left", padx=(8, 0))
+        self.btn_export = ttk.Button(top, text="EXPORT", command=self.export_accounts_excel)
+        self.btn_export.pack(side="left", padx=(8, 0))
         self.btn_import_proxy = ttk.Button(top, text="IMPORT PROXY", command=self.import_proxy_list)
         self.btn_import_proxy.pack(side="left", padx=(8, 0))
         self.btn_scan = ttk.Button(top, text="SCAN", command=self.start_scan)
@@ -2035,6 +2037,17 @@ class App:
         if not caption:
             caption = self._get_fallback_caption()
         return self._limit_caption(caption, max_len)
+
+    def _next_caption_after_error(self, current_caption: str, max_len: int = 1000) -> str:
+        # On caption_error, rotate to the next fallback caption if available.
+        fb = (self._get_fallback_caption() or "").strip()
+        if not fb:
+            return self._limit_caption(current_caption or "", max_len)
+        if fb == (current_caption or "").strip():
+            fb2 = (self._get_fallback_caption() or "").strip()
+            if fb2:
+                fb = fb2
+        return self._limit_caption(fb, max_len)
 
     def _get_checked_all_rows(self) -> list:
         rows = []
@@ -3835,6 +3848,77 @@ class App:
         self._load_rows()
         self._save_accounts_cache()
         self._log(f"[IMPORT] Loaded {len(new_accounts)} accounts")
+
+    def export_accounts_excel(self) -> None:
+        try:
+            import openpyxl  # type: ignore
+        except Exception:
+            messagebox.showerror("Export", "Can phai cai dat openpyxl de xuat file .xlsx")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Export accounts to Excel",
+            defaultextension=".xlsx",
+            initialfile="accounts_export.xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+        )
+        if not path:
+            return
+
+        def _to_text(v):
+            if v is None:
+                return ""
+            return str(v)
+
+        yt_headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "YOUTUBE", "PROFILE_URL", "PROFILE_ID"]
+        fb_headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "FACEBOOK", "PROFILE_URL", "PROFILE_ID"]
+
+        try:
+            wb = openpyxl.Workbook()
+            ws_yt = wb.active
+            ws_yt.title = "YOUTUBE"
+            ws_yt.append(yt_headers)
+            yt_items = list(self.tree.get_children()) if hasattr(self, "tree") else []
+            for idx, iid in enumerate(yt_items, start=1):
+                ws_yt.append(
+                    [
+                        idx,
+                        _to_text(self.tree.set(iid, "email")),
+                        _to_text(self.tree.set(iid, "pass")),
+                        _to_text(self.tree.set(iid, "posts")),
+                        _to_text(self.tree.set(iid, "followers")),
+                        _to_text(self.tree.set(iid, "proxy")),
+                        _to_text(self.tree.set(iid, "youtube")),
+                        _to_text(self.tree.set(iid, "profile_url")),
+                        _to_text(self.tree.set(iid, "profile_id")),
+                    ]
+                )
+
+            ws_fb = wb.create_sheet("FACEBOOK")
+            ws_fb.append(fb_headers)
+            fb_items = list(self.fb_tree.get_children()) if hasattr(self, "fb_tree") else []
+            for idx, iid in enumerate(fb_items, start=1):
+                ws_fb.append(
+                    [
+                        idx,
+                        _to_text(self.fb_tree.set(iid, "email")),
+                        _to_text(self.fb_tree.set(iid, "pass")),
+                        _to_text(self.fb_tree.set(iid, "posts")),
+                        _to_text(self.fb_tree.set(iid, "followers")),
+                        _to_text(self.fb_tree.set(iid, "proxy")),
+                        _to_text(self.fb_tree.set(iid, "facebook")),
+                        _to_text(self.fb_tree.set(iid, "profile_url")),
+                        _to_text(self.fb_tree.set(iid, "profile_id")),
+                    ]
+                )
+
+            wb.save(path)
+            self._log(
+                f"[EXPORT] Saved {len(yt_items)} YTB + {len(fb_items)} FB accounts -> {path}"
+            )
+            messagebox.showinfo("Export", f"Da xuat xong file:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export", f"Loi xuat file: {e}")
 
     def import_proxy_list(self) -> None:
         path = self._extra_proxy_file
@@ -5923,6 +6007,9 @@ class App:
                             if ok_p:
                                 break
                             if up_status in ("dialog_lock_timeout", "caption_error", "dialog_error", "timeout", "unexpected_error", "error") and attempt < 2:
+                                if up_status == "caption_error":
+                                    caption = self._next_caption_after_error(caption, 1000)
+                                    self._log(f"[{acc['uid']}] Caption error -> switched fallback caption for retry")
                                 time.sleep(2 + attempt)
                                 continue
                             break
@@ -6752,6 +6839,9 @@ class App:
                         if ok_p:
                             break
                         if up_status in retry_reopen and attempt < 2:
+                            if up_status == "caption_error":
+                                caption = self._next_caption_after_error(caption, 1000)
+                                self._log(f"[{acc['uid']}] Caption error -> switched fallback caption for retry")
                             wait_s = 2 + attempt
                             self._log(f"[{acc['uid']}] Upload page retry {attempt+1}/2 in {wait_s}s (status={up_status})")
                             time.sleep(wait_s)
@@ -7526,6 +7616,9 @@ class App:
                                         # Retry by re-opening upload page on certain failures
                                         if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error"):
                                             if attempt < 2:
+                                                if up_status == "caption_error":
+                                                    caption = self._next_caption_after_error(caption, 1000)
+                                                    self._log(f"[{acc['uid']}] Caption error -> switched fallback caption for retry")
                                                 wait_time = 2 + attempt
                                                 self._log(f"[{acc['uid']}] Upload page retry {attempt+1}/2 in {wait_time}s (status={up_status})")
                                                 time.sleep(wait_time)
