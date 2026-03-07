@@ -413,11 +413,14 @@ def _scrape_reels(
     reels_url: str,
     stop_check: StopChecker,
     logger: Logger,
+    existing_ids: set[str] | None = None,
 ) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     seen_ids = set()
+    existing_ids = existing_ids or set()
     idle_rounds = 0
     last_count = 0
+    stop_on_existing = False
 
     for _ in range(MAX_SCROLL):
         if stop_check():
@@ -433,8 +436,16 @@ def _scrape_reels(
             if not reel_id or reel_id in seen_ids:
                 continue
             seen_ids.add(reel_id)
+            if reel_id in existing_ids:
+                stop_on_existing = True
+                continue
             canonical = f"https://www.facebook.com/reel/{reel_id}"
             rows.append({"video_id": reel_id, "title": "", "url": canonical})
+
+        if stop_on_existing:
+            if logger:
+                logger("[FB SCAN] Stop early: found existing reel in CSV.")
+            break
 
         if len(rows) == last_count:
             idle_rounds += 1
@@ -489,9 +500,9 @@ def scan_facebook_reels_for_email(
                 logger(f"[{email}] FB SCAN ERR: redirected to login")
             _close_current_tab_return(driver)
             return 0, 0
-        videos = _scrape_reels(driver, url, stop_check, logger)
         existing = load_shorts(email)
         existing_ids = {row.get("video_id") for row in existing if row.get("video_id")}
+        videos = _scrape_reels(driver, url, stop_check, logger, existing_ids=existing_ids)
 
         new_videos: List[Dict[str, str]] = []
         for video in videos:
@@ -605,9 +616,9 @@ def scan_facebook_reels_multi(
                         if background_mode:
                             _set_background_window(driver)
 
-                    videos = _scrape_reels(driver, reels_url, stop_check, logger)
                     existing = load_shorts(email)
                     existing_ids = {row.get("video_id") for row in existing if row.get("video_id")}
+                    videos = _scrape_reels(driver, reels_url, stop_check, logger, existing_ids=existing_ids)
                     new_videos: List[Dict[str, str]] = []
                     for video in videos:
                         if stop_check():
