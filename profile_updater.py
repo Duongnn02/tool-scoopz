@@ -2,6 +2,7 @@
 
 import time
 import os
+from config import DATA_DIR
 import tempfile
 import urllib.request
 from typing import Callable, Tuple, Optional
@@ -166,7 +167,7 @@ def _download_image(url: str, logger: Logger | None = None) -> str:
     if not url:
         return ""
     try:
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile_images")
+        out_dir = os.path.join(DATA_DIR, "profile_images")
         os.makedirs(out_dir, exist_ok=True)
         fd, out_path = tempfile.mkstemp(prefix="yt_avatar_", suffix=".jpg", dir=out_dir)
         os.close(fd)

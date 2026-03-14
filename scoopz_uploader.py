@@ -32,6 +32,12 @@ try:
 except ImportError:
     PYPERCLIP_AVAILABLE = False
 
+try:
+    from pynput.keyboard import Controller, Key
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+
 from config import SCOOPZ_URL
 from operation_orchestrator import get_orchestrator
 
@@ -883,6 +889,9 @@ def upload_prepare(
     def _remaining() -> float:
         return max(0.0, max_total_s - (time.time() - start_time))
 
+    # Use direct file input (no OS dialog)
+    USE_DIRECT_INPUT = True
+
     try:
         driver = _attach_driver(driver_path, remote_debugging_address)
         wait = WebDriverWait(driver, max(1, int(min(60, _remaining()))))
@@ -977,11 +986,55 @@ def upload_prepare(
                 
                 if _force_click(driver, select_btn):
                     _log(logger, "[UPLOAD] ✓ Clicked Select button via Selenium")
-                    # Wait for dialog to appear (longer wait - file picker takes time)
-                    _log(logger, "[UPLOAD] Dialog: waiting 0.5s for dialog to open...")
-                    time.sleep(0.3)
-                    time.sleep(0.2)
-                    _log(logger, "[UPLOAD] Dialog: sleep done, about to call _select_file_in_dialog...")
+                    # Wait for file input to appear (JavaScript renders it after click)
+                    _log(logger, "[UPLOAD] Waiting for file input element to appear...")
+                    try:
+                        if _remaining() <= 0:
+                            return False, driver, "timeout", "Upload prepare timeout"
+                        wait_input = WebDriverWait(driver, max(1, int(min(10, _remaining()))))
+                        file_input = wait_input.until(
+                            EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+                        )
+                        _log(logger, "[UPLOAD] ✓ File input element appeared!")
+
+                        # Directly set file input value (no OS dialog)
+                        video_path_abs = os.path.abspath(video_path)
+                        try:
+                            if USE_DIRECT_INPUT:
+                                _log(logger, "[UPLOAD] Setting file input via send_keys (no dialog)...")
+                                try:
+                                    file_input.send_keys(video_path_abs)
+                                except Exception as e:
+                                    # If hidden, try to unhide then retry
+                                    _log(logger, f"[UPLOAD] send_keys initial failed: {e} (trying to unhide input)")
+                                    try:
+                                        driver.execute_script(
+                                            "arguments[0].style.display='block';"
+                                            "arguments[0].style.visibility='visible';"
+                                            "arguments[0].style.opacity=1;"
+                                            "arguments[0].style.height='1px';"
+                                            "arguments[0].style.width='1px';",
+                                            file_input,
+                                        )
+                                        time.sleep(0.05)
+                                        file_input.send_keys(video_path_abs)
+                                    except Exception as e2:
+                                        _log(logger, f"[UPLOAD] send_keys retry failed: {e2}")
+                                        raise
+                                _log(logger, f"[UPLOAD] ✓ File input set: {os.path.basename(video_path_abs)}")
+                                time.sleep(0.8)
+                            else:
+                                _log(logger, "[UPLOAD] Direct input disabled by config")
+                                return False, driver, "input_disabled", "Direct input disabled"
+                        except Exception as e:
+                            _log(logger, f"[UPLOAD] File input send_keys failed: {e}")
+                            return False, driver, "input_error", str(e)
+                    except TimeoutException:
+                        _log(logger, "[UPLOAD] File input did not appear after 10s")
+                        return False, driver, "input_timeout", "File input element not found"
+                    except Exception as e:
+                        _log(logger, f"[UPLOAD] File input click error: {e}")
+                        return False, driver, "input_error", str(e)
                 else:
                     _log(logger, "[UPLOAD] ✗ _force_click returned False")
                     return False, driver, "select_click_error", "Could not click Select button"
@@ -993,7 +1046,8 @@ def upload_prepare(
             return False, driver, "unexpected_error", f"Unexpected error: {e}"
         finally:
             # Always release dialog lock
-            orchestrator.release_dialog_lock("")
+            if orchestrator:
+                orchestrator.release_dialog_lock("")
 
         try:
             if _remaining() <= 0:
@@ -1156,16 +1210,6 @@ def upload_post_async(
         except Exception:
             profile_url = ""
 
-        # Save profile HTML after we are back on profile page (overwrite upload snapshot)
-        try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//span[normalize-space()='Followers' or normalize-space()='Follower']")
-                )
-            )
-            _save_html_snapshot(driver, acc_email, logger, full_page=True)
-        except Exception:
-            pass
         try:
             foll_el = WebDriverWait(driver, 8).until(
                 EC.visibility_of_element_located(

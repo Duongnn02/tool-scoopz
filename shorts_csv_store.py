@@ -6,6 +6,7 @@ Thread-safe operations for concurrent access.
 """
 
 import os
+from config import DATA_DIR
 import csv
 import threading
 from typing import Tuple, Dict, Any
@@ -25,8 +26,7 @@ def _get_csv_path(email: str) -> str:
         .replace("/", "_")
         .replace("\\", "_")
     )
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(this_dir, "video", email_safe, "shorts.csv")
+    csv_path = os.path.join(DATA_DIR, "video", email_safe, "shorts.csv")
     return csv_path
 
 

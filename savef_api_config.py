@@ -2,6 +2,7 @@
 
 import json
 import os
+from config import DATA_DIR
 from typing import Dict
 
 
@@ -18,7 +19,7 @@ DEFAULT_SAVEF_CONFIG: Dict[str, str] = {
 
 
 def get_savef_config_path() -> str:
-    return os.path.join(os.path.dirname(__file__), "savef_api_config.json")
+    return os.path.join(DATA_DIR, "savef_api_config.json")
 
 
 def load_savef_config() -> Dict[str, str]:

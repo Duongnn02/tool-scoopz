@@ -179,8 +179,8 @@ def close_profile(profile_id: str, timeout_s: int = 10, logger=None) -> Tuple[bo
         return False, msg
 
 
-def delete_profile(profile_id: str, timeout_s: int = 10, logger=None) -> Tuple[bool, str]:
-    url = f"{DELETE_ENDPOINT}/{profile_id}"
+def delete_profile(profile_id: str, timeout_s: int = 10, logger=None, mode: int = 2) -> Tuple[bool, str]:
+    url = f"{DELETE_ENDPOINT}/{profile_id}?mode={mode}"
     try:
         resp = requests.get(url, timeout=timeout_s)
         resp.raise_for_status()

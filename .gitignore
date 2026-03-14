@@ -1,5 +1,7 @@
 # Large files and folders
 video/
+ScoopzToolData/
+ScoopzSync/
 accounts_cache.json
 cookies.txt
 logs/
@@ -20,6 +22,9 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+*.exe
+*.spec
+*.pkg
 downloads/
 eggs/
 .eggs/

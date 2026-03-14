@@ -11,7 +11,20 @@ import time
 import math
 import re
 import random
+import sqlite3
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Ensure Tk uses bundled Tcl/Tk when frozen
+if getattr(sys, "frozen", False):
+    _MEI = getattr(sys, "_MEIPASS", "")
+    _tcl = os.path.join(_MEI, "_tcl_data")
+    _tk = os.path.join(_MEI, "_tk_data")
+    if os.path.isdir(_tcl):
+        os.environ.setdefault("TCL_LIBRARY", _tcl)
+    if os.path.isdir(_tk):
+        os.environ.setdefault("TK_LIBRARY", _tk)
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -22,9 +35,25 @@ if _THIS_DIR not in sys.path:
 if _BASE_DIR not in sys.path:
     sys.path.insert(1, _BASE_DIR)
 
+def _resource_path(name: str) -> str:
+    base = getattr(sys, "_MEIPASS", _THIS_DIR)
+    return os.path.join(base, name)
+
 from gpm_client import create_profile, start_profile, close_profile, delete_profile, extract_driver_info
 from login_scoopz import login_scoopz, login_scoopz_profile, open_profile_in_scoopz
-from config import SCOOPZ_URL, SCOOPZ_UPLOAD_URL, COOKIES_FILE, COOKIES_FILE_FALLBACK
+from config import (
+    SCOOPZ_URL,
+    SCOOPZ_UPLOAD_URL,
+    COOKIES_FILE,
+    COOKIES_FILE_FALLBACK,
+    DATA_DIR,
+    LICENSE_SERVER_ENABLED,
+    LICENSE_SERVER_HOST,
+    LICENSE_SERVER_PORT,
+    LICENSE_SERVER_URL,
+    LICENSE_ADMIN_TOKEN,
+)
+from license_server import start_license_server
 from yt_simple_download import download_one
 from fb_simple_download import download_one_facebook
 from shorts_csv_store import get_next_unuploaded, mark_uploaded, update_title_if_empty
@@ -41,9 +70,9 @@ from operation_orchestrator import initialize_orchestrator
 
 ACCOUNTS = []
 PROFILE_BATCH_SIZE = 100
-PROFILE_BATCH_PAUSE_SEC = 300
 PROFILE_BATCH_STAGGER_SEC = 0.15
-PROFILE_BATCH_PAUSE_CHECK_SEC = 2.0
+SKIP_DOWNLOAD_UPLOAD = False  # TEMP: skip download/upload, only follow + creator fund check
+CLEAR_CREATOR_FUND_ON_START = False  # TEMP: clear creator_fund_status in DB on startup
 FIXED_SCAN_FOLDERS = {
     "alfreorasoly26_at_hotmail_com",
     "driterlaruu_at_hotmail_com",
@@ -75,18 +104,31 @@ FIXED_SCAN_EMAILS = {
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("GPM Multi-Profile Test")
-        self.root.geometry("1100x520")
-        self._accounts_file = os.path.join(_THIS_DIR, "accounts_cache.json")
-        self._profile_accounts_file = os.path.join(_THIS_DIR, "profile_accounts_cache.json")
-        self._fb_accounts_file = os.path.join(_THIS_DIR, "fb_accounts_cache.json")
-        self._fb_profile_accounts_file = os.path.join(_THIS_DIR, "fb_profile_accounts_cache.json")
-        self._extra_proxy_file = os.path.join(_THIS_DIR, "extra_proxies.txt")
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        self.root.title("GPM Multi-Profile Suite")
+        self.root.geometry("1280x720")
+        self.root.minsize(1180, 640)
+        try:
+            icon_path = _resource_path("logo.ico")
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        except Exception:
+            pass
+        self._cache_db = os.path.join(DATA_DIR, "cache.db")
+        self._cache_db_lock = threading.Lock()
+        self._extra_proxy_file = os.path.join(DATA_DIR, "extra_proxies.txt")
         
         # Initialize logger
-        log_dir = os.path.join(_THIS_DIR, "logs")
+        log_dir = os.path.join(DATA_DIR, "logs")
         self.error_logger = initialize_logger(log_dir)
         self.error_logger.log_info("SYSTEM", "START", "Application started")
+        try:
+            self.error_logger.log_info("SYSTEM", "DB", f"Cache DB: {self._cache_db}")
+        except Exception:
+            pass
         
         # Initialize orchestrator with CONSERVATIVE mode
         # This coordinates all operations: login delays, sequential downloads, serial uploads
@@ -104,8 +146,6 @@ class App:
         self.created_profiles = set()
         self.create_lock = threading.Lock()
         # Resource management
-        self.dialog_lock_pool = ResourcePool()  # Per-driver file dialog locks
-        self.file_dialog_semaphore = threading.BoundedSemaphore(1)  # ⭐ CRITICAL: Only 1 dialog at a time!
         self.post_button_semaphore = threading.BoundedSemaphore(1)  # ⭐ CRITICAL: Only 1 POST button click at a time!
         self.upload_retry_semaphore = threading.BoundedSemaphore(2)  # Max 2 concurrent uploads
         self.login_semaphore = threading.BoundedSemaphore(2)  # Max 2 concurrent logins
@@ -154,15 +194,30 @@ class App:
         self._all_repeat_snapshot = None
         self._all_filter_active = False
         self._all_retry_round = 0
-        self._fallback_caption_file = os.path.join(_THIS_DIR, "fallback_captions.txt")
+        self._fallback_caption_file = os.path.join(DATA_DIR, "fallback_captions.txt")
         self._fallback_captions = []
         self._fallback_caption_idx = 0
         self._fallback_caption_lock = threading.Lock()
+        self._creator_fund_checked = set()
+        self._creator_fund_lock = threading.Lock()
         self._extra_proxies = []
         self._extra_proxy_idx = 0
         self._extra_proxy_lock = threading.Lock()
         self._cell_editor = None
+        self._manage_email = ""
+        self._manage_rows = []
+        self._manage_fieldnames = []
+        self._manage_csv_path = ""
+        self._manage_email_map = []
+        self._manage_email_all = []
+        self._manage_search_var = tk.StringVar()
+        self._cookie_status_var = tk.StringVar(value="Cookie: -")
+        self._license_server = None
+        self._license_key_cache = ""
+        self._license_valid = False
         self.repeat_var = tk.BooleanVar(value=True)
+        self._advanced_var = tk.BooleanVar(value=False)
+        self._busy = False
         self._repeat_after_id = None
         self._repeat_countdown_after_id = None
         self._repeat_enabled = False
@@ -183,21 +238,15 @@ class App:
             "fb_profile": {"done": 0, "total": 0, "emails": set()},
         }
         self._run_counts_lock = threading.Lock()
-        self._batch_pause_lock = threading.Lock()
-        self._batch_pause_state = {
-            "YTB": {"started": 0, "release_at": 0.0},
-            "FB": {"started": 0, "release_at": 0.0},
-        }
         self._resume_pending = {
             "upload": set(),
             "profile": set(),
             "fb": set(),
             "fb_profile": set(),
         }
-        self._count_var = tk.StringVar(value="Total: 0")
-        self._profile_count_var = tk.StringVar(value="Total Profile: 0")
-        self._fb_count_var = tk.StringVar(value="Total FB: 0")
-        self._fb_profile_count_var = tk.StringVar(value="Total FB Profile: 0")
+        self._count_var = tk.StringVar(value="Total: 0 | YTB: 0 | FB: 0")
+        self._profile_count_var = tk.StringVar(value="YTB Profile: 0")
+        self._fb_profile_count_var = tk.StringVar(value="FB Profile: 0")
         self._follow_sort_after_id = None
         self._job_item_email_map = {}
         self._job_item_email_lock = threading.Lock()
@@ -214,10 +263,17 @@ class App:
         self._auto_scroll_block_until = {}
         self._auto_scroll_catchup_after_id = {}
         self._last_active_item = {}
+        self._pulse_tokens = {}
 
+        self._apply_theme()
+        self._migrate_legacy_data()
         self._build_ui()
+        self.root.after(300, self._show_intro)
         self._load_fallback_captions()
         self._load_extra_proxy_list()
+        self._start_license_server()
+        if CLEAR_CREATOR_FUND_ON_START:
+            self._clear_creator_fund_status_cache()
         self.accounts = self._load_accounts_cache() or ACCOUNTS
         self._load_rows()
         self.profile_accounts = self._load_profile_accounts_cache()
@@ -226,93 +282,264 @@ class App:
         self._load_fb_rows()
         self.fb_profile_accounts = self._load_fb_profile_accounts_cache()
         self._load_fb_profile_rows()
+        self._refresh_manage_emails()
+        self._load_cookie_into_form()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _apply_theme(self) -> None:
+        palette = {
+            "bg": "#F4F6F8",
+            "panel": "#FFFFFF",
+            "border": "#E5E7EB",
+            "text": "#1F2937",
+            "muted": "#6B7280",
+            "accent": "#0F766E",
+            "accent_dark": "#115E59",
+            "danger": "#B91C1C",
+            "danger_dark": "#991B1B",
+            "select_bg": "#E2F2F1",
+        }
+        self._palette = palette
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        self.root.configure(bg=palette["bg"])
+
+        base_font = ("Segoe UI", 10)
+        title_font = ("Segoe UI Semibold", 14)
+        subtitle_font = ("Segoe UI", 9)
+        tab_font = ("Segoe UI Semibold", 10)
+
+        style.configure("TFrame", background=palette["bg"])
+        style.configure("TLabel", background=palette["bg"], foreground=palette["text"], font=base_font)
+        style.configure("Header.TLabel", background=palette["bg"], foreground=palette["text"], font=title_font)
+        style.configure("Subtle.TLabel", background=palette["bg"], foreground=palette["muted"], font=subtitle_font)
+
+        style.configure("TEntry", padding=6, fieldbackground=palette["panel"], foreground=palette["text"])
+        style.configure("TButton", padding=(10, 6))
+        style.configure(
+            "Accent.TButton",
+            background=palette["accent"],
+            foreground="#FFFFFF",
+            font=("Segoe UI Semibold", 10),
+        )
+        style.map("Accent.TButton", background=[("active", palette["accent_dark"])])
+        style.configure(
+            "Danger.TButton",
+            background=palette["danger"],
+            foreground="#FFFFFF",
+            font=("Segoe UI Semibold", 10),
+        )
+        style.map("Danger.TButton", background=[("active", palette["danger_dark"])])
+
+        style.configure("TNotebook", background=palette["bg"], tabmargins=(8, 4, 8, 0))
+        style.configure("TNotebook.Tab", padding=(12, 6), font=tab_font)
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", palette["panel"])],
+            foreground=[("selected", palette["text"])],
+        )
+        style.configure("Hidden.TNotebook", background=palette["bg"], tabmargins=0)
+        style.layout("Hidden.TNotebook.Tab", [])
+
+        style.configure("TLabelframe", background=palette["bg"], bordercolor=palette["border"])
+        style.configure(
+            "TLabelframe.Label",
+            background=palette["bg"],
+            foreground=palette["muted"],
+            font=("Segoe UI Semibold", 9),
+        )
+
+        style.configure("Status.TLabel", background=palette["bg"], foreground=palette["muted"], font=subtitle_font)
+        style.configure(
+            "Accent.Horizontal.TProgressbar",
+            troughcolor=palette["border"],
+            background=palette["accent"],
+            bordercolor=palette["border"],
+            lightcolor=palette["accent"],
+            darkcolor=palette["accent_dark"],
+        )
+
+        style.configure(
+            "Treeview",
+            background=palette["panel"],
+            fieldbackground=palette["panel"],
+            foreground=palette["text"],
+            rowheight=24,
+            font=base_font,
+            bordercolor=palette["border"],
+            borderwidth=1,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", palette["select_bg"])],
+            foreground=[("selected", palette["text"])],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=palette["bg"],
+            foreground=palette["text"],
+            font=("Segoe UI Semibold", 9),
+            padding=(6, 4),
+        )
+        style.map("Treeview.Heading", background=[("active", palette["border"])])
+
+        style.configure(
+            "Sidebar.TButton",
+            background=palette["panel"],
+            foreground=palette["text"],
+            font=("Segoe UI Semibold", 10),
+            padding=(10, 8),
+            anchor="w",
+        )
+        style.map(
+            "Sidebar.TButton",
+            background=[("active", palette["select_bg"])],
+            foreground=[("active", palette["text"])],
+        )
+
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", padx=8, pady=8)
+        self._ui_paned = tk.PanedWindow(
+            self.root,
+            orient="vertical",
+            sashwidth=6,
+            sashrelief="raised",
+            bd=0,
+            bg=self._palette.get("border", "#E5E7EB"),
+        )
+        self._ui_paned.pack(fill="both", expand=True)
 
-        ttk.Label(top, text="Số luồng:").pack(side="left")
-        self.entry_threads = ttk.Entry(top, width=5)
+        main_container = ttk.Frame(self._ui_paned)
+        log_container = ttk.Frame(self._ui_paned)
+        self._ui_paned.add(main_container, stretch="always")
+        self._ui_paned.add(log_container, minsize=80)
+
+        control_panel = ttk.Frame(main_container)
+        control_panel.pack(fill="x", padx=12, pady=(10, 6))
+        control_panel.columnconfigure(0, weight=1)
+        control_panel.columnconfigure(1, weight=2)
+        control_panel.columnconfigure(2, weight=1)
+
+        run_frame = ttk.LabelFrame(control_panel, text="Run Settings")
+        run_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        run_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(run_frame, text="Threads:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        self.entry_threads = ttk.Entry(run_frame, width=6)
         self.entry_threads.insert(0, "5")
-        self.entry_threads.pack(side="left", padx=(5, 15))
+        self.entry_threads.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=(8, 4))
 
-        ttk.Label(top, text="Videos:").pack(side="left")
-        self.entry_videos = ttk.Entry(top, width=5)
+        ttk.Label(run_frame, text="Videos:").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=(8, 4))
+        self.entry_videos = ttk.Entry(run_frame, width=6)
         self.entry_videos.insert(0, "1")
-        self.entry_videos.pack(side="left", padx=(5, 15))
+        self.entry_videos.grid(row=0, column=3, sticky="w", padx=(0, 8), pady=(8, 4))
 
-        self.chk_repeat = ttk.Checkbutton(top, text="Lặp lại", variable=self.repeat_var)
-        self.chk_repeat.pack(side="left", padx=(0, 6))
-        ttk.Label(top, text="Delay (min):").pack(side="left")
-        self.entry_repeat_delay = ttk.Entry(top, width=6)
+        self.chk_repeat = ttk.Checkbutton(run_frame, text="Repeat", variable=self.repeat_var)
+        self.chk_repeat.grid(row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+        ttk.Label(run_frame, text="Delay (min):").grid(row=1, column=1, sticky="w", padx=(0, 6), pady=(0, 8))
+        self.entry_repeat_delay = ttk.Entry(run_frame, width=6)
         self.entry_repeat_delay.insert(0, "5")
-        self.entry_repeat_delay.pack(side="left", padx=(5, 15))
+        self.entry_repeat_delay.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(0, 8))
 
-        top2 = ttk.Frame(self.root)
-        top2.pack(fill="x", padx=8, pady=(0, 6))
+        path_frame = ttk.LabelFrame(control_panel, text="Paths & Search")
+        path_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        path_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(top2, text="GPM Path:").pack(side="left")
-        self.entry_gpm_path = ttk.Entry(top2, width=24)
+        ttk.Label(path_frame, text="GPM Path:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        self.entry_gpm_path = ttk.Entry(path_frame, width=28)
         self.entry_gpm_path.insert(0, r"C:\GPM")
-        self.entry_gpm_path.pack(side="left", padx=(5, 15))
+        self.entry_gpm_path.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 4))
 
-        self._search_placeholder = "Tìm email..."
-        self.entry_search_email = ttk.Entry(top2, width=28)
+        self._search_placeholder = "Search email..."
+        self.entry_search_email = ttk.Entry(path_frame, width=30)
         self.entry_search_email.insert(0, self._search_placeholder)
-        self.entry_search_email.pack(side="left", padx=(0, 6))
+        self.entry_search_email.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
         try:
             self.entry_search_email.configure(foreground="gray")
         except Exception:
             pass
         self.entry_search_email.bind("<FocusIn>", self._search_focus_in)
         self.entry_search_email.bind("<FocusOut>", self._search_focus_out)
-        self.btn_search_email = ttk.Button(top2, text="FIND", command=self._search_email)
-        self.btn_search_email.pack(side="left", padx=(0, 12))
+        self.btn_search_email = ttk.Button(path_frame, text="FIND", command=self._search_email)
+        self.btn_search_email.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(0, 8))
+
         self._sort_state = {}
-        self.btn_sort_follow_all = ttk.Button(top2, text="SORT FOLLOW ALL", command=self._toggle_followers_sort_all)
-        self.btn_sort_follow_all.pack(side="left", padx=(0, 12))
+        self.btn_sort_follow_all = ttk.Button(path_frame, text="SORT FOLLOW ALL", command=self._toggle_followers_sort_all)
+        self.btn_sort_follow_all.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(8, 4))
 
-        self.lbl_total = ttk.Label(top2, textvariable=self._count_var)
-        self.lbl_total.pack(side="left", padx=(0, 10))
-        self.lbl_profile_total = ttk.Label(top2, textvariable=self._profile_count_var)
-        self.lbl_profile_total.pack(side="left", padx=(0, 10))
-        self.lbl_fb_total = ttk.Label(top2, textvariable=self._fb_count_var)
-        self.lbl_fb_total.pack(side="left", padx=(0, 10))
-        self.lbl_fb_profile_total = ttk.Label(top2, textvariable=self._fb_profile_count_var)
-        self.lbl_fb_profile_total.pack(side="left", padx=(0, 10))
-        self._cycle_var = tk.StringVar(value="Vòng lặp: 0")
-        self._pause100_var = tk.StringVar(value="Đợi 5p/100: -")
-        self._next_cycle_var = tk.StringVar(value="Đợi vòng mới: -")
+        action_frame = ttk.LabelFrame(control_panel, text="Actions")
+        action_frame.grid(row=0, column=2, sticky="nsew")
 
-        top2b = ttk.Frame(self.root)
-        top2b.pack(fill="x", padx=8, pady=(0, 6))
-        self.lbl_cycle = ttk.Label(top2b, textvariable=self._cycle_var)
-        self.lbl_cycle.pack(side="left", padx=(0, 10))
-        self.lbl_pause100 = ttk.Label(top2b, textvariable=self._pause100_var)
-        self.lbl_pause100.pack(side="left", padx=(0, 10))
-        self.lbl_next_cycle = ttk.Label(top2b, textvariable=self._next_cycle_var)
-        self.lbl_next_cycle.pack(side="left")
+        self.btn_start = ttk.Button(action_frame, text="START", command=self.start_jobs, style="Accent.TButton")
+        self.btn_start.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        self.btn_stop = ttk.Button(action_frame, text="STOP", command=self.stop_jobs, style="Danger.TButton")
+        self.btn_stop.grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+        self.btn_reload = ttk.Button(action_frame, text="RELOAD", command=self.reload_app)
+        self.btn_reload.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
 
-        self.btn_start = ttk.Button(top, text="START", command=self.start_jobs)
-        self.btn_start.pack(side="left", padx=(0, 8))
+        self.chk_advanced = ttk.Checkbutton(
+            action_frame,
+            text="Show advanced",
+            variable=self._advanced_var,
+            command=self._toggle_advanced,
+        )
+        self.chk_advanced.grid(row=1, column=1, sticky="w", padx=8, pady=(0, 8))
 
-        self.btn_stop = ttk.Button(top, text="STOP", command=self.stop_jobs)
-        self.btn_stop.pack(side="left")
-        self.btn_reload = ttk.Button(top, text="RELOAD", command=self.reload_app)
-        self.btn_reload.pack(side="left", padx=(8, 0))
-        self.btn_import = ttk.Button(top, text="IMPORT", command=self.import_accounts)
-        self.btn_import.pack(side="left", padx=(8, 0))
-        self.btn_export = ttk.Button(top, text="EXPORT", command=self.export_accounts_excel)
-        self.btn_export.pack(side="left", padx=(8, 0))
-        self.btn_import_proxy = ttk.Button(top, text="IMPORT PROXY", command=self.import_proxy_list)
-        self.btn_import_proxy.pack(side="left", padx=(8, 0))
-        self.btn_scan = ttk.Button(top, text="SCAN", command=self.start_scan)
-        self.btn_scan.pack(side="left", padx=(8, 0))
-        self.btn_clear_videos = ttk.Button(top, text="CLEAR VIDEOS", command=self.clear_all_email_videos)
-        self.btn_clear_videos.pack(side="left", padx=(8, 0))
+        self._advanced_frame = ttk.Frame(action_frame)
+        self._advanced_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        self._advanced_frame.columnconfigure(1, weight=1)
+        self.btn_import = ttk.Button(self._advanced_frame, text="IMPORT", command=self.import_accounts)
+        self.btn_import.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        self.btn_export = ttk.Button(self._advanced_frame, text="EXPORT", command=self.export_accounts_excel)
+        self.btn_export.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        self.btn_import_proxy = ttk.Button(self._advanced_frame, text="IMPORT PROXY", command=self.import_proxy_list)
+        self.btn_import_proxy.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        self.btn_scan = ttk.Button(self._advanced_frame, text="SCAN", command=self.start_scan)
+        self.btn_scan.grid(row=1, column=1, sticky="ew")
+        self.btn_clear_videos = ttk.Button(self._advanced_frame, text="CLEAR VIDEOS", command=self.clear_all_email_videos)
+        self.btn_clear_videos.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.btn_clear_gpm = ttk.Button(self._advanced_frame, text="CLEAR GPM PROFILES", command=self._clear_all_gpm_profiles)
+        self.btn_clear_gpm.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._advanced_frame.grid_remove()
 
-        self.notebook = ttk.Notebook(self.root)
+        status_frame = ttk.Frame(main_container)
+        status_frame.pack(fill="x", padx=12, pady=(0, 8))
+        status_frame.columnconfigure(5, weight=1)
+
+        self.lbl_total = ttk.Label(status_frame, textvariable=self._count_var, style="Status.TLabel")
+        self.lbl_total.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.lbl_profile_total = ttk.Label(status_frame, textvariable=self._profile_count_var, style="Status.TLabel")
+        self.lbl_profile_total.grid(row=0, column=1, sticky="w", padx=(0, 12))
+        self.lbl_fb_profile_total = ttk.Label(status_frame, textvariable=self._fb_profile_count_var, style="Status.TLabel")
+        self.lbl_fb_profile_total.grid(row=0, column=2, sticky="w", padx=(0, 12))
+
+        self._busy_bar = ttk.Progressbar(status_frame, mode="indeterminate", style="Accent.Horizontal.TProgressbar")
+        self._busy_bar.grid(row=0, column=4, sticky="w", padx=(6, 12))
+
+        self._cycle_var = tk.StringVar(value="Cycles: 0")
+        self._next_cycle_var = tk.StringVar(value="Next cycle: -")
+
+        self.lbl_cycle = ttk.Label(status_frame, textvariable=self._cycle_var, style="Status.TLabel")
+        self.lbl_cycle.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.lbl_next_cycle = ttk.Label(status_frame, textvariable=self._next_cycle_var, style="Status.TLabel")
+        self.lbl_next_cycle.grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        ttk.Separator(main_container, orient="horizontal").pack(fill="x", padx=12, pady=(2, 8))
+
+        main_body = ttk.Frame(main_container)
+        main_body.pack(fill="both", expand=True, padx=8, pady=8)
+
+        sidebar = ttk.Frame(main_body, width=180)
+        sidebar.pack(side="left", fill="y", padx=(0, 8))
+
+        content = ttk.Frame(main_body)
+        content.pack(side="right", fill="both", expand=True)
+
+        self.notebook = ttk.Notebook(content, style="Hidden.TNotebook")
         self.tab_all = ttk.Frame(self.notebook)
         self.tab_upload = ttk.Frame(self.notebook)
         self.tab_profile = ttk.Frame(self.notebook)
@@ -320,21 +547,52 @@ class App:
         self.tab_fb_profile = ttk.Frame(self.notebook)
         self.tab_interact = ttk.Frame(self.notebook)
         self.tab_stats = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_all, text="TỔNG")
+        self.tab_manage = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_all, text="Overview")
         self.notebook.add(self.tab_upload, text="YOUTUBE")
         self.notebook.add(self.tab_profile, text="PROFILE")
         self.notebook.add(self.tab_fb, text="FACEBOOK")
         self.notebook.add(self.tab_fb_profile, text="FB PROFILE")
         self.notebook.add(self.tab_interact, text="INTERACT")
-        self.notebook.add(self.tab_stats, text="THỐNG KÊ")
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        self.notebook.add(self.tab_stats, text="Monetization")
+        self.notebook.add(self.tab_manage, text="MANAGEMENT")
+        self.notebook.pack(fill="both", expand=True)
+
+        # Logo
+        self._logo_img = None
+        try:
+            logo_path = _resource_path("logo.png")
+            if os.path.exists(logo_path):
+                self._logo_img = tk.PhotoImage(file=logo_path)
+                ttk.Label(sidebar, image=self._logo_img).pack(anchor="center", pady=(4, 8))
+        except Exception:
+            self._logo_img = None
+
+        ttk.Label(sidebar, text="MENU", style="Subtle.TLabel").pack(anchor="w", padx=8, pady=(2, 8))
+        nav_items = [
+            ("Overview", self.tab_all),
+            ("YouTube", self.tab_upload),
+            ("Profile", self.tab_profile),
+            ("Facebook", self.tab_fb),
+            ("FB Profile", self.tab_fb_profile),
+            ("Interact", self.tab_interact),
+            ("Monetization", self.tab_stats),
+            ("Manage", self.tab_manage),
+        ]
+        for label, tab in nav_items:
+            ttk.Button(
+                sidebar,
+                text=label,
+                style="Sidebar.TButton",
+                command=lambda t=tab: self._select_tab(t),
+            ).pack(fill="x", padx=6, pady=4)
 
         all_top = ttk.Frame(self.tab_all)
         all_top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Button(all_top, text="Select All", command=self._select_all_all_accounts).pack(side="left", padx=(0, 4))
         ttk.Button(all_top, text="Deselect All", command=self._deselect_all_all_accounts).pack(side="left")
-        ttk.Button(all_top, text="Lọc lỗi", command=self._filter_all_errors).pack(side="left", padx=(8, 4))
-        ttk.Button(all_top, text="Hiện tất cả", command=self._clear_all_filter).pack(side="left")
+        ttk.Button(all_top, text="Filter errors", command=self._filter_all_errors).pack(side="left", padx=(8, 4))
+        ttk.Button(all_top, text="Show all", command=self._clear_all_filter).pack(side="left")
         ttk.Button(all_top, text="SCAN", command=self.start_scan).pack(side="left", padx=(8, 0))
 
         all_table = ttk.Frame(self.tab_all)
@@ -362,13 +620,13 @@ class App:
         self.all_tree.column("chk", width=40, anchor="center")
         self.all_tree.heading("stt", text="STT")
         self.all_tree.column("stt", width=50, anchor="center")
-        self.all_tree.heading("social", text="MẠNG")
+        self.all_tree.heading("social", text="NETWORK")
         self.all_tree.column("social", width=70, anchor="center")
         self.all_tree.heading("email", text="EMAIL")
         self.all_tree.column("email", width=240)
         self.all_tree.heading("pass", text="PASS")
         self.all_tree.column("pass", width=130)
-        self.all_tree.heading("status", text="TRẠNG THÁI")
+        self.all_tree.heading("status", text="STATUS")
         self.all_tree.column("status", width=200)
         self.all_tree.heading("posts", text="POSTS", command=lambda: self._toggle_all_sort("posts"))
         self.all_tree.column("posts", width=70, anchor="center")
@@ -395,6 +653,11 @@ class App:
         all_table.grid_columnconfigure(0, weight=1)
         self.all_tree.tag_configure("status_ok", foreground="green")
         self.all_tree.tag_configure("status_err", foreground="red")
+        self.all_tree.tag_configure("status_work", foreground="#0F766E")
+        self.all_tree.tag_configure("status_warn", foreground="#B45309")
+        self.all_tree.tag_configure("status_flash", background="#E8F5FF")
+        self.all_tree.tag_configure("status_pulse_a", background="#E8F5FF")
+        self.all_tree.tag_configure("status_pulse_b", background="#E4FBEA")
         self.all_tree.bind("<Button-1>", self._on_all_tree_click)
         self.all_tree.bind("<B1-Motion>", self._on_all_tree_drag)
         self.all_tree.bind("<ButtonRelease-1>", self._on_all_tree_release)
@@ -426,7 +689,7 @@ class App:
         self.tree.column("email", width=240)
         self.tree.heading("pass", text="PASS")
         self.tree.column("pass", width=130)
-        self.tree.heading("status", text="TRẠNG THÁI")
+        self.tree.heading("status", text="STATUS")
         self.tree.column("status", width=200)
         self.tree.heading("posts", text="POSTS", command=lambda: self._toggle_upload_sort("posts"))
         self.tree.column("posts", width=70, anchor="center")
@@ -453,6 +716,11 @@ class App:
         upload_table.grid_columnconfigure(0, weight=1)
         self.tree.tag_configure("status_ok", foreground="green")
         self.tree.tag_configure("status_err", foreground="red")
+        self.tree.tag_configure("status_work", foreground="#0F766E")
+        self.tree.tag_configure("status_warn", foreground="#B45309")
+        self.tree.tag_configure("status_flash", background="#E8F5FF")
+        self.tree.tag_configure("status_pulse_a", background="#E8F5FF")
+        self.tree.tag_configure("status_pulse_b", background="#E4FBEA")
 
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<B1-Motion>", self._on_tree_drag)
@@ -482,7 +750,7 @@ class App:
         self.profile_tree.column("proxy", width=260)
         self.profile_tree.heading("youtube", text="YOUTUBE")
         self.profile_tree.column("youtube", width=280)
-        self.profile_tree.heading("status", text="TRẠNG THÁI")
+        self.profile_tree.heading("status", text="STATUS")
         self.profile_tree.column("status", width=200)
 
         def _on_profile_scroll(*args):
@@ -497,6 +765,11 @@ class App:
         profile_table.grid_columnconfigure(0, weight=1)
         self.profile_tree.tag_configure("status_ok", foreground="green")
         self.profile_tree.tag_configure("status_err", foreground="red")
+        self.profile_tree.tag_configure("status_work", foreground="#0F766E")
+        self.profile_tree.tag_configure("status_warn", foreground="#B45309")
+        self.profile_tree.tag_configure("status_flash", background="#E8F5FF")
+        self.profile_tree.tag_configure("status_pulse_a", background="#E8F5FF")
+        self.profile_tree.tag_configure("status_pulse_b", background="#E4FBEA")
 
         profile_top = ttk.Frame(self.tab_profile)
         profile_top.pack(fill="x", padx=8, pady=(8, 0))
@@ -531,7 +804,7 @@ class App:
         self.fb_tree.column("email", width=240)
         self.fb_tree.heading("pass", text="PASS")
         self.fb_tree.column("pass", width=130)
-        self.fb_tree.heading("status", text="TRẠNG THÁI")
+        self.fb_tree.heading("status", text="STATUS")
         self.fb_tree.column("status", width=200)
         self.fb_tree.heading("posts", text="POSTS", command=lambda: self._toggle_fb_sort("posts"))
         self.fb_tree.column("posts", width=70, anchor="center")
@@ -558,6 +831,11 @@ class App:
         fb_table.grid_columnconfigure(0, weight=1)
         self.fb_tree.tag_configure("status_ok", foreground="green")
         self.fb_tree.tag_configure("status_err", foreground="red")
+        self.fb_tree.tag_configure("status_work", foreground="#0F766E")
+        self.fb_tree.tag_configure("status_warn", foreground="#B45309")
+        self.fb_tree.tag_configure("status_flash", background="#E8F5FF")
+        self.fb_tree.tag_configure("status_pulse_a", background="#E8F5FF")
+        self.fb_tree.tag_configure("status_pulse_b", background="#E4FBEA")
 
         fb_top = ttk.Frame(self.tab_fb)
         fb_top.pack(fill="x", padx=8, pady=(8, 0))
@@ -598,7 +876,7 @@ class App:
         self.fb_profile_tree.column("proxy", width=260)
         self.fb_profile_tree.heading("facebook", text="FB PROFILE LINK")
         self.fb_profile_tree.column("facebook", width=320)
-        self.fb_profile_tree.heading("status", text="TRẠNG THÁI")
+        self.fb_profile_tree.heading("status", text="STATUS")
         self.fb_profile_tree.column("status", width=200)
 
         def _on_fb_profile_scroll(*args):
@@ -613,6 +891,11 @@ class App:
         fb_profile_table.grid_columnconfigure(0, weight=1)
         self.fb_profile_tree.tag_configure("status_ok", foreground="green")
         self.fb_profile_tree.tag_configure("status_err", foreground="red")
+        self.fb_profile_tree.tag_configure("status_work", foreground="#0F766E")
+        self.fb_profile_tree.tag_configure("status_warn", foreground="#B45309")
+        self.fb_profile_tree.tag_configure("status_flash", background="#E8F5FF")
+        self.fb_profile_tree.tag_configure("status_pulse_a", background="#E8F5FF")
+        self.fb_profile_tree.tag_configure("status_pulse_b", background="#E4FBEA")
 
         fb_profile_top = ttk.Frame(self.tab_fb_profile)
         fb_profile_top.pack(fill="x", padx=8, pady=(8, 0))
@@ -668,22 +951,21 @@ class App:
 
         stats_top = ttk.Frame(self.tab_stats)
         stats_top.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(stats_top, text="Posts >= ").pack(side="left")
-        self.entry_stats_min_posts = ttk.Entry(stats_top, width=6)
-        self.entry_stats_min_posts.insert(0, "50")
-        self.entry_stats_min_posts.pack(side="left", padx=(5, 10))
-        ttk.Label(stats_top, text="Followers < ").pack(side="left")
-        self.entry_stats_min_followers = ttk.Entry(stats_top, width=6)
-        self.entry_stats_min_followers.insert(0, "100")
-        self.entry_stats_min_followers.pack(side="left", padx=(5, 10))
+        ttk.Label(stats_top, text="Creator Fund Status", style="Subtle.TLabel").pack(side="left")
         self.btn_stats_refresh = ttk.Button(stats_top, text="REFRESH", command=self._refresh_stats)
-        self.btn_stats_refresh.pack(side="left")
+        self.btn_stats_refresh.pack(side="right")
+        self.btn_stats_check_payment = ttk.Button(
+            stats_top, text="CHECK PAYMENT", command=self._stats_check_payment_setup
+        )
+        self.btn_stats_check_payment.pack(side="right", padx=(0, 8))
+        self.btn_stats_check = ttk.Button(stats_top, text="CHECK CREATOR FUND", command=self._stats_check_creator_fund)
+        self.btn_stats_check.pack(side="right", padx=(0, 8))
 
         stats_table = ttk.Frame(self.tab_stats)
         stats_table.pack(fill="both", expand=True, padx=8, pady=8)
         self.stats_tree = ttk.Treeview(
             stats_table,
-            columns=("stt", "source", "email", "posts", "followers"),
+            columns=("stt", "source", "email", "followers", "status", "payment"),
             show="headings",
             selectmode="browse",
         )
@@ -693,17 +975,219 @@ class App:
         self.stats_tree.column("source", width=90, anchor="center")
         self.stats_tree.heading("email", text="EMAIL")
         self.stats_tree.column("email", width=260)
-        self.stats_tree.heading("posts", text="POSTS")
-        self.stats_tree.column("posts", width=90, anchor="center")
         self.stats_tree.heading("followers", text="FOLLOWERS")
         self.stats_tree.column("followers", width=100, anchor="center")
-        self.stats_tree.tag_configure("low_ratio", foreground="red")
+        self.stats_tree.heading("status", text="STATUS")
+        self.stats_tree.column("status", width=160, anchor="center")
+        self.stats_tree.heading("payment", text="PAYMENT")
+        self.stats_tree.column("payment", width=140, anchor="center")
+        self.stats_tree.tag_configure("status_joined", foreground="green")
+        self.stats_tree.tag_configure("status_pending", foreground="orange")
+        self.stats_tree.tag_configure("status_not_applied", foreground="#6B7280")
         stats_scroll = ttk.Scrollbar(stats_table, orient="vertical", command=self.stats_tree.yview)
         self.stats_tree.configure(yscrollcommand=stats_scroll.set)
         self.stats_tree.grid(row=0, column=0, sticky="nsew")
         stats_scroll.grid(row=0, column=1, sticky="ns")
         stats_table.grid_rowconfigure(0, weight=1)
         stats_table.grid_columnconfigure(0, weight=1)
+
+        # === MANAGE TAB ===
+        manage_tabs = ttk.Notebook(self.tab_manage)
+        manage_tabs.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tab_manage_video = ttk.Frame(manage_tabs)
+        self.tab_manage_cookie = ttk.Frame(manage_tabs)
+        self.tab_manage_keys = ttk.Frame(manage_tabs)
+        manage_tabs.add(self.tab_manage_video, text="VIDEO")
+        manage_tabs.add(self.tab_manage_cookie, text="COOKIE")
+        manage_tabs.add(self.tab_manage_keys, text="KEYS")
+
+        # --- Manage > Video ---
+        manage_main = ttk.Frame(self.tab_manage_video)
+        manage_main.pack(fill="both", expand=True, padx=8, pady=8)
+        manage_main.columnconfigure(1, weight=1)
+        manage_main.rowconfigure(0, weight=1)
+
+        manage_left = ttk.LabelFrame(manage_main, text="Video Emails", width=260)
+        manage_left.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+        manage_left.columnconfigure(0, weight=1)
+        manage_left.rowconfigure(2, weight=1)
+        manage_left.grid_propagate(False)
+
+        manage_left_top = ttk.Frame(manage_left)
+        manage_left_top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        manage_left_top.columnconfigure(0, weight=1)
+        ttk.Entry(manage_left_top, textvariable=self._manage_search_var).grid(row=0, column=0, sticky="ew")
+        manage_left_actions = ttk.Frame(manage_left_top)
+        manage_left_actions.grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(
+            manage_left_actions,
+            text="Clear",
+            command=lambda: self._manage_search_var.set(""),
+            width=6,
+        ).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(
+            manage_left_actions,
+            text="Refresh",
+            command=self._refresh_manage_emails,
+            width=7,
+        ).grid(row=0, column=1)
+
+        self._manage_email_count_var = tk.StringVar(value="Emails: 0")
+        ttk.Label(manage_left, textvariable=self._manage_email_count_var, style="Subtle.TLabel").grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 6)
+        )
+
+        manage_list_frame = ttk.Frame(manage_left)
+        manage_list_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        manage_list_frame.columnconfigure(0, weight=1)
+        manage_list_frame.rowconfigure(0, weight=1)
+
+        self.manage_email_list = tk.Listbox(manage_list_frame, activestyle="none")
+        self.manage_email_list.grid(row=0, column=0, sticky="nsew")
+        manage_email_scroll = ttk.Scrollbar(manage_list_frame, orient="vertical", command=self.manage_email_list.yview)
+        self.manage_email_list.configure(yscrollcommand=manage_email_scroll.set)
+        manage_email_scroll.grid(row=0, column=1, sticky="ns")
+        self.manage_email_list.bind("<<ListboxSelect>>", self._on_manage_email_select)
+        self.manage_email_list.bind("<KeyRelease>", self._filter_manage_emails)
+        self._manage_search_var.trace_add("write", lambda *_: self._filter_manage_emails())
+
+        manage_right = ttk.Frame(manage_main)
+        manage_right.grid(row=0, column=1, sticky="nsew")
+        manage_right.columnconfigure(0, weight=1)
+        manage_right.rowconfigure(1, weight=1)
+
+        manage_top = ttk.Frame(manage_right)
+        manage_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        manage_top.columnconfigure(0, weight=1)
+        self._manage_selected_var = tk.StringVar(value="Email: -")
+        ttk.Label(manage_top, textvariable=self._manage_selected_var, style="Status.TLabel").pack(
+            side="left", padx=(0, 16)
+        )
+        self._manage_total_var = tk.StringVar(value="Total: 0")
+        self._manage_uploaded_var = tk.StringVar(value="Uploaded: 0")
+        self._manage_remaining_var = tk.StringVar(value="Remaining: 0")
+        ttk.Label(manage_top, textvariable=self._manage_total_var, style="Status.TLabel").pack(side="left", padx=(0, 12))
+        ttk.Label(manage_top, textvariable=self._manage_uploaded_var, style="Status.TLabel").pack(side="left", padx=(0, 12))
+        ttk.Label(manage_top, textvariable=self._manage_remaining_var, style="Status.TLabel").pack(side="left")
+        ttk.Button(manage_top, text="Reload CSV", command=self._reload_manage_csv).pack(side="right", padx=(6, 0))
+        ttk.Button(manage_top, text="Save CSV", command=self._save_manage_csv).pack(side="right")
+
+        manage_table = ttk.Frame(manage_right)
+        manage_table.grid(row=1, column=0, sticky="nsew")
+        manage_table.rowconfigure(0, weight=1)
+        manage_table.columnconfigure(0, weight=1)
+
+        self.manage_tree = ttk.Treeview(
+            manage_table,
+            columns=("stt", "video_id", "title", "url", "status"),
+            show="headings",
+            selectmode="extended",
+        )
+        self.manage_tree.heading("stt", text="STT")
+        self.manage_tree.column("stt", width=50, anchor="center")
+        self.manage_tree.heading("video_id", text="VIDEO ID")
+        self.manage_tree.column("video_id", width=160)
+        self.manage_tree.heading("title", text="TITLE")
+        self.manage_tree.column("title", width=240)
+        self.manage_tree.heading("url", text="URL")
+        self.manage_tree.column("url", width=360)
+        self.manage_tree.heading("status", text="STATUS")
+        self.manage_tree.column("status", width=90, anchor="center")
+
+        manage_scroll = ttk.Scrollbar(manage_table, orient="vertical", command=self.manage_tree.yview)
+        self.manage_tree.configure(yscrollcommand=manage_scroll.set)
+        self.manage_tree.grid(row=0, column=0, sticky="nsew")
+        manage_scroll.grid(row=0, column=1, sticky="ns")
+        self.manage_tree.bind("<Button-1>", self._on_manage_tree_click)
+
+        # --- Manage > Cookie ---
+        cookie_main = ttk.Frame(self.tab_manage_cookie)
+        cookie_main.pack(fill="both", expand=True, padx=8, pady=8)
+        cookie_main.columnconfigure(0, weight=1)
+        cookie_main.rowconfigure(1, weight=1)
+
+        cookie_top = ttk.Frame(cookie_main)
+        cookie_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        cookie_top.columnconfigure(0, weight=1)
+        ttk.Label(cookie_top, text="Paste cookies (same format as cookies.txt):").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(cookie_top, textvariable=self._cookie_status_var, style="Status.TLabel").grid(
+            row=0, column=1, sticky="e", padx=(8, 0)
+        )
+
+        cookie_actions = ttk.Frame(cookie_top)
+        cookie_actions.grid(row=1, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        ttk.Button(cookie_actions, text="Save", command=self._save_cookie_from_form).pack(side="right")
+        ttk.Button(cookie_actions, text="Reload", command=self._load_cookie_into_form).pack(
+            side="right", padx=(0, 6)
+        )
+        ttk.Button(cookie_actions, text="Clear", command=self._clear_cookie_form).pack(
+            side="right", padx=(0, 6)
+        )
+
+        self.cookie_text = tk.Text(cookie_main, height=18)
+        self.cookie_text.grid(row=1, column=0, sticky="nsew")
+
+        # --- Manage > Keys ---
+        keys_main = ttk.Frame(self.tab_manage_keys)
+        keys_main.pack(fill="both", expand=True, padx=8, pady=8)
+        keys_main.columnconfigure(0, weight=1)
+        keys_main.rowconfigure(1, weight=1)
+
+        keys_top = ttk.Frame(keys_main)
+        keys_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(keys_top, text="License Key Manager", style="Subtle.TLabel").pack(side="left")
+        ttk.Button(keys_top, text="REFRESH", command=self._refresh_license_keys).pack(side="right")
+        ttk.Button(keys_top, text="REVOKE", command=self._revoke_selected_license_key).pack(
+            side="right", padx=(0, 6)
+        )
+        ttk.Button(keys_top, text="COPY", command=self._copy_selected_license_key).pack(
+            side="right", padx=(0, 6)
+        )
+        ttk.Button(keys_top, text="CREATE", command=self._create_license_key).pack(
+            side="right", padx=(0, 6)
+        )
+
+        keys_table = ttk.Frame(keys_main)
+        keys_table.grid(row=1, column=0, sticky="nsew")
+        keys_table.rowconfigure(0, weight=1)
+        keys_table.columnconfigure(0, weight=1)
+        self.keys_tree = ttk.Treeview(
+            keys_table,
+            columns=("key", "status", "hwid", "created", "activated", "last_check"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.keys_tree.heading("key", text="KEY")
+        self.keys_tree.column("key", width=220)
+        self.keys_tree.heading("status", text="STATUS")
+        self.keys_tree.column("status", width=90, anchor="center")
+        self.keys_tree.heading("hwid", text="HWID")
+        self.keys_tree.column("hwid", width=220)
+        self.keys_tree.heading("created", text="CREATED")
+        self.keys_tree.column("created", width=130, anchor="center")
+        self.keys_tree.heading("activated", text="ACTIVATED")
+        self.keys_tree.column("activated", width=130, anchor="center")
+        self.keys_tree.heading("last_check", text="LAST CHECK")
+        self.keys_tree.column("last_check", width=130, anchor="center")
+        keys_scroll = ttk.Scrollbar(keys_table, orient="vertical", command=self.keys_tree.yview)
+        self.keys_tree.configure(yscrollcommand=keys_scroll.set)
+        self.keys_tree.grid(row=0, column=0, sticky="nsew")
+        keys_scroll.grid(row=0, column=1, sticky="ns")
+
+        # --- Manage > Sync ---
+        sync_main = ttk.Frame(self.tab_manage)
+        sync_main.pack_forget()
+        self.tab_manage_sync = ttk.Frame(manage_tabs)
+        manage_tabs.add(self.tab_manage_sync, text="SYNC")
+        sync_body = ttk.Frame(self.tab_manage_sync)
+        sync_body.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(sync_body, text="Sync Folder: ScoopzSync (near exe)", style="Subtle.TLabel").pack(anchor="w")
+        btn_row = ttk.Frame(sync_body)
+        btn_row.pack(anchor="w", pady=(8, 0))
+        ttk.Button(btn_row, text="EXPORT SYNC", command=self._export_sync_bundle).pack(side="left")
+        ttk.Button(btn_row, text="IMPORT SYNC", command=self._import_sync_bundle).pack(side="left", padx=(8, 0))
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -756,8 +1240,224 @@ class App:
         self.all_menu.add_separator()
         self.all_menu.add_command(label="Replace proxy errors", command=self.menu_all_replace_proxy_errors)
 
-        self.log_box = tk.Text(self.root, height=6, state="disabled")
-        self.log_box.pack(fill="both", expand=False, padx=8, pady=(0, 8))
+        self.log_box = tk.Text(
+            log_container,
+            height=8,
+            state="disabled",
+            font=("Consolas", 10),
+        )
+        self.log_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._ui_paned.forget(log_container)
+
+    def _show_intro(self) -> None:
+        try:
+            splash = tk.Toplevel(self.root)
+            splash.overrideredirect(True)
+            splash.attributes("-alpha", 0.0)
+            splash.configure(bg="#0B1220")
+            splash.lift()
+            splash.attributes("-topmost", True)
+
+            width, height = 520, 260
+            try:
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                x = int((sw - width) / 2)
+                y = int((sh - height) / 2)
+            except Exception:
+                x, y = 200, 200
+            splash.geometry(f"{width}x{height}+{x}+{y}")
+
+            canvas = tk.Canvas(splash, width=width, height=height, highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+
+            # Subtle gradient background
+            for i in range(0, height, 4):
+                ratio = i / max(1, height)
+                r = int(11 + (20 - 11) * ratio)
+                g = int(18 + (30 - 18) * ratio)
+                b = int(32 + (45 - 32) * ratio)
+                color = f"#{r:02x}{g:02x}{b:02x}"
+                canvas.create_rectangle(0, i, width, i + 4, outline=color, fill=color)
+
+            # Decorative rings
+            ring1 = canvas.create_oval(-40, 30, 220, 290, outline="#132238", width=2)
+            ring2 = canvas.create_oval(300, -30, 620, 290, outline="#102033", width=2)
+
+            # Title block
+            canvas.create_text(
+                width / 2,
+                84,
+                text="GPM Multi-Profile Suite",
+                fill="#E5ECF5",
+                font=("Segoe UI Semibold", 16),
+            )
+            canvas.create_text(
+                width / 2,
+                112,
+                text="Workspace initializing",
+                fill="#94A3B8",
+                font=("Segoe UI", 10),
+            )
+
+            # Accent line
+            canvas.create_line(width / 2 - 60, 132, width / 2 + 60, 132, fill="#1E293B", width=2)
+
+            # SCOOPZ glow
+            glow = canvas.create_oval(
+                width / 2 - 92,
+                150,
+                width / 2 + 92,
+                214,
+                outline="",
+                fill="#0B2A3A",
+            )
+            # SCOOPZ label
+            scoopz = canvas.create_text(
+                width / 2,
+                182,
+                text="SCOOPZ",
+                fill="#22D3EE",
+                font=("Segoe UI Semibold", 24),
+            )
+
+            # Floating dots
+            dots = [
+                canvas.create_oval(70, 170, 76, 176, fill="#22D3EE", outline=""),
+                canvas.create_oval(430, 150, 435, 155, fill="#38BDF8", outline=""),
+                canvas.create_oval(260, 46, 264, 50, fill="#7DD3FC", outline=""),
+            ]
+
+            def _float_phase(phase: float = 0.0):
+                if not canvas.winfo_exists():
+                    return
+                dy = math.sin(phase) * 3
+                canvas.move(glow, 0, dy * 0.08)
+                canvas.move(scoopz, 0, dy * 0.12)
+                canvas.move(dots[0], 0, dy * 0.25)
+                canvas.move(dots[1], 0, -dy * 0.2)
+                canvas.move(dots[2], 0, dy * 0.18)
+                canvas.move(ring1, dy * 0.02, 0)
+                canvas.move(ring2, -dy * 0.02, 0)
+                self.root.after(30, lambda: _float_phase(phase + 0.18))
+
+            def _fade_in(alpha: float = 0.0):
+                alpha = min(alpha + 0.05, 0.95)
+                splash.attributes("-alpha", alpha)
+                if alpha < 0.95:
+                    self.root.after(30, lambda: _fade_in(alpha))
+                else:
+                    self.root.after(2600, _fade_out)
+
+            def _fade_out(alpha: float = 0.95):
+                alpha = max(alpha - 0.05, 0.0)
+                splash.attributes("-alpha", alpha)
+                if alpha > 0.0:
+                    self.root.after(30, lambda: _fade_out(alpha))
+                else:
+                    try:
+                        splash.destroy()
+                    except Exception:
+                        pass
+                    try:
+                        self.root.deiconify()
+                    except Exception:
+                        pass
+                    self.root.after(100, self._ensure_license_valid)
+
+            _float_phase()
+            _fade_in()
+        except Exception:
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
+            try:
+                self.root.after(100, self._ensure_license_valid)
+            except Exception:
+                pass
+
+    def _migrate_legacy_data(self) -> None:
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+        except Exception:
+            return
+        def _db_has_data(path: str) -> bool:
+            try:
+                if not os.path.exists(path):
+                    return False
+                conn = sqlite3.connect(path, timeout=2)
+                try:
+                    cur = conn.execute("SELECT data FROM cache")
+                    rows = cur.fetchall()
+                    if not rows:
+                        return False
+                    for (payload,) in rows:
+                        try:
+                            loaded = json.loads(payload or "[]")
+                            if isinstance(loaded, list) and len(loaded) > 0:
+                                return True
+                        except Exception:
+                            continue
+                    return False
+                finally:
+                    conn.close()
+            except Exception:
+                return False
+
+        def _db_has_any_rows(path: str, table: str) -> bool:
+            try:
+                if not os.path.exists(path):
+                    return False
+                conn = sqlite3.connect(path, timeout=2)
+                try:
+                    cur = conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+                    return cur.fetchone() is not None
+                finally:
+                    conn.close()
+            except Exception:
+                return False
+
+        legacy_candidates = [_THIS_DIR, os.getcwd()]
+        files_to_copy = [
+            "cache.db",
+            "license.db",
+            "cookies.txt",
+            "cookiefb.txt",
+            "extra_proxies.txt",
+            "fallback_captions.txt",
+            "savef_api_config.json",
+        ]
+        dirs_to_copy = ["logs", "video", "profile_images"]
+        for legacy in legacy_candidates:
+            if not legacy or not os.path.isdir(legacy):
+                continue
+            for name in files_to_copy:
+                src = os.path.join(legacy, name)
+                dst = os.path.join(DATA_DIR, name)
+                if not os.path.exists(src):
+                    continue
+                if name == "cache.db":
+                    dst_ok = _db_has_data(dst)
+                    if dst_ok:
+                        continue
+                if name == "license.db":
+                    dst_ok = _db_has_any_rows(dst, "keys")
+                    if dst_ok:
+                        continue
+                if os.path.exists(src):
+                    try:
+                        shutil.copy2(src, dst)
+                    except Exception:
+                        pass
+            for name in dirs_to_copy:
+                src = os.path.join(legacy, name)
+                dst = os.path.join(DATA_DIR, name)
+                if os.path.isdir(src) and not os.path.exists(dst):
+                    try:
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    except Exception:
+                        pass
 
     def _interact_not_ready(self) -> None:
         self._log("[INTERACT] UI ready. Logic will be added next step.")
@@ -773,12 +1473,31 @@ class App:
 
     def _on_tab_changed(self, _evt=None) -> None:
         try:
-            if self.notebook.nametowidget(self.notebook.select()) == self.tab_stats:
+            current = self.notebook.nametowidget(self.notebook.select())
+            if current == self.tab_stats:
                 self._refresh_stats()
+            elif current == self.tab_manage:
+                self._refresh_manage_emails()
+        except Exception:
+            pass
+
+    def _select_tab(self, tab) -> None:
+        try:
+            self.notebook.select(tab)
         except Exception:
             pass
 
     def _refresh_stats(self) -> None:
+        # Always reload from DB to avoid stale in-memory status
+        try:
+            fresh_accounts = self._load_cache_list("accounts")
+            fresh_fb_accounts = self._load_cache_list("fb_accounts")
+            if isinstance(fresh_accounts, list):
+                self.accounts = fresh_accounts
+            if isinstance(fresh_fb_accounts, list):
+                self.fb_accounts = fresh_fb_accounts
+        except Exception:
+            pass
         def _to_num(val) -> int:
             if val is None or val == "":
                 return 0
@@ -794,45 +1513,1088 @@ class App:
                 return 0
 
         try:
-            min_posts = int(self.entry_stats_min_posts.get() or 0)
-        except Exception:
-            min_posts = 0
-        try:
-            max_followers = int(self.entry_stats_min_followers.get() or 0)
-        except Exception:
-            max_followers = 0
-
-        try:
             self.stats_tree.delete(*self.stats_tree.get_children())
         except Exception:
             pass
 
         rows = []
         for acc in self.accounts:
-            email = (acc.get("uid") or "").strip()
-            posts = _to_num(acc.get("posts"))
-            followers = _to_num(acc.get("followers"))
-            if posts < min_posts:
+            status = (acc.get("creator_fund_status") or "").strip().upper() or "NOT_APPLIED"
+            if status != "PENDING":
                 continue
-            rows.append(("UPLOAD", email, posts, followers))
+            payment = (acc.get("payment_status") or "").strip().upper() or "UNKNOWN"
+            email = (acc.get("uid") or "").strip()
+            followers = _to_num(acc.get("followers"))
+            if email:
+                rows.append(("YTB", email, followers, status, payment))
 
         for acc in self.fb_accounts:
-            email = (acc.get("uid") or "").strip()
-            posts = _to_num(acc.get("posts"))
-            followers = _to_num(acc.get("followers"))
-            if posts < min_posts:
+            status = (acc.get("creator_fund_status") or "").strip().upper() or "NOT_APPLIED"
+            if status != "PENDING":
                 continue
-            rows.append(("FB", email, posts, followers))
+            payment = (acc.get("payment_status") or "").strip().upper() or "UNKNOWN"
+            email = (acc.get("uid") or "").strip()
+            followers = _to_num(acc.get("followers"))
+            if email:
+                rows.append(("FB", email, followers, status, payment))
 
-        for idx, (source, email, posts, followers) in enumerate(rows, start=1):
-            tags = ("low_ratio",) if max_followers > 0 and followers < max_followers else ()
+        for idx, (source, email, followers, status, payment) in enumerate(rows, start=1):
+            tags = ()
+            if status == "JOINED":
+                tags = ("status_joined",)
+            elif status == "PENDING":
+                tags = ("status_pending",)
+            elif status == "NOT_APPLIED":
+                tags = ("status_not_applied",)
             self.stats_tree.insert(
                 "",
                 "end",
                 iid=str(idx),
-                values=(idx, source, email, posts, followers),
+                values=(idx, source, email, followers, status, payment),
                 tags=tags,
             )
+
+    def _find_tree_item_by_email(self, tree: ttk.Treeview, email: str) -> str | None:
+        try:
+            for iid in tree.get_children():
+                if (tree.set(iid, "email") or "").strip() == email:
+                    return iid
+        except Exception:
+            pass
+        return None
+
+    def _stats_check_creator_fund(self) -> None:
+        if self.executor is not None:
+            self._log("[STATS] Dang chay job, hay STOP truoc.")
+            return
+
+        selected = self.stats_tree.selection()
+        rows = []
+        if selected:
+            for iid in selected:
+                try:
+                    source = (self.stats_tree.set(iid, "source") or "").strip().upper()
+                    email = (self.stats_tree.set(iid, "email") or "").strip()
+                    if source and email:
+                        rows.append((source, email))
+                except Exception:
+                    continue
+        else:
+            for acc in self.accounts:
+                email = (acc.get("uid") or "").strip()
+                if email:
+                    rows.append(("YTB", email))
+            for acc in self.fb_accounts:
+                email = (acc.get("uid") or "").strip()
+                if email:
+                    rows.append(("FB", email))
+
+        if not rows:
+            return
+
+        max_threads = max(1, int(self.entry_threads.get() or 1))
+        pool = ThreadPoolExecutor(max_workers=max_threads)
+
+        for source, email in rows:
+            acc = None
+            item_id = None
+            if source == "FB":
+                for a in self.fb_accounts:
+                    if (a.get("uid") or "").strip() == email:
+                        acc = a
+                        break
+                item_id = self._find_tree_item_by_email(self.fb_tree, email)
+                if acc is None or item_id is None:
+                    self._log(f"[{email}] CREATOR FUND: skip (not found in FB list)")
+                    continue
+                pool.submit(self._fb_follow_only_worker, item_id, acc)
+            else:
+                for a in self.accounts:
+                    if (a.get("uid") or "").strip() == email:
+                        acc = a
+                        break
+                item_id = self._find_tree_item_by_email(self.tree, email)
+                if acc is None or item_id is None:
+                    self._log(f"[{email}] CREATOR FUND: skip (not found in YTB list)")
+                    continue
+                pool.submit(self._follow_only_worker, item_id, acc)
+
+    def _stats_check_payment_setup(self) -> None:
+        if self.executor is not None:
+            self._log("[PAYMENT] Dang chay job, hay STOP truoc.")
+            return
+
+        try:
+            fresh_accounts = self._load_cache_list("accounts")
+            fresh_fb_accounts = self._load_cache_list("fb_accounts")
+            if isinstance(fresh_accounts, list):
+                self.accounts = fresh_accounts
+            if isinstance(fresh_fb_accounts, list):
+                self.fb_accounts = fresh_fb_accounts
+        except Exception:
+            pass
+
+        selected = self.stats_tree.selection()
+        rows = []
+        if selected:
+            items = selected
+        else:
+            items = self.stats_tree.get_children()
+
+        for iid in items:
+            try:
+                source = (self.stats_tree.set(iid, "source") or "").strip().upper()
+                email = (self.stats_tree.set(iid, "email") or "").strip()
+                if source and email:
+                    rows.append((source, email))
+            except Exception:
+                continue
+
+        if not rows:
+            return
+
+        max_threads = max(1, int(self.entry_threads.get() or 1))
+        pool = ThreadPoolExecutor(max_workers=max_threads)
+
+        for source, email in rows:
+            acc = None
+            item_id = None
+            if source == "FB":
+                for a in self.fb_accounts:
+                    if (a.get("uid") or "").strip() == email:
+                        acc = a
+                        break
+                item_id = self._find_tree_item_by_email(self.fb_tree, email)
+                if acc is None or item_id is None:
+                    self._log(f"[{email}] PAYMENT: skip (not found in FB list)")
+                    continue
+            else:
+                for a in self.accounts:
+                    if (a.get("uid") or "").strip() == email:
+                        acc = a
+                        break
+                item_id = self._find_tree_item_by_email(self.tree, email)
+                if acc is None or item_id is None:
+                    self._log(f"[{email}] PAYMENT: skip (not found in YTB list)")
+                    continue
+
+            if (acc.get("payment_status") or "").strip().upper() == "SETUP":
+                self._log(f"[{email}] PAYMENT: already SETUP, skip")
+                continue
+
+            pool.submit(self._payment_check_worker, item_id, acc, source)
+
+    # === Manage tab helpers ===
+    def _email_to_folder(self, email: str) -> str:
+        return (
+            (email or "unknown")
+            .strip()
+            .replace("@", "_at_")
+            .replace(".", "_")
+            .replace(":", "_")
+            .replace("/", "_")
+            .replace("\\", "_")
+        )
+
+    def _folder_to_email(self, folder: str) -> str:
+        name = (folder or "").strip()
+        return name.replace("_at_", "@").replace("_", ".")
+
+    def _refresh_manage_emails(self) -> None:
+        video_root = os.path.join(DATA_DIR, "video")
+        items = []
+        if os.path.isdir(video_root):
+            for entry in sorted(os.listdir(video_root)):
+                folder_path = os.path.join(video_root, entry)
+                if not os.path.isdir(folder_path):
+                    continue
+                csv_path = os.path.join(folder_path, "shorts.csv")
+                if not os.path.exists(csv_path):
+                    continue
+                email = self._folder_to_email(entry)
+                items.append({"email": email, "folder": entry, "csv_path": csv_path})
+
+        self._manage_email_all = items
+        self._apply_manage_filter(select_first=True)
+
+    def _on_manage_email_select(self, _evt=None) -> None:
+        try:
+            sel = self.manage_email_list.curselection()
+            if not sel:
+                return
+            idx = int(sel[0])
+        except Exception:
+            return
+        if idx < 0 or idx >= len(self._manage_email_map):
+            return
+        item = self._manage_email_map[idx]
+        self._manage_email = item["email"]
+        self._manage_csv_path = item["csv_path"]
+        self._load_manage_csv()
+        self._manage_selected_var.set(f"Email: {self._manage_email}")
+
+    def _reload_manage_csv(self) -> None:
+        self._load_manage_csv()
+
+    def _load_manage_csv(self) -> None:
+        self.manage_tree.delete(*self.manage_tree.get_children())
+        self._manage_rows = []
+        self._manage_fieldnames = []
+        if not self._manage_csv_path or not os.path.exists(self._manage_csv_path):
+            self._update_manage_counts()
+            return
+        try:
+            with open(self._manage_csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                self._manage_fieldnames = reader.fieldnames or ["video_id", "title", "url", "status"]
+                for row in reader:
+                    self._manage_rows.append(
+                        {
+                            "video_id": (row.get("video_id") or "").strip(),
+                            "title": (row.get("title") or "").strip(),
+                            "url": (row.get("url") or "").strip(),
+                            "status": (row.get("status") or "").strip(),
+                        }
+                    )
+        except Exception as e:
+            self._log(f"[MANAGE] Read CSV error: {e}")
+            self._update_manage_counts()
+            return
+
+        for idx, row in enumerate(self._manage_rows, start=1):
+            self.manage_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(idx, row["video_id"], row["title"], row["url"], row["status"]),
+            )
+        self._update_manage_counts()
+
+    def _save_manage_csv(self) -> None:
+        if not self._manage_csv_path:
+            return
+        fieldnames = self._manage_fieldnames or ["video_id", "title", "url", "status"]
+        try:
+            with open(self._manage_csv_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in self._manage_rows:
+                    writer.writerow({k: row.get(k, "") for k in fieldnames})
+            self._log(f"[MANAGE] Saved CSV: {os.path.basename(self._manage_csv_path)}")
+        except Exception as e:
+            self._log(f"[MANAGE] Save CSV error: {e}")
+
+    def _update_manage_counts(self) -> None:
+        total = len(self._manage_rows)
+        uploaded = 0
+        for row in self._manage_rows:
+            if (row.get("status") or "").strip().lower() == "true":
+                uploaded += 1
+        remaining = total - uploaded
+        self._manage_total_var.set(f"Total: {total}")
+        self._manage_uploaded_var.set(f"Uploaded: {uploaded}")
+        self._manage_remaining_var.set(f"Remaining: {remaining}")
+
+    def _apply_manage_filter(self, select_first: bool = False) -> None:
+        query = (self._manage_search_var.get() or "").strip().lower()
+        if query:
+            filtered = [item for item in self._manage_email_all if query in item["email"].lower()]
+        else:
+            filtered = list(self._manage_email_all)
+        self._manage_email_map = filtered
+        self.manage_email_list.delete(0, tk.END)
+        for item in filtered:
+            self.manage_email_list.insert(tk.END, item["email"])
+        self._manage_email_count_var.set(f"Emails: {len(filtered)}")
+
+        if select_first and filtered:
+            self.manage_email_list.selection_set(0)
+            self._on_manage_email_select()
+        elif not filtered:
+            self._manage_email = ""
+            self._manage_rows = []
+            self._manage_fieldnames = []
+            self._manage_csv_path = ""
+            self._manage_selected_var.set("Email: -")
+            self._update_manage_counts()
+            self.manage_tree.delete(*self.manage_tree.get_children())
+
+    def _filter_manage_emails(self, _evt=None) -> None:
+        self._apply_manage_filter(select_first=False)
+
+    def _on_manage_tree_click(self, event) -> None:
+        region = self.manage_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.manage_tree.identify_column(event.x)
+        row = self.manage_tree.identify_row(event.y)
+        if row:
+            try:
+                col_idx = int(column[1:]) - 1
+                col_name = self.manage_tree["columns"][col_idx]
+            except Exception:
+                col_name = ""
+            if col_name in {"video_id", "title", "url", "status"}:
+                self._begin_cell_edit(self.manage_tree, row, col_name)
+
+    # === Cookie helpers ===
+    def _cookie_db_key(self) -> str:
+        return "cookies_text"
+
+    def _get_cookies_file_path(self) -> str:
+        return os.path.join(DATA_DIR, COOKIES_FILE)
+
+    def _read_cookies_file(self) -> str:
+        path = self._get_cookies_file_path()
+        if not os.path.exists(path):
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+    def _write_cookies_file(self, content: str) -> None:
+        path = self._get_cookies_file_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content or "")
+        except Exception:
+            pass
+
+    def _load_cookie_from_db(self) -> str:
+        try:
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if not conn:
+                    return ""
+                try:
+                    cur = conn.execute("SELECT data FROM cache WHERE key = ?", (self._cookie_db_key(),))
+                    row = cur.fetchone()
+                    if not row or not row[0]:
+                        return ""
+                    try:
+                        payload = json.loads(row[0])
+                        if isinstance(payload, dict):
+                            return str(payload.get("value") or "")
+                    except Exception:
+                        return str(row[0] or "")
+                finally:
+                    conn.close()
+        except Exception:
+            return ""
+        return ""
+
+    def _save_cookie_to_db(self, content: str) -> None:
+        try:
+            payload = json.dumps({"value": content or ""}, ensure_ascii=False)
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if not conn:
+                    return
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO cache (key, data, updated_at) VALUES (?, ?, ?)",
+                        (self._cookie_db_key(), payload, time.time()),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+
+    def _load_cookie_into_form(self) -> None:
+        if not hasattr(self, "cookie_text"):
+            return
+        text = self._load_cookie_from_db()
+        source = "DB"
+        if not text:
+            text = self._read_cookies_file()
+            source = "FILE" if text else "-"
+        self.cookie_text.delete("1.0", tk.END)
+        if text:
+            self.cookie_text.insert("1.0", text)
+        self._cookie_status_var.set(f"Cookie: {source}")
+
+    def _save_cookie_from_form(self) -> None:
+        if not hasattr(self, "cookie_text"):
+            return
+        content = self.cookie_text.get("1.0", tk.END).strip()
+        self._save_cookie_to_db(content)
+        self._write_cookies_file(content)
+        self._cookie_status_var.set("Cookie: SAVED")
+        self._log("[COOKIE] Saved to DB and cookies.txt")
+
+    def _clear_cookie_form(self) -> None:
+        if not hasattr(self, "cookie_text"):
+            return
+        self.cookie_text.delete("1.0", tk.END)
+        self._cookie_status_var.set("Cookie: -")
+
+    # === License server / key helpers ===
+    def _start_license_server(self) -> None:
+        if not LICENSE_SERVER_ENABLED:
+            return
+        if self._license_server is not None:
+            return
+        try:
+            db_path = os.path.join(DATA_DIR, "license.db")
+            self._license_server = start_license_server(
+                LICENSE_SERVER_HOST,
+                int(LICENSE_SERVER_PORT),
+                db_path,
+                LICENSE_ADMIN_TOKEN,
+                log_func=lambda m: self._log(m),
+            )
+            self._log(f"[LICENSE] Server started on {LICENSE_SERVER_HOST}:{LICENSE_SERVER_PORT}")
+        except Exception as e:
+            self._log(f"[LICENSE] Server start failed: {e}")
+
+    def _get_hwid(self) -> str:
+        try:
+            import winreg  # type: ignore
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+                0,
+                winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+            ) as key:
+                guid, _ = winreg.QueryValueEx(key, "MachineGuid")
+                return str(guid)
+        except Exception:
+            try:
+                import uuid
+
+                return str(uuid.getnode())
+            except Exception:
+                return ""
+
+    def _license_request(self, method: str, path: str, payload: dict | None = None, admin: bool = False) -> dict:
+        url = LICENSE_SERVER_URL.rstrip("/") + path
+        headers = {"Content-Type": "application/json"}
+        if admin and LICENSE_ADMIN_TOKEN:
+            headers["X-Admin-Token"] = LICENSE_ADMIN_TOKEN
+        try:
+            if method.upper() == "GET":
+                r = requests.get(url, headers=headers, timeout=4)
+            else:
+                r = requests.post(url, headers=headers, json=payload or {}, timeout=6)
+            if r.status_code >= 400:
+                return {"ok": False, "reason": f"HTTP_{r.status_code}"}
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+
+    def _load_license_key(self) -> str:
+        try:
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if not conn:
+                    return ""
+                try:
+                    cur = conn.execute("SELECT data FROM cache WHERE key = ?", ("license_key",))
+                    row = cur.fetchone()
+                    if not row or not row[0]:
+                        return ""
+                    payload = json.loads(row[0])
+                    if isinstance(payload, dict):
+                        return str(payload.get("value") or "")
+                    return str(row[0] or "")
+                finally:
+                    conn.close()
+        except Exception:
+            return ""
+
+    def _save_license_key(self, key: str) -> None:
+        try:
+            payload = json.dumps({"value": key or ""}, ensure_ascii=False)
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if not conn:
+                    return
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO cache (key, data, updated_at) VALUES (?, ?, ?)",
+                        ("license_key", payload, time.time()),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+
+    def _clear_license_key(self) -> None:
+        try:
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if not conn:
+                    return
+                try:
+                    conn.execute("DELETE FROM cache WHERE key = ?", ("license_key",))
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+
+    def _verify_license_key(self, key: str) -> tuple[bool, str]:
+        hwid = self._get_hwid()
+        resp = self._license_request("POST", "/verify", {"key": key, "hwid": hwid})
+        if resp.get("ok"):
+            return True, "OK"
+        return False, resp.get("reason") or "INVALID"
+
+    def _ensure_license_valid(self) -> None:
+        if self._is_admin_machine():
+            self._license_valid = True
+            return
+        key = self._load_license_key()
+        if key:
+            ok, _ = self._verify_license_key(key)
+            if ok:
+                self._license_valid = True
+                return
+        self._show_license_prompt()
+
+    def _show_license_prompt(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("License Key")
+        w, h = 420, 210
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            x = int((sw - w) / 2)
+            y = int((sh - h) / 2)
+        except Exception:
+            x, y = 200, 200
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.resizable(False, False)
+        win.grab_set()
+        win.transient(self.root)
+
+        ttk.Label(win, text="Enter license key:", style="Subtle.TLabel").pack(
+            anchor="w", padx=16, pady=(16, 6)
+        )
+        entry = ttk.Entry(win, width=44)
+        entry.pack(padx=16, pady=(0, 10))
+        msg_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=msg_var, style="Status.TLabel").pack(
+            anchor="w", padx=16, pady=(0, 6)
+        )
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=16, pady=(6, 12))
+
+        def _on_verify():
+            k = (entry.get() or "").strip()
+            if not k:
+                msg_var.set("Key is required.")
+                return
+            ok, reason = self._verify_license_key(k)
+            if ok:
+                self._save_license_key(k)
+                self._license_valid = True
+                msg_var.set("Key verified.")
+                win.after(200, win.destroy)
+            else:
+                msg_var.set(f"Invalid key: {reason}")
+
+        def _on_clear():
+            self._clear_license_key()
+            entry.delete(0, tk.END)
+            msg_var.set("Local key cleared.")
+
+        ttk.Button(btn_row, text="VERIFY", command=_on_verify).pack(side="right")
+        ttk.Button(btn_row, text="CLEAR", command=_on_clear).pack(side="right", padx=(0, 6))
+
+        entry.focus_set()
+
+    def _require_license_or_warn(self) -> bool:
+        if self._is_admin_machine():
+            return True
+        if self._license_valid:
+            return True
+        key = self._load_license_key()
+        if not key:
+            messagebox.showwarning("License", "Chua co key. Vui long nhap key.")
+            self._show_license_prompt()
+            return False
+        ok, reason = self._verify_license_key(key)
+        if ok:
+            self._license_valid = True
+            return True
+        messagebox.showwarning("License", f"Key khong hop le: {reason}")
+        self._show_license_prompt()
+        return False
+
+    def _is_admin_machine(self) -> bool:
+        try:
+            if not LICENSE_SERVER_ENABLED:
+                return False
+            url = (LICENSE_SERVER_URL or "").lower()
+            return "127.0.0.1" in url or "localhost" in url
+        except Exception:
+            return False
+
+    def _format_ts(self, ts: float | None) -> str:
+        if not ts:
+            return "-"
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        except Exception:
+            return "-"
+
+    def _refresh_license_keys(self) -> None:
+        if not hasattr(self, "keys_tree"):
+            return
+        self.keys_tree.delete(*self.keys_tree.get_children())
+
+        def _task():
+            resp = self._license_request("GET", "/keys", admin=True)
+            if not resp.get("ok"):
+                self._log(f"[LICENSE] List keys failed: {resp.get('reason')}")
+                return
+            rows = resp.get("keys", [])
+
+            def _update():
+                try:
+                    self.keys_tree.delete(*self.keys_tree.get_children())
+                    for item in rows:
+                        self.keys_tree.insert(
+                            "",
+                            "end",
+                            values=(
+                                item.get("key", ""),
+                                item.get("status", ""),
+                                item.get("hwid", ""),
+                                self._format_ts(item.get("created_at")),
+                                self._format_ts(item.get("activated_at")),
+                                self._format_ts(item.get("last_check_at")),
+                            ),
+                        )
+                except Exception:
+                    pass
+
+            self.root.after(0, _update)
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _create_license_key(self) -> None:
+        def _task():
+            resp = self._license_request("POST", "/keys/create", admin=True, payload={"note": ""})
+            if not resp.get("ok"):
+                self._log(f"[LICENSE] Create key failed: {resp.get('reason')}")
+                return
+            key = resp.get("key", "")
+            def _update():
+                try:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(key)
+                except Exception:
+                    pass
+                self._refresh_license_keys()
+            self.root.after(0, _update)
+            self._log(f"[LICENSE] Created key: {key}")
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _revoke_selected_license_key(self) -> None:
+        if not hasattr(self, "keys_tree"):
+            return
+        sel = self.keys_tree.selection()
+        if not sel:
+            return
+        key = (self.keys_tree.set(sel[0], "key") or "").strip()
+        if not key:
+            return
+        def _task():
+            resp = self._license_request("POST", "/keys/revoke", admin=True, payload={"key": key})
+            if not resp.get("ok"):
+                self._log(f"[LICENSE] Revoke failed: {resp.get('reason')}")
+                return
+            self.root.after(0, self._refresh_license_keys)
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _copy_selected_license_key(self) -> None:
+        if not hasattr(self, "keys_tree"):
+            return
+        sel = self.keys_tree.selection()
+        if not sel:
+            return
+        key = (self.keys_tree.set(sel[0], "key") or "").strip()
+        if not key:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(key)
+            self._log(f"[LICENSE] Copied key: {key}")
+        except Exception:
+            pass
+
+    # === Sync helpers ===
+    def _sync_dir(self) -> str:
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else _THIS_DIR
+        path = os.path.join(base, "ScoopzSync")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _center_toplevel(self, win: tk.Toplevel, width: int, height: int) -> None:
+        try:
+            win.update_idletasks()
+            screen_w = win.winfo_screenwidth()
+            screen_h = win.winfo_screenheight()
+            x = int((screen_w - width) / 2)
+            y = int((screen_h - height) / 2)
+            win.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _open_sync_progress(
+        self, title: str, message: str
+    ) -> tuple[tk.Toplevel, tk.StringVar, tk.IntVar, tk.StringVar]:
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        width, height = 420, 140
+        self._center_toplevel(win, width, height)
+        msg_var = tk.StringVar(value=message)
+        pct_var = tk.IntVar(value=0)
+        pct_text_var = tk.StringVar(value="0%")
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=16, pady=16)
+        ttk.Label(body, textvariable=msg_var, style="Subtle.TLabel").pack(anchor="w")
+        ttk.Progressbar(
+            body,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            variable=pct_var,
+            style="Accent.Horizontal.TProgressbar",
+        ).pack(fill="x", pady=(12, 4))
+        ttk.Label(body, textvariable=pct_text_var, style="Subtle.TLabel").pack(anchor="e")
+        return win, msg_var, pct_var, pct_text_var
+
+    def _update_sync_progress(
+        self,
+        win: tk.Toplevel,
+        msg_var: tk.StringVar,
+        pct_var: tk.IntVar,
+        pct_text_var: tk.StringVar,
+        percent: int | None,
+        message: str | None,
+    ) -> None:
+        def _apply() -> None:
+            if not win.winfo_exists():
+                return
+            if message is not None:
+                msg_var.set(message)
+            if percent is not None:
+                safe = max(0, min(100, int(percent)))
+                pct_var.set(safe)
+                pct_text_var.set(f"{safe}%")
+        self.root.after(0, _apply)
+
+    def _collect_video_files(self, src_dir: str, dst_dir: str) -> list[tuple[str, str]]:
+        files: list[tuple[str, str]] = []
+        if not os.path.isdir(src_dir):
+            return files
+        for root, _dirs, filenames in os.walk(src_dir):
+            for name in filenames:
+                src = os.path.join(root, name)
+                rel = os.path.relpath(src, src_dir)
+                dst = os.path.join(dst_dir, rel)
+                files.append((src, dst))
+        return files
+
+    def _ask_directory(self, title: str, initial_dir: str, must_exist: bool = False) -> str:
+        # Keep for potential future use; not used by sync popup
+        try:
+            return filedialog.askdirectory(
+                parent=self.root,
+                title=title,
+                initialdir=initial_dir,
+                mustexist=must_exist,
+            )
+        except Exception:
+            return ""
+
+    def _prompt_sync_dir(self, title: str, must_exist: bool) -> str:
+        selected = {"path": ""}
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.minsize(560, 200)
+        self._center_toplevel(win, 600, 220)
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=14, pady=14)
+        ttk.Label(body, text=title, style="Subtle.TLabel").pack(anchor="w")
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(10, 8))
+        path_var = tk.StringVar(value=self._sync_dir())
+        entry = ttk.Entry(row, textvariable=path_var)
+        entry.pack(side="left", fill="x", expand=True)
+        status_var = tk.StringVar(value="")
+
+        def _browse() -> None:
+            status_var.set("Opening folder picker...")
+            browse_btn.configure(state="disabled")
+
+            def _worker() -> None:
+                picked = ""
+                try:
+                    import tempfile
+
+                    desc = (title or "").replace('"', '""')
+                    sel = (path_var.get() or self._sync_dir()).replace('"', '""')
+                    script = (
+                        'Add-Type -AssemblyName System.Windows.Forms\n'
+                        '$f = New-Object System.Windows.Forms.FolderBrowserDialog\n'
+                        f'$f.Description = "{desc}"\n'
+                        f'$f.SelectedPath = "{sel}"\n'
+                        'if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) '
+                        '{ Write-Output $f.SelectedPath }\n'
+                    )
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", delete=False, suffix=".ps1", encoding="utf-8"
+                    ) as tf:
+                        tf.write(script)
+                        ps1_path = tf.name
+                    try:
+                        res = subprocess.run(
+                            [
+                                "powershell",
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-File",
+                                ps1_path,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                        picked = (res.stdout or "").strip()
+                    finally:
+                        try:
+                            os.remove(ps1_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    picked = ""
+
+                def _apply() -> None:
+                    if picked:
+                        path_var.set(picked)
+                        status_var.set("")
+                    else:
+                        status_var.set("Picker closed.")
+                    browse_btn.configure(state="normal")
+
+                self.root.after(0, _apply)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _paste_path() -> None:
+            try:
+                clip = (self.root.clipboard_get() or "").strip()
+            except Exception:
+                clip = ""
+            if clip:
+                path_var.set(clip)
+                status_var.set("Pasted path from clipboard.")
+            else:
+                status_var.set("Clipboard is empty.")
+
+        browse_btn = ttk.Button(row, text="Browse", command=_browse)
+        browse_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Paste", command=_paste_path).pack(side="left", padx=(6, 0))
+        ttk.Label(body, textvariable=status_var, style="Subtle.TLabel").pack(anchor="w")
+        btn_row = ttk.Frame(body)
+        btn_row.pack(side="bottom", fill="x", pady=(10, 0))
+
+        def _ok() -> None:
+            path = (path_var.get() or "").strip()
+            if not path:
+                return
+            if must_exist and not os.path.isdir(path):
+                messagebox.showerror("Sync", "Folder does not exist.")
+                return
+            selected["path"] = path
+            win.destroy()
+
+        def _cancel() -> None:
+            selected["path"] = ""
+            win.destroy()
+
+        tk.Button(btn_row, text="OK", command=_ok, width=10, bg="#0F766E", fg="white").pack(side="right")
+        tk.Button(btn_row, text="Cancel", command=_cancel, width=10).pack(side="right", padx=(0, 8))
+        entry.focus_set()
+        self.root.wait_window(win)
+        return selected["path"]
+
+    def _export_sync_bundle(self) -> None:
+        sync_dir = self._prompt_sync_dir("Select export folder", must_exist=False)
+        if not sync_dir:
+            return
+        win, msg_var, pct_var, pct_text_var = self._open_sync_progress(
+            "Export Sync",
+            "Preparing export...",
+        )
+
+        def _worker() -> None:
+            try:
+                os.makedirs(sync_dir, exist_ok=True)
+                ytb_path = os.path.join(sync_dir, "ytb.json")
+                fb_path = os.path.join(sync_dir, "fb.json")
+                video_src = os.path.join(DATA_DIR, "video")
+                video_dst = os.path.join(sync_dir, "video")
+                video_files = self._collect_video_files(video_src, video_dst)
+
+                total = max(1, 2 + len(video_files))
+                done = 0
+
+                with open(ytb_path, "w", encoding="utf-8") as f:
+                    json.dump(self.accounts or [], f, ensure_ascii=False)
+                done += 1
+                self._update_sync_progress(
+                    win,
+                    msg_var,
+                    pct_var,
+                    pct_text_var,
+                    done * 100 / total,
+                    "Exporting YTB...",
+                )
+
+                with open(fb_path, "w", encoding="utf-8") as f:
+                    json.dump(self.fb_accounts or [], f, ensure_ascii=False)
+                done += 1
+                self._update_sync_progress(
+                    win,
+                    msg_var,
+                    pct_var,
+                    pct_text_var,
+                    done * 100 / total,
+                    "Exporting FB...",
+                )
+
+                if video_files:
+                    for idx, (src, dst) in enumerate(video_files, start=1):
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copy2(src, dst)
+                        done += 1
+                        if idx % 20 == 0 or idx == len(video_files):
+                            self._update_sync_progress(
+                                win,
+                                msg_var,
+                                pct_var,
+                                pct_text_var,
+                                done * 100 / total,
+                                f"Copying videos {idx}/{len(video_files)}...",
+                            )
+                        time.sleep(0.003)
+
+                self._log(f"[SYNC] Exported to {sync_dir}")
+                self.root.after(0, lambda: messagebox.showinfo("Sync", f"Exported to {sync_dir}"))
+            except Exception as e:
+                self._log(f"[SYNC] Export error: {e}")
+                self.root.after(0, lambda: messagebox.showerror("Sync", f"Export error: {e}"))
+            finally:
+                self.root.after(0, win.destroy)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _import_sync_bundle(self) -> None:
+        sync_dir = self._prompt_sync_dir("Select import folder", must_exist=True)
+        if not sync_dir:
+            return
+        win, msg_var, pct_var, pct_text_var = self._open_sync_progress(
+            "Import Sync",
+            "Preparing import...",
+        )
+
+        def _worker() -> None:
+            try:
+                ytb_path = os.path.join(sync_dir, "ytb.json")
+                fb_path = os.path.join(sync_dir, "fb.json")
+                video_src = os.path.join(sync_dir, "video")
+                video_dst = os.path.join(DATA_DIR, "video")
+                video_files = self._collect_video_files(video_src, video_dst)
+
+                total = max(1, 2 + len(video_files))
+                done = 0
+
+                if os.path.exists(ytb_path):
+                    with open(ytb_path, "r", encoding="utf-8") as f:
+                        self.accounts = json.load(f) or []
+                    self._save_accounts_cache()
+                done += 1
+                self._update_sync_progress(
+                    win,
+                    msg_var,
+                    pct_var,
+                    pct_text_var,
+                    done * 100 / total,
+                    "Importing YTB...",
+                )
+                time.sleep(0.05)
+
+                if os.path.exists(fb_path):
+                    with open(fb_path, "r", encoding="utf-8") as f:
+                        self.fb_accounts = json.load(f) or []
+                    self._save_fb_accounts_cache()
+                done += 1
+                self._update_sync_progress(
+                    win,
+                    msg_var,
+                    pct_var,
+                    pct_text_var,
+                    done * 100 / total,
+                    "Importing FB...",
+                )
+                time.sleep(0.05)
+
+                if video_files:
+                    for idx, (src, dst) in enumerate(video_files, start=1):
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copy2(src, dst)
+                        done += 1
+                        if idx % 20 == 0 or idx == len(video_files):
+                            self._update_sync_progress(
+                                win,
+                                msg_var,
+                                pct_var,
+                                pct_text_var,
+                                done * 100 / total,
+                                f"Copying videos {idx}/{len(video_files)}...",
+                            )
+                        time.sleep(0.003)
+
+                def _finish() -> None:
+                    try:
+                        self.accounts = self._load_accounts_cache() or self.accounts
+                        self.fb_accounts = self._load_fb_accounts_cache() or self.fb_accounts
+                        self._load_rows()
+                        self._load_fb_rows()
+                        self._refresh_stats()
+                        self._refresh_manage_emails()
+                    except Exception:
+                        pass
+                    self._log(f"[SYNC] Imported from {sync_dir}")
+                    messagebox.showinfo("Sync", f"Imported from {sync_dir}")
+
+                self.root.after(0, _finish)
+            except Exception as e:
+                self._log(f"[SYNC] Import error: {e}")
+                self.root.after(0, lambda: messagebox.showerror("Sync", f"Import error: {e}"))
+            finally:
+                self.root.after(0, win.destroy)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def start_join_circles(self) -> None:
         if self.executor is not None:
@@ -1142,6 +2904,39 @@ class App:
                     self.active_profiles.pop(item_id, None)
             except Exception:
                 pass
+    def _toggle_advanced(self) -> None:
+        if self._advanced_var.get():
+            self._advanced_frame.grid()
+        else:
+            self._advanced_frame.grid_remove()
+
+    def _set_busy(self, busy: bool) -> None:
+        if busy and not self._busy:
+            self._busy = True
+            try:
+                self._busy_bar.start(10)
+            except Exception:
+                pass
+        elif not busy and self._busy:
+            self._busy = False
+            try:
+                self._busy_bar.stop()
+            except Exception:
+                pass
+
+    def _apply_row_striping(self, tree: ttk.Treeview) -> None:
+        try:
+            tree.tag_configure("row_odd", background="#F8FAFC")
+            tree.tag_configure("row_even", background="#FFFFFF")
+            items = tree.get_children("")
+            for i, item in enumerate(items):
+                tags = list(tree.item(item, "tags") or [])
+                tags = [t for t in tags if t not in ("row_odd", "row_even")]
+                tags.append("row_even" if i % 2 == 0 else "row_odd")
+                tree.item(item, tags=tags)
+        except Exception:
+            pass
+
     def _load_rows(self) -> None:
         self.accounts = self._dedupe_accounts(self.accounts)
         self._save_accounts_cache()
@@ -1169,6 +2964,7 @@ class App:
                 ),
             )
         self._update_counts()
+        self._apply_row_striping(self.tree)
         self._load_all_rows(only_errors=self._all_filter_active)
 
     def _load_profile_rows(self) -> None:
@@ -1191,6 +2987,7 @@ class App:
                 ),
             )
         self._update_counts()
+        self._apply_row_striping(self.profile_tree)
 
     def _load_fb_rows(self) -> None:
         self.fb_accounts = self._dedupe_accounts(self.fb_accounts)
@@ -1216,6 +3013,7 @@ class App:
                 ),
             )
         self._update_counts()
+        self._apply_row_striping(self.fb_tree)
         self._load_all_rows(only_errors=self._all_filter_active)
 
     def _load_all_rows(self, only_errors: bool = False) -> None:
@@ -1247,7 +3045,7 @@ class App:
                 status_upper = (status_val or "").upper()
                 if not any(
                     key in status_upper
-                    for key in ["HẾT VIDEO", "HET VIDEO", "START ERR", "PROXY", "CREATE ERR"]
+                    for key in ["NO VIDEO", "NO VIDEO", "START ERR", "PROXY", "CREATE ERR"]
                 ):
                     continue
             self.all_tree.insert(
@@ -1270,6 +3068,8 @@ class App:
                 ),
             )
 
+        self._apply_row_striping(self.all_tree)
+
     def _load_fb_profile_rows(self) -> None:
         self.fb_profile_accounts = self._dedupe_accounts(self.fb_profile_accounts)
         self._save_fb_profile_accounts_cache()
@@ -1290,30 +3090,26 @@ class App:
                 ),
             )
         self._update_counts()
+        self._apply_row_striping(self.fb_profile_tree)
 
     def _update_counts(self) -> None:
         try:
-            self._count_var.set(
-                self._format_total_with_run("Total", self._unique_count(self.accounts), "upload")
-            )
+            ytb_total = self._unique_count(self.accounts)
+            fb_total = self._unique_count(self.fb_accounts)
+            total_all = ytb_total + fb_total
+            self._count_var.set(self._format_total_with_run("Total", total_all, "upload", ytb_total, fb_total))
         except Exception:
             pass
         try:
             self._profile_count_var.set(
-                self._format_total_with_run("Total Profile", self._unique_count(self.profile_accounts), "profile")
-            )
-        except Exception:
-            pass
-        try:
-            self._fb_count_var.set(
-                self._format_total_with_run("Total FB", self._unique_count(self.fb_accounts), "fb")
+                self._format_total_with_run("YTB Profile", self._unique_count(self.profile_accounts), "profile")
             )
         except Exception:
             pass
         try:
             self._fb_profile_count_var.set(
                 self._format_total_with_run(
-                    "Total FB Profile", self._unique_count(self.fb_profile_accounts), "fb_profile"
+                    "FB Profile", self._unique_count(self.fb_profile_accounts), "fb_profile"
                 )
             )
         except Exception:
@@ -1338,7 +3134,18 @@ class App:
             out.append(acc)
         return out
 
-    def _format_total_with_run(self, label: str, total: int, kind: str) -> str:
+    def _format_total_with_run(
+        self,
+        label: str,
+        total: int,
+        kind: str,
+        ytb_total: int | None = None,
+        fb_total: int | None = None,
+    ) -> str:
+        if ytb_total is not None and fb_total is not None:
+            return f"{label}: {total} | YTB: {ytb_total} | FB: {fb_total}"
+        if ytb_total is not None:
+            return f"{label}: {total} | YTB: {ytb_total}"
         return f"{label}: {total}"
 
     def _set_run_total(self, kind: str, total: int) -> None:
@@ -1368,19 +3175,8 @@ class App:
         self._update_counts()
     def _set_cycle_label(self) -> None:
         try:
-            text = f"Vòng lặp: {self._cycle_count}"
+            text = f"Cycle: {self._cycle_count}"
             self._cycle_var.set(text)
-        except Exception:
-            pass
-
-    def _set_pause100_label(self, remaining_sec: float) -> None:
-        try:
-            if remaining_sec <= 0:
-                self._pause100_var.set("Đợi 5p/100: -")
-                return
-            mm = int(remaining_sec) // 60
-            ss = int(remaining_sec) % 60
-            self._pause100_var.set(f"Đợi 5p/100: {mm:02d}:{ss:02d}")
         except Exception:
             pass
 
@@ -1392,7 +3188,7 @@ class App:
                 pass
             self._repeat_countdown_after_id = None
         try:
-            self._next_cycle_var.set("Đợi vòng mới: -")
+            self._next_cycle_var.set("Next cycle in: -")
         except Exception:
             pass
 
@@ -1406,12 +3202,12 @@ class App:
                 return
             remaining = max(0, end_time - time.time())
             if remaining <= 0:
-                self._next_cycle_var.set("Đợi vòng mới: 00:00")
+                self._next_cycle_var.set("Next cycle in: 00:00")
                 self._repeat_countdown_after_id = None
                 return
             mm = int(remaining) // 60
             ss = int(remaining) % 60
-            self._next_cycle_var.set(f"Đợi vòng mới: {mm:02d}:{ss:02d}")
+            self._next_cycle_var.set(f"Next cycle in: {mm:02d}:{ss:02d}")
             self._repeat_countdown_after_id = self.root.after(1000, _tick)
 
         _tick()
@@ -1450,7 +3246,14 @@ class App:
         q = q.lower()
         if not q:
             return
-        if self._is_profile_tab():
+        if self._is_all_tab():
+            tree = self.all_tree
+            matches = []
+            for iid in tree.get_children():
+                email = (tree.set(iid, "email") or "").strip()
+                if q in email.lower():
+                    matches.append(iid)
+        elif self._is_profile_tab():
             tree = self.profile_tree
             rows = self.profile_accounts
         elif self._is_fb_tab():
@@ -1462,14 +3265,15 @@ class App:
         else:
             tree = self.tree
             rows = self.accounts
-        matches = []
-        email_to_iid = self._map_email_to_item_id(tree)
-        for row in rows:
-            email = (row.get("uid") or "").strip()
-            if q in email.lower():
-                iid = email_to_iid.get(email)
-                if iid:
-                    matches.append(iid)
+        if not self._is_all_tab():
+            matches = []
+            email_to_iid = self._map_email_to_item_id(tree)
+            for row in rows:
+                email = (row.get("uid") or "").strip()
+                if q in email.lower():
+                    iid = email_to_iid.get(email)
+                    if iid:
+                        matches.append(iid)
         if not matches:
             self._log(f"[SEARCH] No match: {q}")
             return
@@ -1564,6 +3368,11 @@ class App:
                 self.tree.set(resolved_id, "profile_id", profile_id)
             self.tree.set(resolved_id, "status", status)
             self._apply_status_tag(resolved_id, status)
+            self._flash_tree_row(self.tree, resolved_id)
+            if self._status_needs_pulse(status):
+                self._pulse_tree_row(self.tree, resolved_id)
+            else:
+                self._stop_pulse_tree_row(self.tree, resolved_id)
             self._auto_scroll_if_needed(self.tree, resolved_id, status)
             try:
                 email = (self.tree.set(resolved_id, "email") or "").strip()
@@ -1590,6 +3399,7 @@ class App:
         def _update():
             self.profile_tree.set(item_id, "status", status)
             self._apply_profile_status_tag(item_id, status)
+            self._flash_tree_row(self.profile_tree, item_id)
             self._auto_scroll_if_needed(self.profile_tree, item_id, status)
 
         self.root.after(0, _update)
@@ -1598,6 +3408,7 @@ class App:
         def _update():
             self.fb_tree.set(item_id, "status", status)
             self._apply_fb_status_tag(item_id, status)
+            self._flash_tree_row(self.fb_tree, item_id)
             self._auto_scroll_if_needed(self.fb_tree, item_id, status)
             try:
                 email = (self.fb_tree.set(item_id, "email") or "").strip()
@@ -1612,6 +3423,7 @@ class App:
         def _update():
             self.fb_profile_tree.set(item_id, "status", status)
             self._apply_fb_profile_status_tag(item_id, status)
+            self._flash_tree_row(self.fb_profile_tree, item_id)
             self._auto_scroll_if_needed(self.fb_profile_tree, item_id, status)
 
         self.root.after(0, _update)
@@ -1654,7 +3466,7 @@ class App:
                     return
             self.failed_accounts.append((item_id, acc))
         try:
-            log_path = os.path.join(_THIS_DIR, "logs", "failed_accounts.log")
+            log_path = os.path.join(DATA_DIR, "logs", "failed_accounts.log")
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{acc.get('uid','')} | {reason}\n")
@@ -1676,7 +3488,7 @@ class App:
                     return
             self.profile_failed_accounts.append((item_id, acc))
         try:
-            log_path = os.path.join(_THIS_DIR, "logs", "failed_profile_accounts.log")
+            log_path = os.path.join(DATA_DIR, "logs", "failed_profile_accounts.log")
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{acc.get('uid','')} | {reason}\n")
@@ -1685,7 +3497,7 @@ class App:
 
     def _clear_failed_log(self) -> None:
         try:
-            log_path = os.path.join(_THIS_DIR, "logs", "failed_accounts.log")
+            log_path = os.path.join(DATA_DIR, "logs", "failed_accounts.log")
             if os.path.exists(log_path):
                 os.remove(log_path)
         except Exception:
@@ -1693,7 +3505,7 @@ class App:
 
     def _clear_profile_failed_log(self) -> None:
         try:
-            log_path = os.path.join(_THIS_DIR, "logs", "failed_profile_accounts.log")
+            log_path = os.path.join(DATA_DIR, "logs", "failed_profile_accounts.log")
             if os.path.exists(log_path):
                 os.remove(log_path)
         except Exception:
@@ -1820,38 +3632,16 @@ class App:
             pass
 
     def _enqueue_upload_turn(self) -> int:
-        with self._upload_queue_cond:
-            self._upload_queue_seq += 1
-            token = self._upload_queue_seq
-            self._upload_queue.append(token)
-            self._upload_queue_cond.notify_all()
-            return token
+        # Upload queue disabled: allow uploads to proceed immediately (parallel).
+        return 0
 
     def _wait_upload_turn(self, token: int) -> bool:
-        with self._upload_queue_cond:
-            while True:
-                if self.stop_event.is_set():
-                    if token in self._upload_queue:
-                        try:
-                            self._upload_queue.remove(token)
-                        except Exception:
-                            pass
-                    self._upload_queue_cond.notify_all()
-                    return False
-                if self._upload_queue and self._upload_queue[0] == token:
-                    return True
-                self._upload_queue_cond.wait(timeout=0.5)
+        # Upload queue disabled: always allow unless stopping.
+        return not self.stop_event.is_set()
 
     def _release_upload_turn(self, token: int) -> None:
-        with self._upload_queue_cond:
-            if self._upload_queue and self._upload_queue[0] == token:
-                self._upload_queue.pop(0)
-            else:
-                try:
-                    self._upload_queue.remove(token)
-                except Exception:
-                    pass
-            self._upload_queue_cond.notify_all()
+        # Upload queue disabled: no-op.
+        return
 
     def _schedule_follow_sort(self) -> None:
         if self._follow_sort_after_id:
@@ -2032,6 +3822,12 @@ class App:
             self._fallback_caption_idx = (self._fallback_caption_idx + 1) % len(self._fallback_captions)
             return cap
 
+    def _ensure_title(self, title: str, max_len: int = 1000) -> str:
+        cleaned = (title or "").strip()
+        if not cleaned:
+            cleaned = self._get_fallback_caption()
+        return self._limit_caption(cleaned, max_len)
+
     def _build_caption(self, title: str, max_len: int = 1000) -> str:
         caption = (title or "").strip()
         if not caption:
@@ -2138,8 +3934,8 @@ class App:
 
     def _prompt_resume(self, kind: str, count: int) -> bool:
         msg = (
-            f"Có {count} tài khoản chưa OK.\n"
-            f"Bạn muốn chạy tiếp các tài khoản chưa OK không?"
+            f"There are {count} accounts not OK.\n"
+            f"Do you want to continue with the not-OK accounts?"
         )
         return messagebox.askyesno("Tiep tuc", msg)
 
@@ -2161,10 +3957,95 @@ class App:
         status_upper = (status or "").upper()
         if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
             self.tree.item(item_id, tags=("status_err",))
-        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "POSTING", "UPLOAD"]):
+        elif any(key in status_upper for key in ["OK", "SUCCESS", "DONE"]):
             self.tree.item(item_id, tags=("status_ok",))
+        elif any(
+            key in status_upper
+            for key in [
+                "LOGIN",
+                "DOWNLOAD",
+                "POSTING",
+                "UPLOAD",
+                "START",
+                "SCAN",
+                "RUNNING",
+                "CHECK",
+                "SYNC",
+            ]
+        ):
+            self.tree.item(item_id, tags=("status_work",))
+        elif any(key in status_upper for key in ["WAIT", "RETRY", "PENDING"]):
+            self.tree.item(item_id, tags=("status_warn",))
         else:
             self.tree.item(item_id, tags=())
+
+    def _status_needs_pulse(self, status: str) -> bool:
+        status_upper = (status or "").upper()
+        if any(key in status_upper for key in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
+            return False
+        if any(key in status_upper for key in ["OK", "SUCCESS", "DONE", "READY"]):
+            return False
+        return any(
+            key in status_upper
+            for key in [
+                "LOGIN",
+                "DOWNLOAD",
+                "POSTING",
+                "UPLOAD",
+                "START",
+                "SCAN",
+                "RUNNING",
+                "CHECK",
+                "SYNC",
+            ]
+        )
+
+    def _stop_pulse_tree_row(self, tree: ttk.Treeview, item_id: str) -> None:
+        try:
+            token = self._pulse_tokens.get(item_id, 0) + 1
+            self._pulse_tokens[item_id] = token
+            cur_tags = list(tree.item(item_id, "tags") or [])
+            cur_tags = [t for t in cur_tags if t not in ("status_pulse_a", "status_pulse_b")]
+            tree.item(item_id, tags=tuple(cur_tags))
+        except Exception:
+            pass
+
+    def _pulse_tree_row(
+        self, tree: ttk.Treeview, item_id: str, cycles: int = 6, interval: int = 220
+    ) -> None:
+        try:
+            base_tags = list(tree.item(item_id, "tags") or [])
+        except Exception:
+            return
+        base_tags = [t for t in base_tags if t not in ("status_pulse_a", "status_pulse_b")]
+        token = self._pulse_tokens.get(item_id, 0) + 1
+        self._pulse_tokens[item_id] = token
+
+        def _tick(step: int) -> None:
+            if self._pulse_tokens.get(item_id) != token:
+                return
+            try:
+                if not tree.exists(item_id):
+                    return
+            except Exception:
+                return
+            pulse_tag = "status_pulse_a" if step % 2 == 0 else "status_pulse_b"
+            try:
+                tree.item(item_id, tags=tuple(base_tags + [pulse_tag]))
+            except Exception:
+                return
+            if step < (cycles * 2 - 1):
+                try:
+                    self.root.after(interval, lambda: _tick(step + 1))
+                except Exception:
+                    return
+            else:
+                try:
+                    tree.item(item_id, tags=tuple(base_tags))
+                except Exception:
+                    pass
+
+        _tick(0)
 
     def _apply_profile_status_tag(self, item_id: str, status: str) -> None:
         status_upper = (status or "").upper()
@@ -2202,6 +4083,32 @@ class App:
         else:
             self.fb_profile_tree.item(item_id, tags=())
 
+    def _flash_tree_row(self, tree: ttk.Treeview, item_id: str) -> None:
+        try:
+            tags = list(tree.item(item_id, "tags") or [])
+        except Exception:
+            return
+        if "status_flash" not in tags:
+            tags.append("status_flash")
+            try:
+                tree.item(item_id, tags=tuple(tags))
+            except Exception:
+                return
+
+        def _clear():
+            try:
+                cur_tags = list(tree.item(item_id, "tags") or [])
+                if "status_flash" in cur_tags:
+                    cur_tags = [t for t in cur_tags if t != "status_flash"]
+                    tree.item(item_id, tags=tuple(cur_tags))
+            except Exception:
+                pass
+
+        try:
+            self.root.after(350, _clear)
+        except Exception:
+            pass
+
     def _next_proxy(self) -> str:
         with self._extra_proxy_lock:
             if not self._extra_proxies:
@@ -2222,10 +4129,7 @@ class App:
             "failed",
             "timeout",
             "tunnel",
-            "khong the",
-            "không thể",
-            "ket noi",
-            "kết nối",
+            "unable",
         ]
         return any(k in text for k in proxy_keywords)
 
@@ -2446,11 +4350,33 @@ class App:
     def _log(self, msg: str) -> None:
         def _is_noisy(m: str) -> bool:
             text = (m or "").strip()
-            if text.startswith("[DL]"):
-                return True
-            if text.startswith("[LOGIN]") and not any(k in text for k in ("ERR", "OK")):
-                return True
-            if text.startswith("[PROFILE]") and not any(k in text for k in ("ERR", "OK", "UPDATED", "OPENED", "CHANGE")):
+            upper = text.upper()
+            important = (
+                "ERR",
+                "ERROR",
+                "FAILED",
+                "TIMEOUT",
+                "BLOCK",
+                "NO VIDEO",
+                "SKIP",
+                "RETRY",
+                "OK",
+                "DONE",
+                "SUCCESS",
+            )
+            noisy_prefixes = (
+                "[DL]",
+                "[UPLOAD]",
+                "[UPLOAD-DIALOG]",
+                "[UPLOAD-POST]",
+                "[LOGIN]",
+                "[PROFILE]",
+                "[SELECT]",
+                "[SEARCH]",
+                "[MENU]",
+                "[PROXY]",
+            )
+            if text.startswith(noisy_prefixes) and not any(k in upper for k in important):
                 return True
             return False
 
@@ -2493,12 +4419,12 @@ class App:
 
     def _clear_log_files(self) -> None:
         paths = [
-            os.path.join(_THIS_DIR, "logs", "app.log"),
-            os.path.join(_THIS_DIR, "logs", "uploads.log"),
-            os.path.join(_THIS_DIR, "logs", "downloads.log"),
-            os.path.join(_THIS_DIR, "logs", "errors.log"),
-            os.path.join(_THIS_DIR, "logs", "threads.log"),
-            os.path.join(_THIS_DIR, "logs", "failed_accounts.log"),
+            os.path.join(DATA_DIR, "logs", "app.log"),
+            os.path.join(DATA_DIR, "logs", "uploads.log"),
+            os.path.join(DATA_DIR, "logs", "downloads.log"),
+            os.path.join(DATA_DIR, "logs", "errors.log"),
+            os.path.join(DATA_DIR, "logs", "threads.log"),
+            os.path.join(DATA_DIR, "logs", "failed_accounts.log"),
         ]
         for path in paths:
             try:
@@ -2530,10 +4456,10 @@ class App:
         if self.executor is not None:
             self._log("[CLEAR] Dang chay job, hay STOP truoc.")
             return
-        ok = messagebox.askyesno("Confirm", "Xoa tat ca video trong folder email?")
+        ok = messagebox.askyesno("Confirm", "Delete all videos in the email folder?")
         if not ok:
             return
-        base = os.path.join(_THIS_DIR, "video")
+        base = os.path.join(DATA_DIR, "video")
         if not os.path.isdir(base):
             self._log("[CLEAR] Folder video khong ton tai.")
             return
@@ -2593,6 +4519,10 @@ class App:
                         break
                 self._save_accounts_cache()
                 # Keep original order; no auto sort after fetching followers
+                try:
+                    self.root.after(0, self._refresh_stats)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2642,6 +4572,10 @@ class App:
                             acc["profile_id"] = profile_id
                         break
                 self._save_fb_accounts_cache()
+                try:
+                    self.root.after(0, self._refresh_stats)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2660,7 +4594,7 @@ class App:
             return
         safe = email.strip().lower().replace("@", "_at_").replace(".", "_")
         try:
-            base = os.path.join(_THIS_DIR, "video", safe)
+            base = os.path.join(DATA_DIR, "video", safe)
             os.makedirs(base, exist_ok=True)
         except Exception:
             pass
@@ -2669,7 +4603,7 @@ class App:
         if not email:
             return
         safe = email.strip().lower().replace("@", "_at_").replace(".", "_")
-        out_dir = os.path.join(_THIS_DIR, "video", safe)
+        out_dir = os.path.join(DATA_DIR, "video", safe)
         try:
             os.makedirs(out_dir, exist_ok=True)
             out_path = os.path.join(out_dir, "profile_assets.json")
@@ -2687,7 +4621,7 @@ class App:
         if not email:
             return {}
         safe = email.strip().lower().replace("@", "_at_").replace(".", "_")
-        path = os.path.join(_THIS_DIR, "video", safe, "profile_assets.json")
+        path = os.path.join(DATA_DIR, "video", safe, "profile_assets.json")
         if not os.path.exists(path):
             return {}
         try:
@@ -2886,6 +4820,15 @@ class App:
                                 self.fb_tree.set(iid, "facebook", new_value)
                         except Exception:
                             pass
+        elif tree == self.manage_tree:
+            try:
+                idx = int(item_id) - 1
+            except Exception:
+                return
+            if idx < 0 or idx >= len(self._manage_rows):
+                return
+            self._manage_rows[idx][col_name] = new_value
+            self._update_manage_counts()
 
     def _begin_cell_edit(self, tree: ttk.Treeview, item_id: str, col_name: str) -> None:
         self._close_cell_editor(save=True)
@@ -3676,87 +5619,570 @@ class App:
             slot_idx += 1
 
     def _load_accounts_cache(self) -> list:
-        if not os.path.exists(self._accounts_file):
-            return []
-        try:
-            with open(self._accounts_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                # Normalize specific YouTube URLs that should always point to Shorts.
-                try:
-                    for acc in data:
-                        if acc.get("uid") == "opendauria@hotmail.com":
-                            yt = (acc.get("youtube") or "").strip()
-                            if yt == "https://www.youtube.com/@Vice_Verses":
-                                acc["youtube"] = "https://www.youtube.com/@Vice_Verses/shorts"
-                except Exception:
-                    pass
-                return data
-        except Exception:
-            return []
-        return []
+        data = self._load_cache_list("accounts")
+        if isinstance(data, list):
+            # Normalize specific YouTube URLs that should always point to Shorts.
+            try:
+                for acc in data:
+                    if acc.get("uid") == "opendauria@hotmail.com":
+                        yt = (acc.get("youtube") or "").strip()
+                        if yt == "https://www.youtube.com/@Vice_Verses":
+                            acc["youtube"] = "https://www.youtube.com/@Vice_Verses/shorts"
+            except Exception:
+                pass
+        return data
 
     def _save_accounts_cache(self) -> None:
-        try:
-            with open(self._accounts_file, "w", encoding="utf-8") as f:
-                json.dump(self.accounts, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        self._save_cache_list("accounts", self.accounts)
 
     def _load_profile_accounts_cache(self) -> list:
-        if not os.path.exists(self._profile_accounts_file):
-            return []
-        try:
-            with open(self._profile_accounts_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            return []
-        return []
+        return self._load_cache_list("profile_accounts")
 
     def _save_profile_accounts_cache(self) -> None:
-        try:
-            with open(self._profile_accounts_file, "w", encoding="utf-8") as f:
-                json.dump(self.profile_accounts, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        self._save_cache_list("profile_accounts", self.profile_accounts)
 
     def _load_fb_accounts_cache(self) -> list:
-        if not os.path.exists(self._fb_accounts_file):
-            return []
-        try:
-            with open(self._fb_accounts_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            return []
-        return []
+        return self._load_cache_list("fb_accounts")
 
     def _save_fb_accounts_cache(self) -> None:
+        self._save_cache_list("fb_accounts", self.fb_accounts)
+
+    def _load_fb_profile_accounts_cache(self) -> list:
+        return self._load_cache_list("fb_profile_accounts")
+
+    def _save_fb_profile_accounts_cache(self) -> None:
+        self._save_cache_list("fb_profile_accounts", self.fb_profile_accounts)
+
+    def _clear_creator_fund_status_cache(self) -> None:
         try:
-            with open(self._fb_accounts_file, "w", encoding="utf-8") as f:
-                json.dump(self.fb_accounts, f, ensure_ascii=False, indent=2)
+            for key in ("accounts", "fb_accounts"):
+                data = self._load_cache_list(key)
+                if not isinstance(data, list):
+                    continue
+                updated = False
+                for acc in data:
+                    if "creator_fund_status" in acc:
+                        acc.pop("creator_fund_status", None)
+                        updated = True
+                if updated:
+                    self._save_cache_list(key, data)
         except Exception:
             pass
 
-    def _load_fb_profile_accounts_cache(self) -> list:
-        if not os.path.exists(self._fb_profile_accounts_file):
-            return []
+    def _open_cache_db(self) -> sqlite3.Connection | None:
         try:
-            with open(self._fb_profile_accounts_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return data
+            conn = sqlite3.connect(self._cache_db, timeout=5)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, data TEXT, updated_at REAL)"
+            )
+            return conn
         except Exception:
-            return []
-        return []
+            return None
 
-    def _save_fb_profile_accounts_cache(self) -> None:
+    def _cache_db_has_data(self) -> bool:
         try:
-            with open(self._fb_profile_accounts_file, "w", encoding="utf-8") as f:
-                json.dump(self.fb_profile_accounts, f, ensure_ascii=False, indent=2)
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if not conn:
+                    return False
+                try:
+                    cur = conn.execute("SELECT data FROM cache")
+                    rows = cur.fetchall()
+                    if not rows:
+                        return False
+                    for (payload,) in rows:
+                        try:
+                            loaded = json.loads(payload or "[]")
+                            if isinstance(loaded, list) and len(loaded) > 0:
+                                return True
+                        except Exception:
+                            continue
+                    return False
+                finally:
+                    conn.close()
+        except Exception:
+            return False
+
+    def _load_cache_list(self, key: str) -> list:
+        data = []
+        try:
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if conn:
+                    try:
+                        cur = conn.execute("SELECT data FROM cache WHERE key = ?", (key,))
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            loaded = json.loads(row[0])
+                            if isinstance(loaded, list):
+                                data = loaded
+                                return data
+                    finally:
+                        conn.close()
+        except Exception:
+            pass
+
+    def _should_check_creator_fund(self, acc: dict, followers) -> bool:
+        if followers is None or str(followers).strip() == "":
+            followers = acc.get("followers")
+        try:
+            fnum = int(re.sub(r"[^0-9]", "", str(followers or "0")) or "0")
+        except Exception:
+            fnum = 0
+        if fnum < 1000:
+            return False
+        status = (acc.get("creator_fund_status") or "").strip().upper()
+        if status in {"JOINED", "PENDING"}:
+            return False
+        return True
+
+    def _creator_fund_status_from_page(self, page_text: str) -> str:
+        text = (page_text or "").lower()
+        if "joined the creator fund" in text or "you\u2019ve joined the creator fund" in text:
+            return "JOINED"
+        if "application under review" in text:
+            return "PENDING"
+        return ""
+
+    def _creator_fund_bars_full(self, page_text: str) -> bool:
+        text = (page_text or "").lower()
+
+        def _percent_for(label: str) -> float:
+            m = re.search(label + r"[^%]*?([0-9]+(?:\\.[0-9]+)?)%", text, re.DOTALL)
+            if not m:
+                return 0.0
+            try:
+                return float(m.group(1))
+            except Exception:
+                return 0.0
+
+        return (
+            _percent_for("followers") >= 100.0
+            and _percent_for("views") >= 100.0
+            and _percent_for("videos") >= 100.0
+        )
+
+    def _set_creator_fund_status(self, acc: dict, source: str, status: str) -> None:
+        try:
+            status = (status or "").strip().upper()
+            if not status:
+                return
+            acc["creator_fund_status"] = status
+            # Persist directly to DB by uid to avoid stale RAM data
+            uid = (acc.get("uid") or "").strip().lower()
+            if uid:
+                key = "fb_accounts" if source == "FB" else "accounts"
+                data = self._load_cache_list(key)
+                if isinstance(data, list):
+                    for row in data:
+                        if (row.get("uid") or "").strip().lower() == uid:
+                            row["creator_fund_status"] = status
+                            break
+                    self._save_cache_list(key, data)
+            self._refresh_stats()
+        except Exception:
+            pass
+
+    def _set_payment_status(self, acc: dict, source: str, status: str) -> None:
+        try:
+            status = (status or "").strip().upper()
+            if not status:
+                return
+            acc["payment_status"] = status
+            uid = (acc.get("uid") or "").strip().lower()
+            if uid:
+                key = "fb_accounts" if source == "FB" else "accounts"
+                data = self._load_cache_list(key)
+                if isinstance(data, list):
+                    for row in data:
+                        if (row.get("uid") or "").strip().lower() == uid:
+                            row["payment_status"] = status
+                            break
+                    self._save_cache_list(key, data)
+            self._refresh_stats()
+        except Exception:
+            pass
+
+    def _close_gpm_profile_for_acc(self, acc: dict) -> None:
+        try:
+            profile_id = (acc.get("profile_id") or "").strip()
+            if not profile_id:
+                return
+            try:
+                close_profile(profile_id, 3)
+            except Exception:
+                pass
+            try:
+                delete_profile(profile_id, 10)
+            except Exception:
+                pass
+            try:
+                self.created_profiles.discard(profile_id)
+            except Exception:
+                pass
+            try:
+                self._delete_profile_path(profile_id)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _check_creator_fund(self, driver_path: str, remote: str, acc: dict, source: str) -> None:
+        email = (acc.get("uid") or "").strip()
+        if not email:
+            return
+        with self._creator_fund_lock:
+            if email in self._creator_fund_checked:
+                return
+            self._creator_fund_checked.add(email)
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.service import Service as ChromeService
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+        except Exception as e:
+            self._log(f"[{email}] CREATOR FUND ERR: {e}")
+            return
+
+        status = ""
+        apply_attempted = False
+        keep_open = False
+        options = webdriver.ChromeOptions()
+        options.add_experimental_option("debuggerAddress", remote.strip())
+        driver = webdriver.Chrome(service=ChromeService(driver_path), options=options)
+        wait = WebDriverWait(driver, 12)
+        try:
+            def _close_tutorial_if_any() -> None:
+                # Close "How to apply" or other onboarding modal if it appears
+                try:
+                    close_btns = driver.find_elements(By.XPATH, "//button[contains(., 'Close') or contains(., 'Skip') or contains(., 'Done')]")
+                    for b in close_btns:
+                        if b.is_displayed():
+                            driver.execute_script("arguments[0].click();", b)
+                            time.sleep(0.4)
+                            return
+                except Exception:
+                    pass
+                try:
+                    # Some modals have an X button
+                    x_btns = driver.find_elements(By.XPATH, "//button[@aria-label='Close'] | //button[contains(., '×')]")
+                    for b in x_btns:
+                        if b.is_displayed():
+                            driver.execute_script("arguments[0].click();", b)
+                            time.sleep(0.4)
+                            return
+                except Exception:
+                    pass
+                try:
+                    driver.execute_script(
+                        "document.body.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}));"
+                    )
+                except Exception:
+                    pass
+
+            try:
+                driver.execute_script("window.open('https://thescoopz.com/creator-fund','_blank');")
+                time.sleep(0.6)
+                try:
+                    driver.switch_to.window(driver.window_handles[-1])
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            driver.get("https://thescoopz.com/creator-fund")
+            time.sleep(2)
+            _close_tutorial_if_any()
+            page = driver.page_source or ""
+            status = self._creator_fund_status_from_page(page)
+            if not status:
+                try:
+                    body_text = driver.execute_script("return document.body && document.body.innerText ? document.body.innerText : ''") or ""
+                    status = self._creator_fund_status_from_page(body_text)
+                except Exception:
+                    pass
+            if status:
+                self._log(f"[{email}] CREATOR FUND: status={status}")
+                try:
+                    self._set_creator_fund_status(acc, source, status)
+                    self._log(f"[{email}] CREATOR FUND: saved status={status} to DB")
+                except Exception as e:
+                    self._log(f"[{email}] CREATOR FUND: save status failed: {e}")
+                try:
+                    self._close_gpm_profile_for_acc(acc)
+                except Exception:
+                    pass
+                try:
+                    driver.execute_script("window.close();")
+                    driver.quit()
+                except Exception:
+                    pass
+                return
+
+            # Try to apply
+            try:
+                # Ensure on apply section when no status
+                # Prefer Apply button in Creator Fund card
+                apply_btns = driver.find_elements(
+                    By.XPATH,
+                    "//section//*[contains(., 'Creator Fund')]/ancestor::*[self::section or self::div][1]//button[normalize-space()='Apply' or contains(., 'Apply')]",
+                )
+                if not apply_btns:
+                    apply_btns = driver.find_elements(By.XPATH, "//button[normalize-space()='Apply' or contains(., 'Apply')]")
+                apply_clicked = False
+                for btn in apply_btns:
+                    try:
+                        if not btn.is_displayed():
+                            continue
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                        time.sleep(0.2)
+                        driver.execute_script("arguments[0].click();", btn)
+                        apply_clicked = True
+                        break
+                    except Exception:
+                        continue
+                if not apply_clicked:
+                    return
+                time.sleep(1.5)
+            except Exception:
+                return
+
+            apply_attempted = True
+            self._log(f"[{email}] CREATOR FUND: apply clicked, opening modal")
+
+            # Handle tutorial modal: click Next then Done
+            try:
+                for _ in range(2):
+                    next_btns = driver.find_elements(By.XPATH, "//button[.//span[normalize-space()='Next'] or normalize-space()='Next']")
+                    clicked = False
+                    for b in next_btns:
+                        if b.is_displayed():
+                            driver.execute_script("arguments[0].click();", b)
+                            clicked = True
+                            time.sleep(1.0)
+                            break
+                    if not clicked:
+                        break
+                done_btns = driver.find_elements(By.XPATH, "//button[.//span[normalize-space()='Done'] or normalize-space()='Done']")
+                for b in done_btns:
+                    if b.is_displayed():
+                        driver.execute_script("arguments[0].click();", b)
+                        time.sleep(1.0)
+                        break
+            except Exception:
+                pass
+            # After Done, scroll down inside the modal content
+            try:
+                modal_scroll = driver.find_element(
+                    By.CSS_SELECTOR,
+                    "div.fixed.inset-0.top-\\[48px\\].overflow-y-auto",
+                )
+                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", modal_scroll)
+                time.sleep(0.8)
+            except Exception:
+                pass
+
+            # Check three % blocks inside the modal; log if all 100%
+            try:
+                modal = driver.find_element(
+                    By.CSS_SELECTOR,
+                    "div.fixed.inset-0.top-\\[48px\\].overflow-y-auto",
+                )
+                section = None
+                try:
+                    section = modal.find_element(
+                        By.XPATH,
+                        ".//section[.//h2//span[contains(., 'Am I qualified to apply?')]]",
+                    )
+                except Exception:
+                    section = modal
+
+                text = ""
+                try:
+                    text = driver.execute_script("return arguments[0].innerText || '';", section) or ""
+                except Exception:
+                    text = section.text or ""
+
+                def _get_stats(label: str) -> tuple[str, str]:
+                    idx = text.lower().find(label.lower())
+                    seg = text[idx: idx + 120] if idx >= 0 else text
+                    pct = ""
+                    ratio = ""
+                    m_pct = re.search(r"([0-9]{1,3})\s*%", seg)
+                    if m_pct:
+                        pct = m_pct.group(1) + "%"
+                    m_ratio = re.search(r"([0-9][0-9,\.]*)\s*/\s*([0-9][0-9,\.]*)", seg)
+                    if m_ratio:
+                        ratio = f"{m_ratio.group(1)}/{m_ratio.group(2)}"
+                    return pct, ratio
+
+                f_pct, f_ratio = _get_stats("Followers")
+                v_pct, v_ratio = _get_stats("Views")
+                vd_pct, vd_ratio = _get_stats("Videos")
+                self._log(f"[{email}] CREATOR FUND: Followers {f_pct} {f_ratio}")
+                self._log(f"[{email}] CREATOR FUND: Views {v_pct} {v_ratio}")
+                self._log(f"[{email}] CREATOR FUND: Videos {vd_pct} {vd_ratio}")
+
+                if f_pct == "100%" and v_pct == "100%" and vd_pct == "100%":
+                    self._log(f"[{email}] CREATOR FUND: QUALIFIED (100% on all 3)")
+                    try:
+                        # Tick 2 checkboxes in the same modal section
+                        boxes = modal.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
+                        for cb in boxes:
+                            if not cb.is_selected():
+                                try:
+                                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cb)
+                                except Exception:
+                                    pass
+                                try:
+                                    driver.execute_script("arguments[0].click();", cb)
+                                except Exception:
+                                    try:
+                                        cb.click()
+                                    except Exception:
+                                        pass
+                                time.sleep(0.3)
+                        try:
+                            # Verify checkboxes
+                            checked = [cb for cb in boxes if cb.is_selected()]
+                            self._log(f"[{email}] CREATOR FUND: checkboxes checked={len(checked)}/{len(boxes)}")
+                        except Exception:
+                            pass
+                        try:
+                            apply_btn = modal.find_element(
+                                By.XPATH,
+                                ".//button[normalize-space()='Apply' or contains(., 'Apply')]",
+                            )
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", apply_btn)
+                            time.sleep(0.2)
+                            driver.execute_script("arguments[0].click();", apply_btn)
+                            time.sleep(0.8)
+                            # Default to PENDING after apply click
+                            try:
+                                self._set_creator_fund_status(acc, source, "PENDING")
+                                self._log(f"[{email}] CREATOR FUND: saved status=PENDING to DB")
+                            except Exception as e:
+                                self._log(f"[{email}] CREATOR FUND: save status failed: {e}")
+                            try:
+                                self._close_gpm_profile_for_acc(acc)
+                            except Exception:
+                                pass
+                            try:
+                                driver.execute_script("window.close();")
+                                driver.quit()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                else:
+                    self._log(f"[{email}] CREATOR FUND: NOT QUALIFIED (percent check)")
+            except Exception:
+                pass
+
+            
+        finally:
+            if not status:
+                with self._creator_fund_lock:
+                    self._creator_fund_checked.discard(email)
+            try:
+                if apply_attempted and keep_open:
+                    self._log(f"[{email}] CREATOR FUND: keep browser open for check")
+                else:
+                    driver.quit()
+            except Exception:
+                pass
+
+    def _maybe_check_creator_fund(self, driver_path: str, remote: str, acc: dict, followers, source: str) -> None:
+        try:
+            if not self._should_check_creator_fund(acc, followers):
+                try:
+                    email = (acc.get("uid") or "").strip()
+                    self._log(f"[{email}] CREATOR FUND: skip (not eligible or already set)")
+                except Exception:
+                    pass
+                return
+            try:
+                email = (acc.get("uid") or "").strip()
+                self._log(f"[{email}] CREATOR FUND: start check")
+            except Exception:
+                pass
+            self._check_creator_fund(driver_path, remote, acc, source)
+        except Exception as e:
+            email = (acc.get("uid") or "").strip()
+            self._log(f"[{email}] CREATOR FUND ERR: {e}")
+
+    def _payment_check_worker(self, item_id: str, acc: dict, source: str) -> None:
+        if self.stop_event.is_set():
+            return
+        profile_id = None
+        email = (acc.get("uid") or "").strip()
+        try:
+            driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc)
+            if not driver_path or not remote:
+                return
+            try:
+                from selenium import webdriver
+                from selenium.webdriver.chrome.service import Service as ChromeService
+                from selenium.webdriver.support.ui import WebDriverWait
+            except Exception as e:
+                self._log(f"[{email}] PAYMENT ERR: {e}")
+                return
+
+            options = webdriver.ChromeOptions()
+            options.add_experimental_option("debuggerAddress", remote.strip())
+            driver = webdriver.Chrome(service=ChromeService(driver_path), options=options)
+            wait = WebDriverWait(driver, 12)
+            status = "NOT_SETUP"
+            try:
+                driver.get("https://thescoopz.com/wallet")
+                try:
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                except Exception:
+                    pass
+                time.sleep(1.2)
+                try:
+                    text = driver.execute_script(
+                        "return document.body && document.body.innerText ? document.body.innerText : ''"
+                    ) or ""
+                except Exception:
+                    text = ""
+                page = (text or "") + " " + (driver.page_source or "")
+                needle = "set up completed: your payment has been successfully set up through stripe."
+                if needle in page.lower():
+                    status = "SETUP"
+                else:
+                    status = "NOT_SETUP"
+                self._set_payment_status(acc, source, status)
+                self._log(f"[{email}] PAYMENT: {status}")
+            except Exception as e:
+                self._log(f"[{email}] PAYMENT ERR: {e}")
+                self._set_payment_status(acc, source, "CHECK_ERR")
+            finally:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+        finally:
+            if profile_id:
+                self._cleanup_profile_session(item_id, profile_id)
+
+    def _save_cache_list(self, key: str, data: list) -> None:
+        try:
+            payload = json.dumps(data or [], ensure_ascii=False)
+            with self._cache_db_lock:
+                conn = self._open_cache_db()
+                if conn:
+                    try:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO cache (key, data, updated_at) VALUES (?, ?, ?)",
+                            (key, payload, time.time()),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
         except Exception:
             pass
 
@@ -4179,7 +6605,6 @@ class App:
             return
         self._force_close_all_profiles()
         self._reset_all_statuses()
-        self._clear_all_logs()
         if self._repeat_after_id:
             try:
                 self.root.after_cancel(self._repeat_after_id)
@@ -4191,14 +6616,12 @@ class App:
             if max_threads <= 0:
                 raise ValueError
         except Exception:
-            messagebox.showerror("Lỗi", "Số luồng phải > 0")
+            messagebox.showerror("Error", "Threads must be > 0")
             return
 
         self._fixed_threads = max_threads
         self.stop_event.clear()
         self._profile_retry_round = 0
-        with self.profile_failed_lock:
-            self.profile_failed_accounts = []
         pending = self._resume_pending.get("profile") or set()
         if pending:
             if self._prompt_resume("profile", len(pending)):
@@ -4213,22 +6636,6 @@ class App:
             return
         self._set_run_total("profile", len(checked_emails))
         self._profile_batch_running = True
-
-        def _sleep_with_stop(total_sec: float) -> None:
-            end_time = time.time() + max(0.0, total_sec)
-            next_log = 0.0
-            while time.time() < end_time:
-                if self.stop_event.is_set():
-                    break
-                remaining = max(0.0, end_time - time.time())
-                # Log countdown every 10s, and each second for last 5s
-                now = time.time()
-                if remaining <= 5 or now >= next_log:
-                    mm = int(remaining) // 60
-                    ss = int(remaining) % 60
-                    self._log(f"[PROFILE BATCH] Resume in {mm:02d}:{ss:02d}")
-                    next_log = now + (1.0 if remaining <= 5 else 10.0)
-                time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, remaining))
 
         def _run_batch(batch_items: list) -> None:
             if not batch_items or self.stop_event.is_set():
@@ -4307,7 +6714,7 @@ class App:
                 )
                 current_items = failed_list
 
-            self._clear_profile_failed_log()
+            # keep profile failed log
 
         def _batch_runner():
             try:
@@ -4335,55 +6742,12 @@ class App:
                     _run_batch(batch)
                     if self.stop_event.is_set():
                         break
-                    if start_idx + batch_size < total:
-                        self._log(f"[PROFILE BATCH] Pause {PROFILE_BATCH_PAUSE_SEC}s before next batch")
-                        _sleep_with_stop(PROFILE_BATCH_PAUSE_SEC)
                 self._log("[PROFILE BATCH] Done")
             finally:
                 self._profile_batch_running = False
                 self._reset_run("profile")
 
         threading.Thread(target=_batch_runner, daemon=True).start()
-
-    def _reset_batch_pause_state(self, lane: str) -> None:
-        key = (lane or "").upper()
-        with self._batch_pause_lock:
-            self._batch_pause_state[key] = {"started": 0, "release_at": 0.0}
-
-    def _wait_batch_pause_if_needed(self, lane: str) -> bool:
-        if PROFILE_BATCH_SIZE <= 0 or PROFILE_BATCH_PAUSE_SEC <= 0:
-            return True
-
-        key = (lane or "").upper()
-        with self._batch_pause_lock:
-            state = self._batch_pause_state.setdefault(key, {"started": 0, "release_at": 0.0})
-            state["started"] += 1
-            started = state["started"]
-            if started > 1 and (started - 1) % PROFILE_BATCH_SIZE == 0:
-                now = time.time()
-                state["release_at"] = max(now, state["release_at"]) + PROFILE_BATCH_PAUSE_SEC
-                self._log(
-                    f"[{key} BATCH] Reached {started - 1} profiles, pause {PROFILE_BATCH_PAUSE_SEC}s"
-                )
-            release_at = state["release_at"]
-
-        next_log = 0.0
-        while True:
-            wait_s = release_at - time.time()
-            if wait_s <= 0:
-                self._set_pause100_label(0)
-                return not self.stop_event.is_set()
-            if self.stop_event.is_set():
-                self._set_pause100_label(0)
-                return False
-            now = time.time()
-            if wait_s <= 5 or now >= next_log:
-                mm = int(wait_s) // 60
-                ss = int(wait_s) % 60
-                self._log(f"[{key} BATCH] Resume in {mm:02d}:{ss:02d}")
-                next_log = now + (1.0 if wait_s <= 5 else 10.0)
-            self._set_pause100_label(wait_s)
-            time.sleep(min(PROFILE_BATCH_PAUSE_CHECK_SEC, wait_s))
 
     def start_all_jobs_mixed(self, snapshot: dict | None = None) -> None:
         if self.executor is not None:
@@ -4426,7 +6790,7 @@ class App:
 
         self._force_close_all_profiles()
         self._reset_all_statuses()
-        self._clear_all_logs()
+        # Keep logs (do not clear on start)
 
         if snapshot is not None and snapshot.get("max_threads"):
             max_threads = int(snapshot.get("max_threads"))
@@ -4458,8 +6822,6 @@ class App:
             self._set_cycle_label()
         self._fixed_threads = max_threads
         self.stop_event.clear()
-        self._reset_batch_pause_state("YTB")
-        self._reset_batch_pause_state("FB")
         self._retry_round = 0
         self._all_retry_round = 0
         with self.failed_accounts_lock:
@@ -4568,13 +6930,14 @@ class App:
                     )
                     return
                 self._log(f"[ALL RETRY] Stop retry after 2 rounds (remaining: {len(failed_list)})")
-            self._clear_failed_log()
+            # keep failed log
             self._reset_run("upload")
             self._reset_run("fb")
 
             if self._repeat_enabled and not self.stop_event.is_set():
-                delay_ms = 5 * 60 * 1000
-                self._start_next_cycle_countdown(300)
+                delay_sec = max(0.0, float(self._repeat_delay_sec or 0.0))
+                delay_ms = int(delay_sec * 1000)
+                self._start_next_cycle_countdown(int(delay_sec))
 
                 def _repeat_start():
                     if self.stop_event.is_set():
@@ -4583,7 +6946,7 @@ class App:
                     self._repeat_cycle_pending = True
                     self.start_all_jobs_mixed(self._all_repeat_snapshot)
 
-                self._repeat_after_id = self.root.after(delay_ms, _repeat_start)
+                self._repeat_after_id = self.root.after(max(0, delay_ms), _repeat_start)
             self._from_all_tab = False
 
         threading.Thread(target=_waiter, daemon=True).start()
@@ -4668,13 +7031,18 @@ class App:
                     )
                     return
                 self._log(f"[ALL RETRY] Stop retry after 2 rounds (remaining: {len(failed_list)})")
-            self._clear_failed_log()
+            # keep failed log
             self._reset_run("upload")
             self._reset_run("fb")
 
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = 5 * 60 * 1000
                 self._start_next_cycle_countdown(300)
+                try:
+                    self._log("[REPEAT] Running GPM cleanup during wait...")
+                    self.root.after(0, self._clear_all_gpm_profiles)
+                except Exception:
+                    pass
 
                 def _repeat_start():
                     if self.stop_event.is_set():
@@ -4690,6 +7058,9 @@ class App:
 
 
     def start_jobs(self) -> None:
+        if not self._require_license_or_warn():
+            return
+        self._set_busy(True)
         if self._is_all_tab():
             self.start_all_jobs_mixed()
             return
@@ -4720,7 +7091,6 @@ class App:
         self._force_upload_only = False
         self._force_close_all_profiles()
         self._reset_all_statuses()
-        self._clear_all_logs()
         if self._repeat_after_id:
             try:
                 self.root.after_cancel(self._repeat_after_id)
@@ -4732,12 +7102,11 @@ class App:
             if max_threads <= 0:
                 raise ValueError
         except Exception:
-            messagebox.showerror("Lỗi", "Số luồng phải > 0")
+            messagebox.showerror("Error", "Threads must be > 0")
             return
 
         self._fixed_threads = max_threads
         self.stop_event.clear()
-        self._reset_batch_pause_state("YTB")
         self._clear_status_tags()
         if self._repeat_cycle_pending:
             self._repeat_cycle_pending = False
@@ -4746,10 +7115,6 @@ class App:
             self._cycle_count = 1
             self._set_cycle_label()
         self._retry_round = 0
-        # Clear failed accounts list at start of new cycle
-        with self.failed_accounts_lock:
-            self.failed_accounts = []
-        
         # Use exact number of threads (no extra retry threads)
         self.executor = ThreadPoolExecutor(max_workers=max_threads)
         self.login_semaphore = threading.BoundedSemaphore(max_threads)
@@ -4864,7 +7229,7 @@ class App:
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
                 self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
-            self._clear_failed_log()
+            # keep failed log
 
             if self._from_all_tab and self._all_pending_fb_emails and not self.stop_event.is_set():
                 pending_fb = set(self._all_pending_fb_emails)
@@ -4879,6 +7244,11 @@ class App:
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = 5 * 60 * 1000
                 self._start_next_cycle_countdown(300)
+                try:
+                    self._log("[REPEAT] Running GPM cleanup during wait...")
+                    self.root.after(0, self._clear_all_gpm_profiles)
+                except Exception:
+                    pass
 
                 def _repeat_start():
                     if self.stop_event.is_set():
@@ -4913,7 +7283,6 @@ class App:
 
         # Clear executor state
         self.stop_event.clear()
-        self._reset_batch_pause_state("YTB")
         self._clear_status_tags()
         self._retry_round = 0
         with self.failed_accounts_lock:
@@ -5011,7 +7380,7 @@ class App:
                     return
                 self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
 
-            self._clear_failed_log()
+            # keep failed log
 
             # Schedule next repeat cycle
             if self._repeat_enabled and not self.stop_event.is_set():
@@ -5027,11 +7396,18 @@ class App:
 
                 self._repeat_after_id = self.root.after(delay_ms, _repeat_again)
                 self._log("[REPEAT] Next cycle in 300 seconds...")
+                try:
+                    self._log("[REPEAT] Running GPM cleanup during wait...")
+                    self.root.after(0, self._clear_all_gpm_profiles)
+                except Exception:
+                    pass
             self._reset_run("upload")
 
         threading.Thread(target=_repeat_waiter, daemon=True).start()
 
     def start_scan(self) -> None:
+        if not self._require_license_or_warn():
+            return
         if self._is_fb_profile_tab():
             self._log("[FB PROFILE] Khong co scan o tab nay.")
             return
@@ -5156,7 +7532,7 @@ class App:
                 selected,
                 stop_check=lambda: self.stop_event.is_set(),
                 logger=self._log,
-                cookie_file=os.path.join(_THIS_DIR, "cookiefb.txt"),
+                cookie_file=os.path.join(DATA_DIR, "cookiefb.txt"),
                 max_workers=2,
                 on_status=_on_status,
             )
@@ -5192,7 +7568,7 @@ class App:
             reels_url,
             lambda: self.stop_event.is_set(),
             self._log,
-            cookie_file=os.path.join(_THIS_DIR, "cookiefb.txt"),
+            cookie_file=os.path.join(DATA_DIR, "cookiefb.txt"),
         )
         self._set_fb_status(item_id, f"SCAN OK ({added})")
         self._log(f"[{acc['uid']}] FB SCAN OK: added {added}, total {total}")
@@ -5202,7 +7578,6 @@ class App:
             return
         self._force_close_all_profiles()
         self._reset_all_statuses()
-        self._clear_all_logs()
         try:
             max_threads = int(self.entry_threads.get())
             if max_threads <= 0:
@@ -5447,7 +7822,6 @@ class App:
             return
         self._force_close_all_profiles()
         self._reset_all_statuses()
-        self._clear_all_logs()
         try:
             max_threads = int(self.entry_threads.get())
             if max_threads <= 0:
@@ -5479,7 +7853,6 @@ class App:
         self._set_run_total("fb", len(checked_emails))
 
         self.stop_event.clear()
-        self._reset_batch_pause_state("FB")
         self._retry_round = 0
         with self.failed_accounts_lock:
             self.failed_accounts = []
@@ -5565,13 +7938,18 @@ class App:
                     )
                     return
                 self._log(f"[FB RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
-            self._clear_failed_log()
+            # keep failed log
             self._reset_run("fb")
             if self._from_all_tab:
                 self._from_all_tab = False
                 if self._repeat_enabled and not self.stop_event.is_set():
                     delay_ms = 5 * 60 * 1000
                     self._start_next_cycle_countdown(300)
+                    try:
+                        self._log("[REPEAT] Running GPM cleanup during wait...")
+                        self.root.after(0, self._clear_all_gpm_profiles)
+                    except Exception:
+                        pass
 
                     def _repeat_start():
                         if self.stop_event.is_set():
@@ -5585,6 +7963,11 @@ class App:
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = 5 * 60 * 1000
                 self._start_next_cycle_countdown(300)
+                try:
+                    self._log("[REPEAT] Running GPM cleanup during wait...")
+                    self.root.after(0, self._clear_all_gpm_profiles)
+                except Exception:
+                    pass
 
                 def _repeat_start():
                     if self.stop_event.is_set():
@@ -5714,13 +8097,18 @@ class App:
                     )
                     return
                 self._log(f"[FB RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
-            self._clear_failed_log()
+            # keep failed log
             self._reset_run("fb")
             if self._from_all_tab:
                 self._from_all_tab = False
                 if self._repeat_enabled and not self.stop_event.is_set():
                     delay_ms = 5 * 60 * 1000
                     self._start_next_cycle_countdown(300)
+                    try:
+                        self._log("[REPEAT] Running GPM cleanup during wait...")
+                        self.root.after(0, self._clear_all_gpm_profiles)
+                    except Exception:
+                        pass
 
                     def _repeat_start():
                         if self.stop_event.is_set():
@@ -5739,8 +8127,6 @@ class App:
         started = False
         try:
             if self.stop_event.is_set():
-                return
-            if not self._wait_batch_pause_if_needed("FB"):
                 return
             started = True
             profile_id = None
@@ -5849,6 +8235,30 @@ class App:
                 return
     
             self._set_fb_status(item_id, "LOGIN OK")
+            if SKIP_DOWNLOAD_UPLOAD:
+                try:
+                    followers = None
+                    profile_url = ""
+                    posts = None
+                    for attempt in range(3):
+                        followers, profile_url, posts = fetch_followers(driver_path, remote, self._log, acc.get("uid", ""))
+                        if followers is not None or posts is not None:
+                            break
+                        time.sleep(2 + attempt)
+                    if followers is not None or posts is not None:
+                        if followers is not None:
+                            self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                        if posts is not None:
+                            self._log(f"[{acc['uid']}] POSTS: {posts}")
+                        self._set_fb_profile_info(item_id, profile_url, followers, posts)
+                        self._maybe_check_creator_fund(driver_path, remote, acc, followers, "FB")
+                        self._set_fb_status(item_id, "FOLLOW OK")
+                    else:
+                        self._set_fb_status(item_id, "FOLLOW ERR")
+                        self._log(f"[{acc['uid']}] FOLLOW ERR")
+                except Exception as e:
+                    self._log(f"[{acc['uid']}] FOLLOW ERR: {e}")
+                return
             success_count = 0
             safety_guard = 0
             while success_count < max_videos:
@@ -5861,7 +8271,7 @@ class App:
                 self.operation_delayer.delay_before_download(acc["uid"], self._log_progress)
                 ok_next, row = get_next_unuploaded(acc["uid"])
                 if not ok_next:
-                    self._set_fb_status(item_id, "HẾT VIDEO")
+                    self._set_fb_status(item_id, "NO VIDEO")
                     break
                 row_url = (row.get("url") or "").strip()
                 row_id = (row.get("video_id") or "").strip()
@@ -5894,7 +8304,7 @@ class App:
                         acc["uid"],
                         row_url,
                         self._log_progress,
-                        cookie_path=os.path.join(_THIS_DIR, "cookiefb.txt"),
+                        cookie_path=os.path.join(DATA_DIR, "cookiefb.txt"),
                         timeout_s=30,
                     )
                     if ok_dl:
@@ -5948,6 +8358,7 @@ class App:
                     self._record_failed(item_id, acc, f"DOWNLOAD ERR: {err_text}")
                     break
     
+                title = self._ensure_title(title, 1000)
                 if title:
                     try:
                         title = self._format_fb_title_case1(title)
@@ -5974,8 +8385,13 @@ class App:
                             continue
                 except Exception:
                     pass
+                title = self._ensure_title(title, 1000)
+                if vid_id and title:
+                    try:
+                        update_title_if_empty(acc["uid"], vid_id, title)
+                    except Exception:
+                        pass
                 caption = self._build_caption(title, 1000)
-                self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
                 with self.upload_retry_semaphore:
                     ok_p = False
                     drv = None
@@ -5988,25 +8404,23 @@ class App:
                         for attempt in range(3):
                             if self.stop_event.is_set():
                                 break
-                            driver_key = f"{acc['uid']}_upload"
                             try:
-                                with self.dialog_lock_pool.acquire(driver_key, timeout=60):
-                                    ok_p, drv, up_status, up_msg = upload_prepare(
-                                        driver_path,
-                                        remote,
-                                        path_or_err,
-                                        caption,
-                                        lambda: self.stop_event.is_set(),
-                                        self._log,
-                                        acc.get("uid", ""),
-                                        max_total_s=360,
-                                        file_dialog_semaphore=self.file_dialog_semaphore,
-                                    )
+                                ok_p, drv, up_status, up_msg = upload_prepare(
+                                    driver_path,
+                                    remote,
+                                    path_or_err,
+                                    caption,
+                                    lambda: self.stop_event.is_set(),
+                                    self._log,
+                                    acc.get("uid", ""),
+                                    max_total_s=360,
+                                    file_dialog_semaphore=None,
+                                )
                             except Exception as e:
                                 up_msg = f"Lock timeout: {e}"
                             if ok_p:
                                 break
-                            if up_status in ("dialog_lock_timeout", "caption_error", "dialog_error", "timeout", "unexpected_error", "error") and attempt < 2:
+                            if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error") and attempt < 2:
                                 if up_status == "caption_error":
                                     caption = self._next_caption_after_error(caption, 1000)
                                     self._log(f"[{acc['uid']}] Caption error -> switched fallback caption for retry")
@@ -6144,7 +8558,7 @@ class App:
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
                 self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
-            self._clear_failed_log()
+            # keep failed log
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = int(self._repeat_delay_sec * 1000)
                 if delay_ms < 0:
@@ -6218,7 +8632,7 @@ class App:
                     )
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_profile_accounts(fl, max_threads))
                     return
-            self._clear_profile_failed_log()
+            # keep profile failed log
 
         threading.Thread(target=_retry_waiter, daemon=True).start()
 
@@ -6471,6 +8885,109 @@ class App:
         except Exception:
             pass
 
+    def _clear_all_gpm_profiles(self) -> None:
+        """Delete all GPM profiles by calling GPM list API (background thread)."""
+        try:
+            popup = tk.Toplevel(self.root)
+            popup.title("GPM Cleanup")
+            popup.geometry("360x120")
+            popup.resizable(False, False)
+            popup.transient(self.root)
+            label = tk.Label(popup, text="Loading GPM profiles...", font=("Segoe UI", 10))
+            label.pack(expand=True, fill="both", padx=12, pady=20)
+            self.root.update_idletasks()
+            try:
+                self.root.update_idletasks()
+                x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 180
+                y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 60
+                popup.geometry(f"+{max(0, x)}+{max(0, y)}")
+            except Exception:
+                pass
+        except Exception:
+            popup = None
+            label = None
+
+        def _set_label(text: str) -> None:
+            try:
+                if label is not None:
+                    label.configure(text=text)
+                    self.root.update_idletasks()
+            except Exception:
+                pass
+
+        def _worker() -> None:
+            ids = []
+            try:
+                page = 1
+                per_page = 5000
+                group = ""
+                while True:
+                    url = f"http://127.0.0.1:19995/api/v3/profiles?page={page}&per_page={per_page}"
+                    resp = requests.get(url, timeout=30)
+                    resp.raise_for_status()
+                    payload = resp.json() if resp.content else {}
+                    items = []
+                    if isinstance(payload, dict):
+                        data = payload.get("data")
+                        if isinstance(data, dict):
+                            items = data.get("data") or data.get("items") or []
+                        elif isinstance(data, list):
+                            items = data
+                    if not items:
+                        break
+                    for item in items:
+                        pid = (item.get("id") or item.get("profile_id") or "").strip()
+                        if pid:
+                            ids.append(pid)
+                    if len(items) < per_page:
+                        break
+                    time.sleep(0.2)
+                    page += 1
+            except Exception as e:
+                self._log(f"[GPM] List profiles error: {e}")
+                self.root.after(0, _set_label, f"List profiles error: {e}")
+                return
+
+            total = len(ids)
+            if total == 0:
+                self._log("[GPM] No profile IDs found to delete")
+                self.root.after(0, _set_label, "No profiles found")
+                return
+
+            self._log(f"[GPM] Deleting {total} profiles...")
+            self.root.after(0, _set_label, f"Deleting 0/{total} profiles...")
+            completed = 0
+            try:
+                with ThreadPoolExecutor(max_workers=10) as ex:
+                    futures = [ex.submit(delete_profile, pid, 10) for pid in ids]
+                    for _f in as_completed(futures):
+                        completed += 1
+                        if completed % 500 == 0 or completed == total:
+                            self.root.after(0, _set_label, f"Deleting {completed}/{total} profiles...")
+            except Exception:
+                # Fallback to sequential delete if executor fails
+                for idx, pid in enumerate(ids, start=1):
+                    try:
+                        delete_profile(pid, 10)
+                    except Exception:
+                        pass
+                    if idx % 500 == 0 or idx == total:
+                        self.root.after(0, _set_label, f"Deleting {idx}/{total} profiles...")
+
+            self.root.after(0, _set_label, "Done")
+            self._log("[GPM] Delete all profiles done")
+            try:
+                time.sleep(0.6)
+            except Exception:
+                pass
+            try:
+                if popup is not None:
+                    self.root.after(0, popup.destroy)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _track_profile_cleanup(self) -> None:
         with self._gpm_cleanup_lock:
             self._gpm_cleanup_count += 1
@@ -6721,6 +9238,7 @@ class App:
                 time.sleep(2 + attempt)
             if followers is not None or posts is not None:
                 self._set_fb_profile_info(item_id, profile_url, followers, posts)
+                self._maybe_check_creator_fund(driver_path, remote, acc, followers, "FB")
                 self._set_fb_status(item_id, "FOLLOW OK")
             else:
                 self._set_fb_status(item_id, "FOLLOW ERR")
@@ -6736,6 +9254,30 @@ class App:
             driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc)
             if not driver_path or not remote:
                 return
+            if SKIP_DOWNLOAD_UPLOAD:
+                try:
+                    followers = None
+                    profile_url = ""
+                    posts = None
+                    for attempt in range(3):
+                        followers, profile_url, posts = fetch_followers(driver_path, remote, self._log, acc.get("uid", ""))
+                        if followers is not None or posts is not None:
+                            break
+                        time.sleep(2 + attempt)
+                    if followers is not None or posts is not None:
+                        if followers is not None:
+                            self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                        if posts is not None:
+                            self._log(f"[{acc['uid']}] POSTS: {posts}")
+                        self._set_profile_info(item_id, profile_url, followers, posts)
+                        self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
+                        self._set_status(item_id, "FOLLOW OK")
+                    else:
+                        self._set_status(item_id, "FOLLOW ERR")
+                        self._log(f"[{acc['uid']}] FOLLOW ERR")
+                except Exception as e:
+                    self._log(f"[{acc['uid']}] FOLLOW ERR: {e}")
+                return
             download_started = threading.Event()
 
             def _idle_watchdog():
@@ -6745,8 +9287,8 @@ class App:
                     return
                 ok_next, row = get_next_unuploaded(acc["uid"])
                 if not ok_next:
-                    self._set_status(item_id, "H?T VIDEO")
-                    self._log(f"[{acc['uid']}] H?T VIDEO: {row.get('msg', 'No URL in CSV')}")
+                    self._set_status(item_id, "NO VIDEO")
+                    self._log(f"[{acc['uid']}] NO VIDEO: {row.get('msg', 'No URL in CSV')}")
                     return
                 self._set_status(item_id, "LOGIN OK (IDLE)")
                 self._log(f"[{acc['uid']}] LOGIN OK (IDLE) - no download started")
@@ -6765,8 +9307,8 @@ class App:
 
                 ok_next, row = get_next_unuploaded(acc["uid"])
                 if not ok_next:
-                    self._set_status(item_id, "H?T VIDEO")
-                    self._log(f"[{acc['uid']}] H?T VIDEO: {row.get('msg', 'No URL in CSV')}")
+                    self._set_status(item_id, "NO VIDEO")
+                    self._log(f"[{acc['uid']}] NO VIDEO: {row.get('msg', 'No URL in CSV')}")
                     return
                 row_url = (row.get("url") or "").strip()
                 row_id = (row.get("video_id") or "").strip()
@@ -6834,7 +9376,7 @@ class App:
                             self._log,
                             acc.get("uid", ""),
                             max_total_s=360,
-                            file_dialog_semaphore=self.file_dialog_semaphore,
+                            file_dialog_semaphore=None,
                         )
                         if ok_p:
                             break
@@ -6892,6 +9434,7 @@ class App:
                             if posts is not None:
                                 self._log(f"[{acc['uid']}] POSTS: {posts}")
                             self._set_profile_info(item_id, profile_url, followers, posts)
+                            self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
                         else:
                             self._log(f"[{acc['uid']}] FOLLOW ERR: empty")
                     except Exception as e:
@@ -6931,6 +9474,7 @@ class App:
                 if posts is not None:
                     self._log(f"[{acc['uid']}] POSTS: {posts}")
                 self._set_profile_info(item_id, profile_url, followers, posts)
+                self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
                 self._set_status(item_id, "FOLLOW OK")
             else:
                 self._set_status(item_id, "FOLLOW ERR")
@@ -7180,11 +9724,10 @@ class App:
                 sem.release()
 
     def stop_jobs(self) -> None:
-        self._clear_all_logs()
         self.stop_event.set()
+        self._set_busy(False)
         self._fixed_threads = None
         self._reset_cycle_count()
-        self._set_pause100_label(0)
         self._stop_next_cycle_countdown()
         try:
             self._resume_pending["upload"] = self._collect_pending_emails(self.tree, {"UPLOAD OK", "DONE"})
@@ -7193,20 +9736,13 @@ class App:
             self._resume_pending["fb_profile"] = self._collect_pending_emails(self.fb_profile_tree, {"DONE"})
         except Exception:
             pass
-        self._reset_batch_pause_state("YTB")
-        self._reset_batch_pause_state("FB")
         if self._repeat_after_id:
             try:
                 self.root.after_cancel(self._repeat_after_id)
             except Exception:
                 pass
             self._repeat_after_id = None
-        with self.failed_accounts_lock:
-            self.failed_accounts = []
-        self._clear_failed_log()
-        with self.profile_failed_lock:
-            self.profile_failed_accounts = []
-        self._clear_profile_failed_log()
+        # Keep failed account history and logs for review
         if self.executor is not None:
             try:
                 self.executor.shutdown(wait=False, cancel_futures=True)
@@ -7251,29 +9787,34 @@ class App:
             pass
 
     def reload_app(self) -> None:
-        self.stop_jobs()
-        self._reset_all_statuses()
-        exe = sys.executable
-        script = os.path.abspath(__file__)
+        if getattr(self, "_reloading", False):
+            return
+        self._reloading = True
         try:
-            subprocess.Popen([exe, script], close_fds=True)
-        except Exception as e:
+            self.stop_jobs()
+            self._reset_all_statuses()
+            self.accounts = self._load_accounts_cache() or self.accounts
+            self._load_rows()
+            self.profile_accounts = self._load_profile_accounts_cache()
+            self._load_profile_rows()
+            self.fb_accounts = self._load_fb_accounts_cache()
+            self._load_fb_rows()
+            self.fb_profile_accounts = self._load_fb_profile_accounts_cache()
+            self._load_fb_profile_rows()
+            self._refresh_stats()
+            self._refresh_manage_emails()
             try:
-                self._log(f"[RELOAD] ERR: {e}")
+                self._log("[RELOAD] Refreshed data.")
             except Exception:
                 pass
-        try:
-            self.root.after(200, self.root.destroy)
-        except Exception:
-            pass
+        finally:
+            self._reloading = False
 
     def _worker_one(self, item_id: str, acc: dict, win_pos: str, win_size: str, max_videos: int) -> None:
         email = (acc.get("uid") or "").strip()
         started = False
         try:
             if self.stop_event.is_set():
-                return
-            if not self._wait_batch_pause_if_needed("YTB"):
                 return
             started = True
     
@@ -7394,6 +9935,30 @@ class App:
                 if ok_login:
                     self._set_status(item_id, "LOGIN OK")
                     self._log(f"[{acc['uid']}] LOGIN OK")
+                    if SKIP_DOWNLOAD_UPLOAD:
+                        try:
+                            followers = None
+                            profile_url = ""
+                            posts = None
+                            for attempt in range(3):
+                                followers, profile_url, posts = fetch_followers(driver_path, remote, self._log, acc.get("uid", ""))
+                                if followers is not None or posts is not None:
+                                    break
+                                time.sleep(2 + attempt)
+                            if followers is not None or posts is not None:
+                                if followers is not None:
+                                    self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
+                                if posts is not None:
+                                    self._log(f"[{acc['uid']}] POSTS: {posts}")
+                                self._set_profile_info(item_id, profile_url, followers, posts)
+                                self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
+                                self._set_status(item_id, "FOLLOW OK")
+                            else:
+                                self._set_status(item_id, "FOLLOW ERR")
+                                self._log(f"[{acc['uid']}] FOLLOW ERR")
+                        except Exception as e:
+                            self._log(f"[{acc['uid']}] FOLLOW ERR: {e}")
+                        return
                     download_started = threading.Event()
                     def _idle_watchdog():
                         if download_started.wait(timeout=30):
@@ -7402,8 +9967,8 @@ class App:
                             return
                         ok_next, row = get_next_unuploaded(acc["uid"])
                         if not ok_next:
-                            self._set_status(item_id, "HẾT VIDEO")
-                            self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
+                            self._set_status(item_id, "NO VIDEO")
+                            self._log(f"[{acc['uid']}] NO VIDEO: {row.get('msg', 'No URL in CSV')}")
                             return
                         self._set_status(item_id, "LOGIN OK (IDLE)")
                         self._log(f"[{acc['uid']}] LOGIN OK (IDLE) - no download started")
@@ -7424,8 +9989,8 @@ class App:
     
                         ok_next, row = get_next_unuploaded(acc["uid"])
                         if not ok_next:
-                            self._set_status(item_id, "HẾT VIDEO")
-                            self._log(f"[{acc['uid']}] HẾT VIDEO: {row.get('msg', 'No URL in CSV')}")
+                            self._set_status(item_id, "NO VIDEO")
+                            self._log(f"[{acc['uid']}] NO VIDEO: {row.get('msg', 'No URL in CSV')}")
                             break
                         row_url = (row.get("url") or "").strip()
                         row_id = (row.get("video_id") or "").strip()
@@ -7548,6 +10113,7 @@ class App:
                         if skip_current:
                             continue
                         if ok_dl:
+                            title = self._ensure_title(title, 1000)
                             if title:
                                 try:
                                     title = self._format_fb_title_case1(title)
@@ -7562,9 +10128,6 @@ class App:
                             self._set_status(item_id, f"DOWNLOAD OK {success_count+1}/{max_videos}")
                             self._log(f"[{acc['uid']}] DOWNLOAD OK")
                             caption = self._build_caption(title, 1000)
-    
-                            # Smart delay before upload
-                            self.operation_delayer.delay_before_upload(acc["uid"], self._log_progress)
     
                             # Use semaphore to limit concurrent uploads
                             with self.upload_retry_semaphore:
@@ -7581,37 +10144,24 @@ class App:
                                         if self.stop_event.is_set():
                                             break
     
-                                        # Use per-driver lock to prevent file dialog conflicts
-                                        driver_key = f"{acc['uid']}_upload"
                                         try:
-                                            with self.dialog_lock_pool.acquire(driver_key, timeout=60):
-                                                ok_p, drv, up_status, up_msg = upload_prepare(
-                                                    driver_path,
-                                                    remote,
-                                                    path_or_err,
-                                                    caption,
-                                                    lambda: self.stop_event.is_set(),
-                                                    self._log,
-                                                    acc.get("uid", ""),
-                                                    max_total_s=360,
-                                                    file_dialog_semaphore=self.file_dialog_semaphore,
-                                                )
+                                            ok_p, drv, up_status, up_msg = upload_prepare(
+                                                driver_path,
+                                                remote,
+                                                path_or_err,
+                                                caption,
+                                                lambda: self.stop_event.is_set(),
+                                                self._log,
+                                                acc.get("uid", ""),
+                                                max_total_s=360,
+                                                file_dialog_semaphore=None,
+                                            )
                                         except Exception as e:
                                             up_msg = f"Lock timeout: {e}"
                                             self._log(f"[{acc['uid']}] Upload lock error: {e}")
     
                                         if ok_p:
                                             break
-    
-                                        # Retry on dialog lock timeout
-                                        if up_status == "dialog_lock_timeout":
-                                            if attempt < 2:
-                                                wait_time = 5  # Wait 5s before retrying dialog lock
-                                                self._log(f"[{acc['uid']}] Dialog lock timeout, retry in {wait_time}s...")
-                                                time.sleep(wait_time)
-                                                continue
-                                            else:
-                                                break
     
                                         # Retry by re-opening upload page on certain failures
                                         if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error"):
@@ -7646,7 +10196,7 @@ class App:
                                     break
     
                             if not ok_p:
-                                if up_status == "account_blocked" or "Kh?ng th?y tr?ng th?i Uploading/Uploaded" in (up_msg or ""):
+                                if up_status == "account_blocked" or "Could not detect Uploading/Uploaded status" in (up_msg or ""):
                                     self._set_status(item_id, "ACCOUNT BLOCKED")
                                     self._log(f"[{acc['uid']}] ACCOUNT BLOCKED - skip retry")
                                     self._record_failed(item_id, acc, "ACCOUNT BLOCKED")
@@ -7673,6 +10223,10 @@ class App:
                                     except Exception:
                                         pass
                                     self._set_profile_info(item_id, purl, foll, posts)
+                                    try:
+                                        self._maybe_check_creator_fund(driver_path, remote, acc, foll, "YTB")
+                                    except Exception:
+                                        pass
                                     self._set_status(item_id, "UPLOAD OK")
                                     self._log(f"[{acc['uid']}] UPLOAD OK")
                                     self._delete_uploaded_video(path_or_err, acc["uid"])
@@ -7743,6 +10297,28 @@ class App:
                 self._mark_run_done("upload", email)
 
 if __name__ == "__main__":
+    # Single-instance guard for frozen app (prevents multiple windows)
+    if getattr(sys, "frozen", False):
+        try:
+            import msvcrt
+            import tempfile
+            import ctypes
+
+            lock_path = os.path.join(tempfile.gettempdir(), "ScoopzTool.lock")
+            _lock_file = open(lock_path, "a+")
+            try:
+                msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except Exception:
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "ScoopzTool is already running.",
+                    "ScoopzTool",
+                    0x00000040,
+                )
+                sys.exit(0)
+        except Exception:
+            pass
+
     root = tk.Tk()
     App(root)
     root.mainloop()
