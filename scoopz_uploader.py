@@ -988,23 +988,6 @@ def upload_prepare(
             except Exception as e:
                 _log(logger, f"[UPLOAD] ✗ Click error: {e}")
                 return False, driver, "select_click_error", f"Select video click error: {e}"
-            
-            _log(logger, f"[UPLOAD] Dialog: calling _select_file_in_dialog('{video_path}', timeout=15)...")
-            watchdog_stop = threading.Event()
-            watchdog = threading.Thread(
-                target=_dialog_watchdog,
-                args=(watchdog_stop, DIALOG_WATCHDOG_SEC, logger),
-                daemon=True,
-            )
-            watchdog.start()
-            try:
-                ok = _select_file_in_dialog(video_path, logger, timeout=15, semaphore=file_dialog_semaphore)
-            finally:
-                watchdog_stop.set()
-            _log(logger, f"[UPLOAD] Dialog: _select_file_in_dialog returned {ok}")
-            if not ok:
-                _close_file_dialog(logger)
-                return False, driver, "dialog_error", "Open dialog failed"
         except Exception as e:
             _log(logger, f"[UPLOAD] Unexpected error: {e}")
             return False, driver, "unexpected_error", f"Unexpected error: {e}"
