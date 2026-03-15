@@ -62,10 +62,58 @@ from followers_fetcher import fetch_followers
 from profile_updater import fetch_youtube_profile_assets_local, fetch_facebook_profile_assets_local, update_profile_from_assets
 from shorts_scanner import scan_shorts_for_email
 from fb_reels_scanner import scan_facebook_reels_for_email, scan_facebook_reels_multi
+from monetization_utils import normalize_payment_status, format_stats_count_map
 from threading_utils import ResourcePool, RetryHelper, ThreadSafeCounter
 from logging_config import initialize_logger
 from rate_limiter import initialize_rate_limiting, get_operation_delayer
 from operation_orchestrator import initialize_orchestrator
+
+
+_PACER_LOCK = threading.Lock()
+_PACER_LAST_TS = {
+    "create_profile": 0.0,
+    "start_profile": 0.0,
+    "login": 0.0,
+}
+
+
+def _humanized_action_pace(action: str, min_gap_s: float, jitter_min_s: float, jitter_max_s: float) -> None:
+    """Global pacing gate to avoid bursty multi-thread browser actions."""
+    with _PACER_LOCK:
+        now = time.time()
+        last = _PACER_LAST_TS.get(action, 0.0)
+        wait_base = max(0.0, min_gap_s - (now - last))
+        _PACER_LAST_TS[action] = now + wait_base
+    if wait_base > 0:
+        time.sleep(wait_base)
+    if jitter_max_s > 0:
+        time.sleep(random.uniform(jitter_min_s, jitter_max_s))
+
+
+_raw_create_profile = create_profile
+_raw_start_profile = start_profile
+_raw_login_scoopz = login_scoopz
+
+
+def _paced_create_profile(*args, **kwargs):
+    _humanized_action_pace("create_profile", min_gap_s=1.2, jitter_min_s=0.25, jitter_max_s=0.8)
+    return _raw_create_profile(*args, **kwargs)
+
+
+def _paced_start_profile(*args, **kwargs):
+    _humanized_action_pace("start_profile", min_gap_s=1.5, jitter_min_s=0.3, jitter_max_s=0.9)
+    return _raw_start_profile(*args, **kwargs)
+
+
+def _paced_login_scoopz(*args, **kwargs):
+    _humanized_action_pace("login", min_gap_s=1.8, jitter_min_s=0.35, jitter_max_s=1.0)
+    return _raw_login_scoopz(*args, **kwargs)
+
+
+# Rebind locally so all existing flows automatically use paced operations.
+create_profile = _paced_create_profile
+start_profile = _paced_start_profile
+login_scoopz = _paced_login_scoopz
 
 
 ACCOUNTS = []
@@ -132,7 +180,7 @@ class App:
         
         # Initialize orchestrator with CONSERVATIVE mode
         # This coordinates all operations: login delays, sequential downloads, serial uploads
-        self.orchestrator = initialize_orchestrator("aggressive", logger=self.error_logger.main_logger.info)
+        self.orchestrator = initialize_orchestrator("balanced", logger=self.error_logger.main_logger.info)
         
         # Initialize rate limiter with conservative strategy
         initialize_rate_limiting("conservative")
@@ -228,6 +276,7 @@ class App:
         self._force_upload_only = False
         self._fixed_threads = None
         self._max_retry_rounds = 1
+        self._upload_retry_rounds = 0
         self._retry_round = 0
         self._profile_retry_round = 0
         self._profile_batch_running = False
@@ -238,6 +287,15 @@ class App:
             "fb_profile": {"done": 0, "total": 0, "emails": set()},
         }
         self._run_counts_lock = threading.Lock()
+        self._runtime_var = tk.StringVar(value="Runtime: 00:00:00")
+        self._perf_var = tk.StringVar(value="Speed: 0.0 acc/min | ETA: -")
+        self._upload_stats_var = tk.StringVar(value="Run: processed 0 | ok 0 | no video 0 | err 0")
+        self._runtime_accum_sec = 0.0
+        self._runtime_started_at = None
+        self._runtime_running = False
+        self._runtime_after_id = None
+        self._upload_outcomes = {}
+        self._upload_stats_lock = threading.Lock()
         self._resume_pending = {
             "upload": set(),
             "profile": set(),
@@ -247,6 +305,8 @@ class App:
         self._count_var = tk.StringVar(value="Total: 0 | YTB: 0 | FB: 0")
         self._profile_count_var = tk.StringVar(value="YTB Profile: 0")
         self._fb_profile_count_var = tk.StringVar(value="FB Profile: 0")
+        self._stats_total_var = tk.StringVar(value="Total: 0")
+        self._stats_breakdown_var = tk.StringVar(value="Creator: - | Payment: -")
         self._follow_sort_after_id = None
         self._job_item_email_map = {}
         self._job_item_email_lock = threading.Lock()
@@ -264,6 +324,13 @@ class App:
         self._auto_scroll_catchup_after_id = {}
         self._last_active_item = {}
         self._pulse_tokens = {}
+        self._search_last_query = ""
+        self._search_last_tab = ""
+        self._search_last_matches = []
+        self._search_cycle_index = -1
+        self.active_channel = tk.StringVar(value="ytb")
+        self._sidebar_buttons = {}
+        self._active_sidebar_key = "overview"
 
         self._apply_theme()
         self._migrate_legacy_data()
@@ -272,6 +339,9 @@ class App:
         self._load_fallback_captions()
         self._load_extra_proxy_list()
         self._start_license_server()
+        self._clear_not_applied_status_cache()
+        self._normalize_payment_status_cache()
+        self._reset_operational_status_cache()
         if CLEAR_CREATOR_FUND_ON_START:
             self._clear_creator_fund_status_cache()
         self.accounts = self._load_accounts_cache() or ACCOUNTS
@@ -288,16 +358,16 @@ class App:
 
     def _apply_theme(self) -> None:
         palette = {
-            "bg": "#F4F6F8",
+            "bg": "#F1F5F9",
             "panel": "#FFFFFF",
-            "border": "#E5E7EB",
-            "text": "#1F2937",
-            "muted": "#6B7280",
-            "accent": "#0F766E",
-            "accent_dark": "#115E59",
+            "border": "#D9E2EC",
+            "text": "#0F172A",
+            "muted": "#64748B",
+            "accent": "#0E7490",
+            "accent_dark": "#155E75",
             "danger": "#B91C1C",
             "danger_dark": "#991B1B",
-            "select_bg": "#E2F2F1",
+            "select_bg": "#E0F2FE",
         }
         self._palette = palette
 
@@ -315,9 +385,12 @@ class App:
         tab_font = ("Segoe UI Semibold", 10)
 
         style.configure("TFrame", background=palette["bg"])
+        style.configure("Panel.TFrame", background=palette["panel"])
         style.configure("TLabel", background=palette["bg"], foreground=palette["text"], font=base_font)
         style.configure("Header.TLabel", background=palette["bg"], foreground=palette["text"], font=title_font)
         style.configure("Subtle.TLabel", background=palette["bg"], foreground=palette["muted"], font=subtitle_font)
+        style.configure("SidebarTitle.TLabel", background=palette["bg"], foreground=palette["muted"], font=("Segoe UI Semibold", 9))
+        style.configure("Panel.TLabel", background=palette["panel"], foreground=palette["text"], font=base_font)
 
         style.configure("TEntry", padding=6, fieldbackground=palette["panel"], foreground=palette["text"])
         style.configure("TButton", padding=(10, 6))
@@ -393,13 +466,33 @@ class App:
             background=palette["panel"],
             foreground=palette["text"],
             font=("Segoe UI Semibold", 10),
-            padding=(10, 8),
+            padding=(12, 9),
             anchor="w",
         )
         style.map(
             "Sidebar.TButton",
             background=[("active", palette["select_bg"])],
             foreground=[("active", palette["text"])],
+        )
+        style.configure(
+            "SidebarActive.TButton",
+            background=palette["accent"],
+            foreground="#FFFFFF",
+            font=("Segoe UI Semibold", 10),
+            padding=(12, 9),
+            anchor="w",
+        )
+        style.map("SidebarActive.TButton", background=[("active", palette["accent_dark"])])
+        style.configure(
+            "Channel.TRadiobutton",
+            background=palette["panel"],
+            foreground=palette["text"],
+            font=("Segoe UI Semibold", 10),
+        )
+        style.map(
+            "Channel.TRadiobutton",
+            foreground=[("selected", palette["accent_dark"]), ("!selected", palette["text"])],
+            background=[("active", palette["panel"])],
         )
 
     def _build_ui(self) -> None:
@@ -464,6 +557,8 @@ class App:
             pass
         self.entry_search_email.bind("<FocusIn>", self._search_focus_in)
         self.entry_search_email.bind("<FocusOut>", self._search_focus_out)
+        self.entry_search_email.bind("<Return>", self._search_email)
+        self.entry_search_email.bind("<Shift-Return>", self._search_email_prev)
         self.btn_search_email = ttk.Button(path_frame, text="FIND", command=self._search_email)
         self.btn_search_email.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(0, 8))
 
@@ -492,18 +587,10 @@ class App:
         self._advanced_frame = ttk.Frame(action_frame)
         self._advanced_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
         self._advanced_frame.columnconfigure(1, weight=1)
-        self.btn_import = ttk.Button(self._advanced_frame, text="IMPORT", command=self.import_accounts)
-        self.btn_import.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
-        self.btn_export = ttk.Button(self._advanced_frame, text="EXPORT", command=self.export_accounts_excel)
-        self.btn_export.grid(row=0, column=1, sticky="ew", pady=(0, 6))
-        self.btn_import_proxy = ttk.Button(self._advanced_frame, text="IMPORT PROXY", command=self.import_proxy_list)
-        self.btn_import_proxy.grid(row=1, column=0, sticky="ew", padx=(0, 6))
-        self.btn_scan = ttk.Button(self._advanced_frame, text="SCAN", command=self.start_scan)
-        self.btn_scan.grid(row=1, column=1, sticky="ew")
         self.btn_clear_videos = ttk.Button(self._advanced_frame, text="CLEAR VIDEOS", command=self.clear_all_email_videos)
-        self.btn_clear_videos.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.btn_clear_videos.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.btn_clear_gpm = ttk.Button(self._advanced_frame, text="CLEAR GPM PROFILES", command=self._clear_all_gpm_profiles)
-        self.btn_clear_gpm.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.btn_clear_gpm.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self._advanced_frame.grid_remove()
 
         status_frame = ttk.Frame(main_container)
@@ -526,14 +613,20 @@ class App:
         self.lbl_cycle = ttk.Label(status_frame, textvariable=self._cycle_var, style="Status.TLabel")
         self.lbl_cycle.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.lbl_next_cycle = ttk.Label(status_frame, textvariable=self._next_cycle_var, style="Status.TLabel")
-        self.lbl_next_cycle.grid(row=1, column=1, sticky="w", pady=(4, 0))
+        self.lbl_next_cycle.grid(row=1, column=1, sticky="w", pady=(4, 0), padx=(6, 0))
+        self.lbl_runtime = ttk.Label(status_frame, textvariable=self._runtime_var, style="Status.TLabel")
+        self.lbl_runtime.grid(row=1, column=2, sticky="w", pady=(4, 0), padx=(10, 0))
+        self.lbl_perf = ttk.Label(status_frame, textvariable=self._perf_var, style="Status.TLabel")
+        self.lbl_perf.grid(row=1, column=3, sticky="w", pady=(4, 0), padx=(10, 0))
+        self.lbl_upload_stats = ttk.Label(status_frame, textvariable=self._upload_stats_var, style="Status.TLabel")
+        self.lbl_upload_stats.grid(row=1, column=4, sticky="w", pady=(4, 0), padx=(10, 0))
 
         ttk.Separator(main_container, orient="horizontal").pack(fill="x", padx=12, pady=(2, 8))
 
         main_body = ttk.Frame(main_container)
         main_body.pack(fill="both", expand=True, padx=8, pady=8)
 
-        sidebar = ttk.Frame(main_body, width=180)
+        sidebar = ttk.Frame(main_body, width=210)
         sidebar.pack(side="left", fill="y", padx=(0, 8))
 
         content = ttk.Frame(main_body)
@@ -568,24 +661,27 @@ class App:
         except Exception:
             self._logo_img = None
 
-        ttk.Label(sidebar, text="MENU", style="Subtle.TLabel").pack(anchor="w", padx=8, pady=(2, 8))
+        ttk.Label(sidebar, text="MENU", style="SidebarTitle.TLabel").pack(anchor="w", padx=8, pady=(2, 8))
+
         nav_items = [
-            ("Overview", self.tab_all),
-            ("YouTube", self.tab_upload),
-            ("Profile", self.tab_profile),
-            ("Facebook", self.tab_fb),
-            ("FB Profile", self.tab_fb_profile),
-            ("Interact", self.tab_interact),
-            ("Monetization", self.tab_stats),
-            ("Manage", self.tab_manage),
+            ("overview", "Overview", self.tab_all),
+            ("upvideo", "UpVideo", self._open_upload_panel),
+            ("profile", "Profile", self._open_profile_panel),
+            ("interact", "Interact", self.tab_interact),
+            ("monetization", "Monetization", self.tab_stats),
+            ("manage", "Manage", self.tab_manage),
         ]
-        for label, tab in nav_items:
-            ttk.Button(
+        self._sidebar_buttons = {}
+        for key, label, target in nav_items:
+            btn = ttk.Button(
                 sidebar,
                 text=label,
                 style="Sidebar.TButton",
-                command=lambda t=tab: self._select_tab(t),
-            ).pack(fill="x", padx=6, pady=4)
+                command=lambda k=key, t=target: self._sidebar_go(k, t),
+            )
+            btn.pack(fill="x", padx=6, pady=4)
+            self._sidebar_buttons[key] = btn
+        self._set_sidebar_active("overview")
 
         all_top = ttk.Frame(self.tab_all)
         all_top.pack(fill="x", padx=8, pady=(8, 4))
@@ -628,9 +724,9 @@ class App:
         self.all_tree.column("pass", width=130)
         self.all_tree.heading("status", text="STATUS")
         self.all_tree.column("status", width=200)
-        self.all_tree.heading("posts", text="POSTS", command=lambda: self._toggle_all_sort("posts"))
+        self.all_tree.heading("posts", text="POSTS")
         self.all_tree.column("posts", width=70, anchor="center")
-        self.all_tree.heading("followers", text="FOLLOWERS", command=lambda: self._toggle_all_sort("followers"))
+        self.all_tree.heading("followers", text="FOLLOWERS")
         self.all_tree.column("followers", width=90, anchor="center")
         self.all_tree.heading("proxy", text="PROXY")
         self.all_tree.column("proxy", width=260)
@@ -646,9 +742,11 @@ class App:
             self.all_tree.yview(*args)
 
         all_scroll = ttk.Scrollbar(all_table, orient="vertical", command=_on_all_scroll)
-        self.all_tree.configure(yscrollcommand=all_scroll.set)
+        all_scroll_x = ttk.Scrollbar(all_table, orient="horizontal", command=self.all_tree.xview)
+        self.all_tree.configure(yscrollcommand=all_scroll.set, xscrollcommand=all_scroll_x.set)
         self.all_tree.grid(row=0, column=0, sticky="nsew")
         all_scroll.grid(row=0, column=1, sticky="ns")
+        all_scroll_x.grid(row=1, column=0, sticky="ew")
         all_table.grid_rowconfigure(0, weight=1)
         all_table.grid_columnconfigure(0, weight=1)
         self.all_tree.tag_configure("status_ok", foreground="green")
@@ -670,8 +768,28 @@ class App:
         btn_frame_upload = ttk.Frame(self.tab_upload)
         btn_frame_upload.pack(fill="x", padx=8, pady=(8, 4))
 
-        ttk.Button(btn_frame_upload, text="Select All", command=self._select_all_accounts).pack(side="left", padx=(0, 4))
-        ttk.Button(btn_frame_upload, text="Deselect All", command=self._deselect_all_accounts).pack(side="left")
+        ttk.Button(btn_frame_upload, text="IMPORT", command=self._import_active_upload_accounts).pack(side="left")
+        ttk.Button(btn_frame_upload, text="Select All", command=self._select_all_active_upload_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(btn_frame_upload, text="Deselect All", command=self._deselect_all_active_upload_accounts).pack(side="left")
+        ttk.Button(btn_frame_upload, text="EXPORT", command=self._export_active_upload_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(btn_frame_upload, text="SCAN", command=self._scan_active_upload_accounts).pack(side="left")
+        ttk.Label(btn_frame_upload, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
+        ttk.Radiobutton(
+            btn_frame_upload,
+            text="YTB",
+            value="ytb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(
+            btn_frame_upload,
+            text="FB",
+            value="fb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left")
 
         upload_table = ttk.Frame(self.tab_upload)
         upload_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -709,9 +827,11 @@ class App:
             self.tree.yview(*args)
 
         upload_scroll = ttk.Scrollbar(upload_table, orient="vertical", command=_on_upload_scroll)
-        self.tree.configure(yscrollcommand=upload_scroll.set)
+        upload_scroll_x = ttk.Scrollbar(upload_table, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=upload_scroll.set, xscrollcommand=upload_scroll_x.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         upload_scroll.grid(row=0, column=1, sticky="ns")
+        upload_scroll_x.grid(row=1, column=0, sticky="ew")
         upload_table.grid_rowconfigure(0, weight=1)
         upload_table.grid_columnconfigure(0, weight=1)
         self.tree.tag_configure("status_ok", foreground="green")
@@ -729,6 +849,30 @@ class App:
         self.tree.bind("<MouseWheel>", lambda e, t=self.tree: self._mark_user_scroll(t))
         self.tree.bind("<Button-4>", lambda e, t=self.tree: self._mark_user_scroll(t))
         self.tree.bind("<Button-5>", lambda e, t=self.tree: self._mark_user_scroll(t))
+
+        profile_top = ttk.Frame(self.tab_profile)
+        profile_top.pack(fill="x", padx=8, pady=(8, 0))
+        self.btn_import_profile = ttk.Button(profile_top, text="IMPORT PROFILE", command=self._import_active_profile_accounts)
+        self.btn_import_profile.pack(side="left")
+        ttk.Button(profile_top, text="Select All", command=self._select_all_active_profile_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(profile_top, text="Deselect All", command=self._deselect_all_active_profile_accounts).pack(side="left")
+        ttk.Label(profile_top, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
+        ttk.Radiobutton(
+            profile_top,
+            text="YTB",
+            value="ytb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(
+            profile_top,
+            text="FB",
+            value="fb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left")
 
         profile_table = ttk.Frame(self.tab_profile)
         profile_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -771,15 +915,6 @@ class App:
         self.profile_tree.tag_configure("status_pulse_a", background="#E8F5FF")
         self.profile_tree.tag_configure("status_pulse_b", background="#E4FBEA")
 
-        profile_top = ttk.Frame(self.tab_profile)
-        profile_top.pack(fill="x", padx=8, pady=(8, 0))
-        self.btn_import_profile = ttk.Button(
-            profile_top, text="IMPORT PROFILE", command=self.import_profile_accounts
-        )
-        self.btn_import_profile.pack(side="left")
-        ttk.Button(profile_top, text="Select All", command=self._select_all_profile_accounts).pack(side="left", padx=(8, 4))
-        ttk.Button(profile_top, text="Deselect All", command=self._deselect_all_profile_accounts).pack(side="left")
-
         self.profile_tree.bind("<Button-1>", self._on_profile_tree_click)
         self.profile_tree.bind("<B1-Motion>", self._on_profile_tree_drag)
         self.profile_tree.bind("<ButtonRelease-1>", self._on_profile_tree_release)
@@ -787,6 +922,32 @@ class App:
         self.profile_tree.bind("<MouseWheel>", lambda e, t=self.profile_tree: self._mark_user_scroll(t))
         self.profile_tree.bind("<Button-4>", lambda e, t=self.profile_tree: self._mark_user_scroll(t))
         self.profile_tree.bind("<Button-5>", lambda e, t=self.profile_tree: self._mark_user_scroll(t))
+
+        fb_top = ttk.Frame(self.tab_fb)
+        fb_top.pack(fill="x", padx=8, pady=(8, 0))
+        self.btn_import_fb = ttk.Button(fb_top, text="IMPORT", command=self._import_active_upload_accounts)
+        self.btn_import_fb.pack(side="left")
+        ttk.Button(fb_top, text="Select All", command=self._select_all_active_upload_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(fb_top, text="Deselect All", command=self._deselect_all_active_upload_accounts).pack(side="left")
+        ttk.Button(fb_top, text="EXPORT", command=self._export_active_upload_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(fb_top, text="SCAN", command=self._scan_active_upload_accounts).pack(side="left")
+        ttk.Label(fb_top, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
+        ttk.Radiobutton(
+            fb_top,
+            text="YTB",
+            value="ytb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(
+            fb_top,
+            text="FB",
+            value="fb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left")
 
         fb_table = ttk.Frame(self.tab_fb)
         fb_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -824,9 +985,11 @@ class App:
             self.fb_tree.yview(*args)
 
         fb_scroll = ttk.Scrollbar(fb_table, orient="vertical", command=_on_fb_scroll)
-        self.fb_tree.configure(yscrollcommand=fb_scroll.set)
+        fb_scroll_x = ttk.Scrollbar(fb_table, orient="horizontal", command=self.fb_tree.xview)
+        self.fb_tree.configure(yscrollcommand=fb_scroll.set, xscrollcommand=fb_scroll_x.set)
         self.fb_tree.grid(row=0, column=0, sticky="nsew")
         fb_scroll.grid(row=0, column=1, sticky="ns")
+        fb_scroll_x.grid(row=1, column=0, sticky="ew")
         fb_table.grid_rowconfigure(0, weight=1)
         fb_table.grid_columnconfigure(0, weight=1)
         self.fb_tree.tag_configure("status_ok", foreground="green")
@@ -837,17 +1000,6 @@ class App:
         self.fb_tree.tag_configure("status_pulse_a", background="#E8F5FF")
         self.fb_tree.tag_configure("status_pulse_b", background="#E4FBEA")
 
-        fb_top = ttk.Frame(self.tab_fb)
-        fb_top.pack(fill="x", padx=8, pady=(8, 0))
-        self.btn_import_fb = ttk.Button(
-            fb_top, text="IMPORT FB", command=self.import_fb_accounts
-        )
-        self.btn_import_fb.pack(side="left")
-        ttk.Button(fb_top, text="Select All", command=self._select_all_fb_accounts).pack(side="left", padx=(8, 4))
-        ttk.Button(fb_top, text="Deselect All", command=self._deselect_all_fb_accounts).pack(side="left")
-        ttk.Button(fb_top, text="SORT EMAIL", command=lambda: self._sort_tree_by_column(self.fb_tree, "email")).pack(side="left", padx=(8, 4))
-        ttk.Button(fb_top, text="RESET ORDER", command=lambda: self._reorder_tree_by_accounts(self.fb_tree, self.fb_accounts)).pack(side="left")
-
         self.fb_tree.bind("<Button-1>", self._on_fb_tree_click)
         self.fb_tree.bind("<B1-Motion>", self._on_fb_tree_drag)
         self.fb_tree.bind("<ButtonRelease-1>", self._on_fb_tree_release)
@@ -855,6 +1007,30 @@ class App:
         self.fb_tree.bind("<MouseWheel>", lambda e, t=self.fb_tree: self._mark_user_scroll(t))
         self.fb_tree.bind("<Button-4>", lambda e, t=self.fb_tree: self._mark_user_scroll(t))
         self.fb_tree.bind("<Button-5>", lambda e, t=self.fb_tree: self._mark_user_scroll(t))
+
+        fb_profile_top = ttk.Frame(self.tab_fb_profile)
+        fb_profile_top.pack(fill="x", padx=8, pady=(8, 0))
+        self.btn_import_fb_profile = ttk.Button(fb_profile_top, text="IMPORT PROFILE", command=self._import_active_profile_accounts)
+        self.btn_import_fb_profile.pack(side="left")
+        ttk.Button(fb_profile_top, text="Select All", command=self._select_all_active_profile_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(fb_profile_top, text="Deselect All", command=self._deselect_all_active_profile_accounts).pack(side="left")
+        ttk.Label(fb_profile_top, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
+        ttk.Radiobutton(
+            fb_profile_top,
+            text="YTB",
+            value="ytb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(
+            fb_profile_top,
+            text="FB",
+            value="fb",
+            style="Channel.TRadiobutton",
+            variable=self.active_channel,
+            command=self._on_active_channel_changed,
+        ).pack(side="left")
 
         fb_profile_table = ttk.Frame(self.tab_fb_profile)
         fb_profile_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -896,15 +1072,6 @@ class App:
         self.fb_profile_tree.tag_configure("status_flash", background="#E8F5FF")
         self.fb_profile_tree.tag_configure("status_pulse_a", background="#E8F5FF")
         self.fb_profile_tree.tag_configure("status_pulse_b", background="#E4FBEA")
-
-        fb_profile_top = ttk.Frame(self.tab_fb_profile)
-        fb_profile_top.pack(fill="x", padx=8, pady=(8, 0))
-        self.btn_import_fb_profile = ttk.Button(
-            fb_profile_top, text="IMPORT FB PROFILE", command=self.import_fb_profile_accounts
-        )
-        self.btn_import_fb_profile.pack(side="left")
-        ttk.Button(fb_profile_top, text="Select All", command=self._select_all_fb_profile_accounts).pack(side="left", padx=(8, 4))
-        ttk.Button(fb_profile_top, text="Deselect All", command=self._deselect_all_fb_profile_accounts).pack(side="left")
 
         self.fb_profile_tree.bind("<Button-1>", self._on_fb_profile_tree_click)
         self.fb_profile_tree.bind("<B1-Motion>", self._on_fb_profile_tree_drag)
@@ -952,6 +1119,7 @@ class App:
         stats_top = ttk.Frame(self.tab_stats)
         stats_top.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(stats_top, text="Creator Fund Status", style="Subtle.TLabel").pack(side="left")
+        ttk.Label(stats_top, textvariable=self._stats_total_var, style="Status.TLabel").pack(side="left", padx=(18, 0))
         self.btn_stats_refresh = ttk.Button(stats_top, text="REFRESH", command=self._refresh_stats)
         self.btn_stats_refresh.pack(side="right")
         self.btn_stats_check_payment = ttk.Button(
@@ -960,6 +1128,10 @@ class App:
         self.btn_stats_check_payment.pack(side="right", padx=(0, 8))
         self.btn_stats_check = ttk.Button(stats_top, text="CHECK CREATOR FUND", command=self._stats_check_creator_fund)
         self.btn_stats_check.pack(side="right", padx=(0, 8))
+
+        stats_summary = ttk.Frame(self.tab_stats)
+        stats_summary.pack(fill="x", padx=8, pady=(2, 0))
+        ttk.Label(stats_summary, textvariable=self._stats_breakdown_var, style="Status.TLabel").pack(side="left")
 
         stats_table = ttk.Frame(self.tab_stats)
         stats_table.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1474,6 +1646,24 @@ class App:
     def _on_tab_changed(self, _evt=None) -> None:
         try:
             current = self.notebook.nametowidget(self.notebook.select())
+            if current in (self.tab_upload, self.tab_profile):
+                self.active_channel.set("ytb")
+            elif current in (self.tab_fb, self.tab_fb_profile):
+                self.active_channel.set("fb")
+
+            if current == self.tab_all:
+                self._set_sidebar_active("overview")
+            elif current in (self.tab_upload, self.tab_fb):
+                self._set_sidebar_active("upvideo")
+            elif current in (self.tab_profile, self.tab_fb_profile):
+                self._set_sidebar_active("profile")
+            elif current == self.tab_interact:
+                self._set_sidebar_active("interact")
+            elif current == self.tab_stats:
+                self._set_sidebar_active("monetization")
+            elif current == self.tab_manage:
+                self._set_sidebar_active("manage")
+
             if current == self.tab_stats:
                 self._refresh_stats()
             elif current == self.tab_manage:
@@ -1481,13 +1671,197 @@ class App:
         except Exception:
             pass
 
+    def _set_sidebar_active(self, key: str) -> None:
+        self._active_sidebar_key = key
+        for btn_key, btn in (self._sidebar_buttons or {}).items():
+            try:
+                btn.configure(style="SidebarActive.TButton" if btn_key == key else "Sidebar.TButton")
+            except Exception:
+                pass
+
+    def _sidebar_go(self, key: str, target) -> None:
+        self._set_sidebar_active(key)
+        if callable(target):
+            target()
+        else:
+            self._select_tab(target)
+
     def _select_tab(self, tab) -> None:
         try:
+            if tab in (self.tab_upload, self.tab_profile):
+                self.active_channel.set("ytb")
+            elif tab in (self.tab_fb, self.tab_fb_profile):
+                self.active_channel.set("fb")
             self.notebook.select(tab)
         except Exception:
             pass
 
+    def _channel(self) -> str:
+        ch = (self.active_channel.get() or "ytb").strip().lower()
+        return "fb" if ch == "fb" else "ytb"
+
+    def _import_active_upload_accounts(self) -> None:
+        if self._channel() == "fb":
+            self._select_tab(self.tab_fb)
+            self.import_fb_accounts()
+        else:
+            self._select_tab(self.tab_upload)
+            self.import_accounts()
+
+    def _select_all_active_upload_accounts(self) -> None:
+        if self._channel() == "fb":
+            self._select_all_fb_accounts()
+        else:
+            self._select_all_accounts()
+
+    def _deselect_all_active_upload_accounts(self) -> None:
+        if self._channel() == "fb":
+            self._deselect_all_fb_accounts()
+        else:
+            self._deselect_all_accounts()
+
+    def _import_active_profile_accounts(self) -> None:
+        if self._channel() == "fb":
+            self._select_tab(self.tab_fb_profile)
+            self.import_fb_profile_accounts()
+        else:
+            self._select_tab(self.tab_profile)
+            self.import_profile_accounts()
+
+    def _scan_active_upload_accounts(self) -> None:
+        if self._channel() == "fb":
+            self._select_tab(self.tab_fb)
+        else:
+            self._select_tab(self.tab_upload)
+        self.start_scan()
+
+    def _export_active_upload_accounts(self) -> None:
+        try:
+            import openpyxl  # type: ignore
+        except Exception:
+            messagebox.showerror("Export", "Can phai cai dat openpyxl de xuat file .xlsx")
+            return
+
+        channel = self._channel()
+        default_name = "fb_accounts_export.xlsx" if channel == "fb" else "ytb_accounts_export.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Export accounts to Excel",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel", "*.xlsx")],
+        )
+        if not path:
+            return
+
+        def _to_text(v):
+            if v is None:
+                return ""
+            return str(v)
+
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            if channel == "fb":
+                ws.title = "FACEBOOK"
+                headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "FACEBOOK", "PROFILE_URL", "PROFILE_ID"]
+                ws.append(headers)
+                items = list(self.fb_tree.get_children()) if hasattr(self, "fb_tree") else []
+                for idx, iid in enumerate(items, start=1):
+                    ws.append(
+                        [
+                            idx,
+                            _to_text(self.fb_tree.set(iid, "email")),
+                            _to_text(self.fb_tree.set(iid, "pass")),
+                            _to_text(self.fb_tree.set(iid, "posts")),
+                            _to_text(self.fb_tree.set(iid, "followers")),
+                            _to_text(self.fb_tree.set(iid, "proxy")),
+                            _to_text(self.fb_tree.set(iid, "facebook")),
+                            _to_text(self.fb_tree.set(iid, "profile_url")),
+                            _to_text(self.fb_tree.set(iid, "profile_id")),
+                        ]
+                    )
+            else:
+                ws.title = "YOUTUBE"
+                headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "YOUTUBE", "PROFILE_URL", "PROFILE_ID"]
+                ws.append(headers)
+                items = list(self.tree.get_children()) if hasattr(self, "tree") else []
+                for idx, iid in enumerate(items, start=1):
+                    ws.append(
+                        [
+                            idx,
+                            _to_text(self.tree.set(iid, "email")),
+                            _to_text(self.tree.set(iid, "pass")),
+                            _to_text(self.tree.set(iid, "posts")),
+                            _to_text(self.tree.set(iid, "followers")),
+                            _to_text(self.tree.set(iid, "proxy")),
+                            _to_text(self.tree.set(iid, "youtube")),
+                            _to_text(self.tree.set(iid, "profile_url")),
+                            _to_text(self.tree.set(iid, "profile_id")),
+                        ]
+                    )
+
+            wb.save(path)
+            self._log(f"[EXPORT] Saved {len(items)} {channel.upper()} accounts -> {path}")
+            messagebox.showinfo("Export", f"Da xuat xong file:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export", f"Loi xuat file: {e}")
+
+    def _select_all_active_profile_accounts(self) -> None:
+        if self._channel() == "fb":
+            self._select_all_fb_profile_accounts()
+        else:
+            self._select_all_profile_accounts()
+
+    def _deselect_all_active_profile_accounts(self) -> None:
+        if self._channel() == "fb":
+            self._deselect_all_fb_profile_accounts()
+        else:
+            self._deselect_all_profile_accounts()
+
+    def _open_upload_panel(self) -> None:
+        self._set_sidebar_active("upvideo")
+        if self._channel() == "fb":
+            self._select_tab(self.tab_fb)
+        else:
+            self._select_tab(self.tab_upload)
+
+    def _open_profile_panel(self) -> None:
+        self._set_sidebar_active("profile")
+        if self._channel() == "fb":
+            self._select_tab(self.tab_fb_profile)
+        else:
+            self._select_tab(self.tab_profile)
+
+    def _on_active_channel_changed(self) -> None:
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except Exception:
+            return
+        if current in (self.tab_upload, self.tab_fb):
+            self._open_upload_panel()
+        elif current in (self.tab_profile, self.tab_fb_profile):
+            self._open_profile_panel()
+
+    def _followers_to_int(self, val) -> int:
+        txt = str(val or "").strip().upper().replace(",", "")
+        if not txt:
+            return 0
+        m = re.match(r"^([0-9]+(?:\.[0-9]+)?)([KMB])?$", txt)
+        if m:
+            num = float(m.group(1))
+            suffix = m.group(2)
+            if suffix == "K":
+                num *= 1_000
+            elif suffix == "M":
+                num *= 1_000_000
+            elif suffix == "B":
+                num *= 1_000_000_000
+            return int(num)
+        digits = re.sub(r"[^0-9]", "", txt)
+        return int(digits) if digits else 0
+
     def _refresh_stats(self) -> None:
+        self._normalize_payment_status_cache()
         # Always reload from DB to avoid stale in-memory status
         try:
             fresh_accounts = self._load_cache_list("accounts")
@@ -1498,19 +1872,6 @@ class App:
                 self.fb_accounts = fresh_fb_accounts
         except Exception:
             pass
-        def _to_num(val) -> int:
-            if val is None or val == "":
-                return 0
-            text = str(val).strip()
-            if not text:
-                return 0
-            digits = re.sub(r"[^0-9]", "", text)
-            if not digits:
-                return 0
-            try:
-                return int(digits)
-            except Exception:
-                return 0
 
         try:
             self.stats_tree.delete(*self.stats_tree.get_children())
@@ -1519,24 +1880,26 @@ class App:
 
         rows = []
         for acc in self.accounts:
-            status = (acc.get("creator_fund_status") or "").strip().upper() or "NOT_APPLIED"
-            if status != "PENDING":
+            status = (acc.get("creator_fund_status") or "").strip().upper() or "UNCHECKED"
+            followers = self._followers_to_int(acc.get("followers"))
+            if followers < 1000 and status not in {"PENDING", "JOINED"}:
                 continue
-            payment = (acc.get("payment_status") or "").strip().upper() or "UNKNOWN"
+            payment = self._normalize_payment_status(acc.get("payment_status"))
             email = (acc.get("uid") or "").strip()
-            followers = _to_num(acc.get("followers"))
             if email:
                 rows.append(("YTB", email, followers, status, payment))
 
         for acc in self.fb_accounts:
-            status = (acc.get("creator_fund_status") or "").strip().upper() or "NOT_APPLIED"
-            if status != "PENDING":
+            status = (acc.get("creator_fund_status") or "").strip().upper() or "UNCHECKED"
+            followers = self._followers_to_int(acc.get("followers"))
+            if followers < 1000 and status not in {"PENDING", "JOINED"}:
                 continue
-            payment = (acc.get("payment_status") or "").strip().upper() or "UNKNOWN"
+            payment = self._normalize_payment_status(acc.get("payment_status"))
             email = (acc.get("uid") or "").strip()
-            followers = _to_num(acc.get("followers"))
             if email:
                 rows.append(("FB", email, followers, status, payment))
+
+        rows.sort(key=lambda r: (r[0], -int(r[2]), r[1]))
 
         for idx, (source, email, followers, status, payment) in enumerate(rows, start=1):
             tags = ()
@@ -1544,7 +1907,7 @@ class App:
                 tags = ("status_joined",)
             elif status == "PENDING":
                 tags = ("status_pending",)
-            elif status == "NOT_APPLIED":
+            elif status in ("NOT_APPLIED", "UNCHECKED"):
                 tags = ("status_not_applied",)
             self.stats_tree.insert(
                 "",
@@ -1553,6 +1916,35 @@ class App:
                 values=(idx, source, email, followers, status, payment),
                 tags=tags,
             )
+        self._update_stats_summary()
+
+    def _format_stats_count_map(self, counts: dict, preferred_order: list | None = None) -> str:
+        return format_stats_count_map(counts, preferred_order)
+
+    def _update_stats_summary(self) -> None:
+        try:
+            total = 0
+            status_counts = {}
+            payment_counts = {}
+            for iid in self.stats_tree.get_children():
+                total += 1
+                status = (self.stats_tree.set(iid, "status") or "").strip().upper() or "UNKNOWN"
+                payment = self._normalize_payment_status(self.stats_tree.set(iid, "payment"))
+                status_counts[status] = int(status_counts.get(status, 0)) + 1
+                payment_counts[payment] = int(payment_counts.get(payment, 0)) + 1
+
+            status_text = self._format_stats_count_map(
+                status_counts,
+                preferred_order=["JOINED", "PENDING", "UNCHECKED", "NOT_APPLIED", "CHECKING...", "UNKNOWN"],
+            )
+            payment_text = self._format_stats_count_map(
+                payment_counts,
+                preferred_order=["SETUP", "NOT_SETUP", "CHECK_ERR"],
+            )
+            self._stats_total_var.set(f"Total: {total}")
+            self._stats_breakdown_var.set(f"Creator: {status_text} | Payment: {payment_text}")
+        except Exception:
+            pass
 
     def _find_tree_item_by_email(self, tree: ttk.Treeview, email: str) -> str | None:
         try:
@@ -1563,39 +1955,94 @@ class App:
             pass
         return None
 
+    def _set_stats_row_checking(self, source: str, email: str, checking: bool, status_text: str = "") -> None:
+        def _update() -> None:
+            try:
+                src = (source or "").strip().upper()
+                em = (email or "").strip()
+                if not src or not em:
+                    return
+                target_iid = None
+                for iid in self.stats_tree.get_children():
+                    row_src = (self.stats_tree.set(iid, "source") or "").strip().upper()
+                    row_email = (self.stats_tree.set(iid, "email") or "").strip()
+                    if row_src == src and row_email == em:
+                        target_iid = iid
+                        break
+                if not target_iid:
+                    return
+                if checking:
+                    # Runtime progress text while checking creator fund.
+                    try:
+                        self.stats_tree.set(target_iid, "status", (status_text or "CHECKING...").strip())
+                    except Exception:
+                        pass
+                    self._update_stats_summary()
+                    try:
+                        self.stats_tree.see(target_iid)
+                    except Exception:
+                        pass
+                else:
+                    self._refresh_stats()
+            except Exception:
+                pass
+        try:
+            self.root.after(0, _update)
+        except Exception:
+            pass
+
     def _stats_check_creator_fund(self) -> None:
         if self.executor is not None:
             self._log("[STATS] Dang chay job, hay STOP truoc.")
             return
 
+        # Always work from Monetization rows so behavior matches what user sees.
         selected = self.stats_tree.selection()
         rows = []
-        if selected:
-            for iid in selected:
-                try:
-                    source = (self.stats_tree.set(iid, "source") or "").strip().upper()
-                    email = (self.stats_tree.set(iid, "email") or "").strip()
-                    if source and email:
-                        rows.append((source, email))
-                except Exception:
+        items = selected if selected else self.stats_tree.get_children()
+        for iid in items:
+            try:
+                source = (self.stats_tree.set(iid, "source") or "").strip().upper()
+                email = (self.stats_tree.set(iid, "email") or "").strip()
+                status = (self.stats_tree.set(iid, "status") or "").strip().upper()
+                # Only run check for UNCHECKED/PENDING rows as requested.
+                if status not in {"UNCHECKED", "PENDING"}:
                     continue
-        else:
-            for acc in self.accounts:
-                email = (acc.get("uid") or "").strip()
-                if email:
-                    rows.append(("YTB", email))
-            for acc in self.fb_accounts:
-                email = (acc.get("uid") or "").strip()
-                if email:
-                    rows.append(("FB", email))
+                if source and email:
+                    rows.append((source, email))
+            except Exception:
+                continue
 
         if not rows:
+            self._log("[STATS] No UNCHECKED/PENDING row to check.")
             return
 
-        max_threads = max(1, int(self.entry_threads.get() or 1))
-        pool = ThreadPoolExecutor(max_workers=max_threads)
+        try:
+            max_threads = max(1, int(self.entry_threads.get() or 1))
+        except Exception:
+            max_threads = 1
 
-        for source, email in rows:
+        tasks = []
+
+        # Use same window tiling strategy as upload/payment flows.
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            screen_w, screen_h = 1920, 1080
+        gap = 6
+        taskbar_h = 40
+        usable_w = screen_w - (gap * 2)
+        usable_h = (screen_h - taskbar_h) - (gap * 2)
+        active_count = max(1, min(len(rows), max_threads))
+        cols = min(5, active_count)
+        rows_layout = min(2, max(1, math.ceil(active_count / cols)))
+        win_w = int((usable_w - gap * (cols - 1)) / cols)
+        win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+        win_w = max(150, min(280, win_w))
+        win_h = max(420, min(600, win_h))
+
+        for idx, (source, email) in enumerate(rows):
             acc = None
             item_id = None
             if source == "FB":
@@ -1607,7 +2054,14 @@ class App:
                 if acc is None or item_id is None:
                     self._log(f"[{email}] CREATOR FUND: skip (not found in FB list)")
                     continue
-                pool.submit(self._fb_follow_only_worker, item_id, acc)
+                pos = idx % (cols * rows_layout)
+                col = pos % cols
+                row = pos // cols
+                x = gap + col * (win_w + gap)
+                y = gap + row * (win_h + gap)
+                win_pos = f"{x},{y}"
+                win_size = f"{win_w},{win_h}"
+                tasks.append(("FB", item_id, acc, email, win_pos, win_size))
             else:
                 for a in self.accounts:
                     if (a.get("uid") or "").strip() == email:
@@ -1617,7 +2071,67 @@ class App:
                 if acc is None or item_id is None:
                     self._log(f"[{email}] CREATOR FUND: skip (not found in YTB list)")
                     continue
-                pool.submit(self._follow_only_worker, item_id, acc)
+                pos = idx % (cols * rows_layout)
+                col = pos % cols
+                row = pos // cols
+                x = gap + col * (win_w + gap)
+                y = gap + row * (win_h + gap)
+                win_pos = f"{x},{y}"
+                win_size = f"{win_w},{win_h}"
+                tasks.append(("YTB", item_id, acc, email, win_pos, win_size))
+
+        if not tasks:
+            self._log("[STATS] No valid row to check.")
+            return
+
+        def _run_creator_one(source: str, item_id: str, acc: dict, email: str, win_pos: str, win_size: str) -> None:
+            if self.stop_event.is_set():
+                return
+            self._set_stats_row_checking(source, email, True, "LOGIN...")
+            try:
+                if source == "FB":
+                    self._fb_follow_only_worker(
+                        item_id,
+                        acc,
+                        win_pos=win_pos,
+                        win_size=win_size,
+                        perform_creator_fund_check=True,
+                        force_creator_fund_check=True,
+                        stats_source="FB",
+                        stats_email=email,
+                        skip_follow_fetch=True,
+                    )
+                else:
+                    self._follow_only_worker(
+                        item_id,
+                        acc,
+                        perform_creator_fund_check=True,
+                        force_creator_fund_check=True,
+                        stats_source="YTB",
+                        stats_email=email,
+                        win_pos=win_pos,
+                        win_size=win_size,
+                        skip_follow_fetch=True,
+                    )
+            except Exception as e:
+                self._log(f"[{email}] CREATOR FUND ERR: {e}")
+                self._set_stats_row_checking(source, email, False)
+
+        def _run_creator_tasks() -> None:
+            with ThreadPoolExecutor(max_workers=max_threads) as pool:
+                futures = [
+                    pool.submit(_run_creator_one, source, item_id, acc, email, win_pos, win_size)
+                    for source, item_id, acc, email, win_pos, win_size in tasks
+                ]
+                for fut in as_completed(futures):
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_run_creator_tasks, daemon=True).start()
 
     def _stats_check_payment_setup(self) -> None:
         if self.executor is not None:
@@ -1653,10 +2167,32 @@ class App:
         if not rows:
             return
 
-        max_threads = max(1, int(self.entry_threads.get() or 1))
-        pool = ThreadPoolExecutor(max_workers=max_threads)
+        try:
+            max_threads = max(1, int(self.entry_threads.get() or 1))
+        except Exception:
+            max_threads = 1
 
-        for source, email in rows:
+        tasks = []
+
+        # Use same window tiling strategy as upload/follow flows.
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+        except Exception:
+            screen_w, screen_h = 1920, 1080
+        gap = 6
+        taskbar_h = 40
+        usable_w = screen_w - (gap * 2)
+        usable_h = (screen_h - taskbar_h) - (gap * 2)
+        active_count = max(1, min(len(rows), max_threads))
+        cols = min(5, active_count)
+        rows_layout = min(2, max(1, math.ceil(active_count / cols)))
+        win_w = int((usable_w - gap * (cols - 1)) / cols)
+        win_h = int((usable_h - gap * (rows_layout - 1)) / rows_layout)
+        win_w = max(150, min(280, win_w))
+        win_h = max(420, min(600, win_h))
+
+        for idx, (source, email) in enumerate(rows):
             acc = None
             item_id = None
             if source == "FB":
@@ -1682,7 +2218,44 @@ class App:
                 self._log(f"[{email}] PAYMENT: already SETUP, skip")
                 continue
 
-            pool.submit(self._payment_check_worker, item_id, acc, source)
+            pos = idx % (cols * rows_layout)
+            col = pos % cols
+            row = pos // cols
+            x = gap + col * (win_w + gap)
+            y = gap + row * (win_h + gap)
+            win_pos = f"{x},{y}"
+            win_size = f"{win_w},{win_h}"
+
+            tasks.append((item_id, acc, source, win_pos, win_size))
+
+        if not tasks:
+            self._log("[PAYMENT] No valid row to check.")
+            return
+
+        def _run_payment_one(item_id: str, acc: dict, source: str, win_pos: str, win_size: str) -> None:
+            if self.stop_event.is_set():
+                return
+            try:
+                self._payment_check_worker(item_id, acc, source, win_pos, win_size)
+            except Exception as e:
+                email = (acc.get("uid") or "") if isinstance(acc, dict) else ""
+                self._log(f"[{email}] PAYMENT ERR: {e}")
+
+        def _run_payment_tasks() -> None:
+            with ThreadPoolExecutor(max_workers=max_threads) as pool:
+                futures = [
+                    pool.submit(_run_payment_one, item_id, acc, source, win_pos, win_size)
+                    for item_id, acc, source, win_pos, win_size in tasks
+                ]
+                for fut in as_completed(futures):
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        fut.result()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_run_payment_tasks, daemon=True).start()
 
     # === Manage tab helpers ===
     def _email_to_folder(self, email: str) -> str:
@@ -2963,6 +3536,10 @@ class App:
                     row.get("profile_id", ""),
                 ),
             )
+            try:
+                self._apply_status_tag(str(idx), row.get("status", "READY"))
+            except Exception:
+                pass
         self._update_counts()
         self._apply_row_striping(self.tree)
         self._load_all_rows(only_errors=self._all_filter_active)
@@ -2986,6 +3563,10 @@ class App:
                     row.get("status", "READY"),
                 ),
             )
+            try:
+                self._apply_profile_status_tag(str(idx), row.get("status", "READY"))
+            except Exception:
+                pass
         self._update_counts()
         self._apply_row_striping(self.profile_tree)
 
@@ -3012,6 +3593,10 @@ class App:
                     row.get("profile_id", ""),
                 ),
             )
+            try:
+                self._apply_fb_status_tag(str(idx), row.get("status", "READY"))
+            except Exception:
+                pass
         self._update_counts()
         self._apply_row_striping(self.fb_tree)
         self._load_all_rows(only_errors=self._all_filter_active)
@@ -3034,6 +3619,28 @@ class App:
             rows.append(("YTB", acc))
         for acc in (getattr(self, "fb_accounts", None) or []):
             rows.append(("FB", acc))
+
+        def _followers_to_num(val) -> int:
+            txt = str(val or "").strip().upper().replace(",", "")
+            if not txt:
+                return -1
+            m = re.match(r"^([0-9]+(?:\.[0-9]+)?)([KMB])?$", txt)
+            if m:
+                num = float(m.group(1))
+                suffix = m.group(2)
+                if suffix == "K":
+                    num *= 1_000
+                elif suffix == "M":
+                    num *= 1_000_000
+                elif suffix == "B":
+                    num *= 1_000_000_000
+                return int(num)
+            digits = re.sub(r"[^0-9]", "", txt)
+            return int(digits) if digits else -1
+
+        # Overview fixed priority: highest followers first
+        rows.sort(key=lambda pair: _followers_to_num((pair[1] or {}).get("followers")), reverse=True)
+
         for idx, (social, row) in enumerate(rows, start=1):
             chk = cached_chk.get((social, row.get("uid", "")), "v")
             posts = row.get("posts", "")
@@ -3067,6 +3674,10 @@ class App:
                     row.get("profile_id", ""),
                 ),
             )
+            try:
+                self._apply_all_status_tag(str(idx), status_val)
+            except Exception:
+                pass
 
         self._apply_row_striping(self.all_tree)
 
@@ -3114,6 +3725,7 @@ class App:
             )
         except Exception:
             pass
+        self._update_perf_label()
 
     def _unique_count(self, accounts: list) -> int:
         try:
@@ -3180,6 +3792,148 @@ class App:
         except Exception:
             pass
 
+    def _format_hms(self, total_sec: float) -> str:
+        sec = max(0, int(total_sec or 0))
+        hh = sec // 3600
+        mm = (sec % 3600) // 60
+        ss = sec % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+    def _current_runtime_sec(self) -> float:
+        total = float(self._runtime_accum_sec or 0.0)
+        if self._runtime_running and self._runtime_started_at:
+            total += max(0.0, time.time() - float(self._runtime_started_at))
+        return total
+
+    def _set_runtime_label(self) -> None:
+        try:
+            self._runtime_var.set(f"Runtime: {self._format_hms(self._current_runtime_sec())}")
+        except Exception:
+            pass
+
+    def _collect_run_progress(self) -> tuple[int, int]:
+        done = 0
+        total = 0
+        try:
+            with self._run_counts_lock:
+                for rc in self._run_counts.values():
+                    done += int(rc.get("done", 0) or 0)
+                    total += int(rc.get("total", 0) or 0)
+        except Exception:
+            pass
+        return max(0, done), max(0, total)
+
+    def _update_perf_label(self) -> None:
+        try:
+            done, total = self._collect_run_progress()
+            elapsed_min = max(0.0, self._current_runtime_sec() / 60.0)
+            speed = (done / elapsed_min) if elapsed_min > 0.0 and done > 0 else 0.0
+            remaining = max(0, total - done)
+            eta = "-"
+            if remaining == 0 and total > 0:
+                eta = "00:00:00"
+            elif speed > 0:
+                eta_sec = int((remaining / speed) * 60.0)
+                eta = self._format_hms(eta_sec)
+            self._perf_var.set(f"Speed: {speed:.1f} acc/min | ETA: {eta}")
+        except Exception:
+            pass
+
+    def _runtime_tick(self) -> None:
+        self._set_runtime_label()
+        self._update_perf_label()
+        if not self._runtime_running:
+            self._runtime_after_id = None
+            return
+        try:
+            self._runtime_after_id = self.root.after(1000, self._runtime_tick)
+        except Exception:
+            self._runtime_after_id = None
+
+    def _runtime_start(self) -> None:
+        if self._runtime_running:
+            return
+        self._runtime_running = True
+        self._runtime_started_at = time.time()
+        if not self._runtime_after_id:
+            self._runtime_tick()
+
+    def _runtime_pause(self) -> None:
+        if not self._runtime_running:
+            return
+        if self._runtime_started_at:
+            self._runtime_accum_sec += max(0.0, time.time() - float(self._runtime_started_at))
+        self._runtime_started_at = None
+        self._runtime_running = False
+        if self._runtime_after_id:
+            try:
+                self.root.after_cancel(self._runtime_after_id)
+            except Exception:
+                pass
+            self._runtime_after_id = None
+        self._set_runtime_label()
+        self._update_perf_label()
+
+    def _reset_upload_cycle_stats(self) -> None:
+        try:
+            with self._upload_stats_lock:
+                self._upload_outcomes = {}
+            self._upload_stats_var.set("Run: processed 0 | ok 0 | no video 0 | err 0")
+        except Exception:
+            pass
+
+    def _update_upload_stats_label(self) -> None:
+        ok = 0
+        no_video = 0
+        err = 0
+        processed = 0
+        try:
+            with self._upload_stats_lock:
+                processed = len(self._upload_outcomes)
+                for cat in self._upload_outcomes.values():
+                    if cat == "ok":
+                        ok += 1
+                    elif cat == "no_video":
+                        no_video += 1
+                    elif cat == "err":
+                        err += 1
+            self._upload_stats_var.set(
+                f"Run: processed {processed} | ok {ok} | no video {no_video} | err {err}"
+            )
+        except Exception:
+            pass
+
+    def _classify_upload_status(self, status: str) -> str:
+        text = (status or "").strip().upper()
+        if not text:
+            return ""
+        if "NO VIDEO" in text:
+            return "no_video"
+        if "UPLOAD OK" in text:
+            return "ok"
+        if any(k in text for k in ["ERR", "ERROR", "FAIL", "BLOCKED", "LOI"]):
+            return "err"
+        return ""
+
+    def _record_upload_status(self, social: str, email: str, status: str) -> None:
+        social_u = (social or "").strip().upper()
+        email_s = (email or "").strip()
+        if social_u not in {"YTB", "FB"} or not email_s:
+            return
+        cat = self._classify_upload_status(status)
+        if not cat:
+            return
+        key = f"{social_u}:{email_s}"
+        try:
+            with self._upload_stats_lock:
+                prev = self._upload_outcomes.get(key)
+                if prev == cat:
+                    return
+                self._upload_outcomes[key] = cat
+            self._update_upload_stats_label()
+        except Exception:
+            pass
+
     def _stop_next_cycle_countdown(self) -> None:
         if self._repeat_countdown_after_id:
             try:
@@ -3219,6 +3973,7 @@ class App:
     def _increment_cycle(self) -> None:
         self._cycle_count = max(0, int(self._cycle_count or 0)) + 1
         self._set_cycle_label()
+        self._reset_upload_cycle_stats()
 
     def _mark_run_done(self, kind: str, email: str) -> None:
         if not email:
@@ -3239,44 +3994,56 @@ class App:
         if updated:
             self._update_counts()
 
-    def _search_email(self) -> None:
-        q = (self.entry_search_email.get() or "").strip()
-        if not q or q == self._search_placeholder:
-            return
-        q = q.lower()
-        if not q:
-            return
+    def _get_active_search_tree(self):
         if self._is_all_tab():
-            tree = self.all_tree
-            matches = []
-            for iid in tree.get_children():
-                email = (tree.set(iid, "email") or "").strip()
-                if q in email.lower():
-                    matches.append(iid)
-        elif self._is_profile_tab():
-            tree = self.profile_tree
-            rows = self.profile_accounts
-        elif self._is_fb_tab():
-            tree = self.fb_tree
-            rows = self.fb_accounts
-        elif self._is_fb_profile_tab():
-            tree = self.fb_profile_tree
-            rows = self.fb_profile_accounts
-        else:
-            tree = self.tree
-            rows = self.accounts
-        if not self._is_all_tab():
-            matches = []
-            email_to_iid = self._map_email_to_item_id(tree)
-            for row in rows:
-                email = (row.get("uid") or "").strip()
-                if q in email.lower():
-                    iid = email_to_iid.get(email)
-                    if iid:
-                        matches.append(iid)
+            return self.all_tree, "all"
+        if self._is_profile_tab():
+            return self.profile_tree, "profile"
+        if self._is_fb_tab():
+            return self.fb_tree, "fb"
+        if self._is_fb_profile_tab():
+            return self.fb_profile_tree, "fb_profile"
+        return self.tree, "upload"
+
+    def _normalize_search_query(self, q: str) -> str:
+        return re.sub(r"\s+", " ", (q or "").strip().lower())
+
+    def _build_search_groups(self, q: str) -> list[list[str]]:
+        groups = []
+        for part in (q or "").split("|"):
+            tokens = [t for t in re.split(r"\s+", part.strip()) if t]
+            if tokens:
+                groups.append(tokens)
+        return groups
+
+    def _row_matches_search(self, tree: ttk.Treeview, iid: str, groups: list[list[str]]) -> bool:
+        if not groups:
+            return False
+        try:
+            cols = list(tree["columns"])
+        except Exception:
+            cols = []
+        parts = []
+        for c in cols:
+            try:
+                v = (tree.set(iid, c) or "").strip().lower()
+            except Exception:
+                v = ""
+            if v:
+                parts.append(v)
+                parts.append(f"{c}:{v}")
+        text = " | ".join(parts)
+        for tokens in groups:
+            if all(tok in text for tok in tokens):
+                return True
+        return False
+
+    def _focus_search_match(self, tree: ttk.Treeview, matches: list, idx: int, q: str) -> None:
         if not matches:
-            self._log(f"[SEARCH] No match: {q}")
             return
+        idx = max(0, min(idx, len(matches) - 1))
+        self._search_cycle_index = idx
+        target = matches[idx]
         try:
             tree.selection_remove(tree.selection())
         except Exception:
@@ -3287,10 +4054,72 @@ class App:
             except Exception:
                 pass
         try:
-            tree.see(matches[0])
+            tree.focus(target)
         except Exception:
             pass
-        self._log(f"[SEARCH] Found {len(matches)} match(es) for: {q}")
+        try:
+            tree.see(target)
+        except Exception:
+            pass
+        self._log(f"[SEARCH] Found {len(matches)} match(es) for: {q} | focus {idx+1}/{len(matches)}")
+
+    def _search_email(self, _evt=None) -> None:
+        raw_q = (self.entry_search_email.get() or "").strip()
+        if not raw_q or raw_q == self._search_placeholder:
+            return
+        q = self._normalize_search_query(raw_q)
+        if not q:
+            return
+
+        tree, tab_key = self._get_active_search_tree()
+
+        # Repeated FIND with same query/tab cycles to next match.
+        if (
+            self._search_last_query == q
+            and self._search_last_tab == tab_key
+            and self._search_last_matches
+        ):
+            next_idx = (self._search_cycle_index + 1) % len(self._search_last_matches)
+            self._focus_search_match(tree, self._search_last_matches, next_idx, q)
+            return
+
+        groups = self._build_search_groups(q)
+        matches = []
+        try:
+            for iid in tree.get_children():
+                if self._row_matches_search(tree, iid, groups):
+                    matches.append(iid)
+        except Exception:
+            matches = []
+
+        self._search_last_query = q
+        self._search_last_tab = tab_key
+        self._search_last_matches = matches
+        self._search_cycle_index = -1
+
+        if not matches:
+            self._log(f"[SEARCH] No match: {q}")
+            return
+
+        self._focus_search_match(tree, matches, 0, q)
+
+    def _search_email_prev(self, _evt=None) -> None:
+        raw_q = (self.entry_search_email.get() or "").strip()
+        if not raw_q or raw_q == self._search_placeholder:
+            return
+        q = self._normalize_search_query(raw_q)
+        if not q:
+            return
+        tree, tab_key = self._get_active_search_tree()
+        if not (
+            self._search_last_query == q
+            and self._search_last_tab == tab_key
+            and self._search_last_matches
+        ):
+            self._search_email()
+            return
+        prev_idx = (self._search_cycle_index - 1) % len(self._search_last_matches)
+        self._focus_search_match(tree, self._search_last_matches, prev_idx, q)
 
     def _bind_item_email(self, item_id: str, email: str) -> None:
         if not item_id or not email:
@@ -3383,6 +4212,7 @@ class App:
             try:
                 email = self.tree.set(resolved_id, "email")
                 if email:
+                    self._record_upload_status("YTB", email, status)
                     for acc in self.accounts:
                         if acc.get("uid") == email:
                             acc["status"] = status
@@ -3413,7 +4243,13 @@ class App:
             try:
                 email = (self.fb_tree.set(item_id, "email") or "").strip()
                 if email:
+                    self._record_upload_status("FB", email, status)
                     self._update_all_row("FB", email, status=status)
+                    for acc in self.fb_accounts:
+                        if (acc.get("uid") or "").strip() == email:
+                            acc["status"] = status
+                            break
+                    self._save_fb_accounts_cache()
             except Exception:
                 pass
 
@@ -3578,15 +4414,17 @@ class App:
         return
 
     def _toggle_followers_sort_all(self) -> None:
+        if self._is_all_tab():
+            self._sort_state["followers_all"] = "desc"
+            self._sort_tree_by_column(self.all_tree, "followers", descending=True)
+            return
         state = self._sort_state.get("followers_all")
         if state == "desc":
             self._sort_state["followers_all"] = "asc"
-            if self._is_all_tab():
-                self._sort_tree_by_column(self.all_tree, "followers", descending=False)
-            elif self._is_fb_tab():
+            if self._is_fb_tab():
                 self._sort_tree_by_column(self.fb_tree, "followers", descending=False)
             else:
-                self._sort_accounts_by_followers(descending=False)
+                self._sort_tree_by_column(self.tree, "followers", descending=False)
             return
         self._sort_state["followers_all"] = "desc"
         if self._is_all_tab():
@@ -3594,7 +4432,7 @@ class App:
         elif self._is_fb_tab():
             self._sort_tree_by_column(self.fb_tree, "followers", descending=True)
         else:
-            self._sort_accounts_by_followers(descending=True)
+            self._sort_tree_by_column(self.tree, "followers", descending=True)
 
     def _sort_accounts_by_followers(self, descending: bool = True) -> None:
         def _to_num(val) -> int:
@@ -3642,6 +4480,84 @@ class App:
     def _release_upload_turn(self, token: int) -> None:
         # Upload queue disabled: no-op.
         return
+
+    def _prepare_upload_with_retry(
+        self,
+        driver_path: str,
+        remote: str,
+        video_path: str,
+        caption: str,
+        acc_email: str,
+        caption_limit: int = 1000,
+    ) -> tuple[bool, object, str, str, str]:
+        ok_p = False
+        drv = None
+        up_status = ""
+        up_msg = ""
+        current_caption = caption
+        retry_reopen = {"caption_error", "dialog_error", "timeout", "unexpected_error", "error"}
+
+        try:
+            self.operation_delayer.delay_before_upload(acc_email, self._log)
+        except Exception:
+            pass
+
+        with self.upload_retry_semaphore:
+            token = self._enqueue_upload_turn()
+            if not self._wait_upload_turn(token):
+                return False, None, "stopped", "stopped", current_caption
+            try:
+                for attempt in range(3):
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        ok_p, drv, up_status, up_msg = upload_prepare(
+                            driver_path,
+                            remote,
+                            video_path,
+                            current_caption,
+                            lambda: self.stop_event.is_set(),
+                            self._log,
+                            acc_email,
+                            max_total_s=360,
+                            file_dialog_semaphore=None,
+                        )
+                    except Exception as e:
+                        up_msg = f"Lock timeout: {e}"
+                        self._log(f"[{acc_email}] Upload lock error: {e}")
+
+                    if ok_p:
+                        break
+
+                    if up_status in retry_reopen and attempt < 2:
+                        if up_status == "caption_error":
+                            current_caption = self._next_caption_after_error(current_caption, caption_limit)
+                            self._log(f"[{acc_email}] Caption error -> switched fallback caption for retry")
+                        wait_time = 2 + attempt
+                        self._log(f"[{acc_email}] Upload page retry {attempt+1}/2 in {wait_time}s (status={up_status})")
+                        time.sleep(wait_time)
+                        continue
+
+                    if up_status in ("select_not_found", "select_click_error") and attempt < 2:
+                        wait_time = min(2 ** attempt, 10)
+                        self._log(f"[{acc_email}] Upload retry in {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+
+                    break
+            finally:
+                self._release_upload_turn(token)
+
+        return ok_p, drv, up_status, up_msg, current_caption
+
+    def _post_uploaded_video(self, drv, acc_email: str) -> tuple[str, str, str, str, str]:
+        return upload_post_async(
+            drv,
+            self._log,
+            acc_email=acc_email,
+            max_total_s=180,
+            post_button_semaphore=self.post_button_semaphore,
+        )
 
     def _schedule_follow_sort(self) -> None:
         if self._follow_sort_after_id:
@@ -3857,6 +4773,40 @@ class App:
                     rows.append((social, email))
         except Exception:
             pass
+        return rows
+
+    def _build_mixed_ordered_rows(self, base_rows: list | None = None) -> list:
+        rows = []
+        try:
+            ytb_exists = {str(a.get("uid") or "").strip() for a in self.accounts}
+            fb_exists = {str(a.get("uid") or "").strip() for a in self.fb_accounts}
+
+            if base_rows is None:
+                checked = self._get_checked_all_rows()
+                checked_set = {(str(s or "").strip().upper(), str(e or "").strip()) for s, e in checked}
+                if not checked_set:
+                    return []
+                source_rows = []
+                for iid in self.all_tree.get_children():
+                    social = (self.all_tree.set(iid, "social") or "").strip().upper()
+                    email = (self.all_tree.set(iid, "email") or "").strip()
+                    if (social, email) in checked_set:
+                        source_rows.append((social, email))
+            else:
+                source_rows = [
+                    (str(s or "").strip().upper(), str(e or "").strip())
+                    for s, e in (base_rows or [])
+                ]
+
+            for social, email in source_rows:
+                if not social or not email:
+                    continue
+                if social == "YTB" and email in ytb_exists:
+                    rows.append((social, email))
+                elif social == "FB" and email in fb_exists:
+                    rows.append((social, email))
+        except Exception:
+            return []
         return rows
 
     def _filter_all_errors(self) -> None:
@@ -5624,6 +6574,7 @@ class App:
             # Normalize specific YouTube URLs that should always point to Shorts.
             try:
                 for acc in data:
+                    acc["payment_status"] = self._normalize_payment_status(acc.get("payment_status"))
                     if acc.get("uid") == "opendauria@hotmail.com":
                         yt = (acc.get("youtube") or "").strip()
                         if yt == "https://www.youtube.com/@Vice_Verses":
@@ -5642,7 +6593,14 @@ class App:
         self._save_cache_list("profile_accounts", self.profile_accounts)
 
     def _load_fb_accounts_cache(self) -> list:
-        return self._load_cache_list("fb_accounts")
+        data = self._load_cache_list("fb_accounts")
+        if isinstance(data, list):
+            try:
+                for acc in data:
+                    acc["payment_status"] = self._normalize_payment_status(acc.get("payment_status"))
+            except Exception:
+                pass
+        return data
 
     def _save_fb_accounts_cache(self) -> None:
         self._save_cache_list("fb_accounts", self.fb_accounts)
@@ -5663,6 +6621,63 @@ class App:
                 for acc in data:
                     if "creator_fund_status" in acc:
                         acc.pop("creator_fund_status", None)
+                        updated = True
+                if updated:
+                    self._save_cache_list(key, data)
+        except Exception:
+            pass
+
+    def _clear_not_applied_status_cache(self) -> None:
+        """Remove only NOT_APPLIED creator fund statuses from both YTB and FB cache."""
+        try:
+            for key in ("accounts", "fb_accounts"):
+                data = self._load_cache_list(key)
+                if not isinstance(data, list):
+                    continue
+                updated = False
+                for acc in data:
+                    status = (acc.get("creator_fund_status") or "").strip().upper()
+                    if status == "NOT_APPLIED":
+                        acc.pop("creator_fund_status", None)
+                        updated = True
+                if updated:
+                    self._save_cache_list(key, data)
+        except Exception:
+            pass
+
+    def _normalize_payment_status(self, status: str) -> str:
+        return normalize_payment_status(status)
+
+    def _normalize_payment_status_cache(self) -> None:
+        try:
+            for key in ("accounts", "fb_accounts"):
+                data = self._load_cache_list(key)
+                if not isinstance(data, list):
+                    continue
+                updated = False
+                for acc in data:
+                    cur = (acc.get("payment_status") or "").strip().upper()
+                    nxt = self._normalize_payment_status(cur)
+                    if cur != nxt:
+                        acc["payment_status"] = nxt
+                        updated = True
+                if updated:
+                    self._save_cache_list(key, data)
+        except Exception:
+            pass
+
+    def _reset_operational_status_cache(self) -> None:
+        """Reset runtime statuses for upload/profile tabs when app starts."""
+        try:
+            for key in ("accounts", "profile_accounts", "fb_accounts", "fb_profile_accounts"):
+                data = self._load_cache_list(key)
+                if not isinstance(data, list):
+                    continue
+                updated = False
+                for acc in data:
+                    cur = (acc.get("status") or "").strip().upper()
+                    if cur != "READY":
+                        acc["status"] = "READY"
                         updated = True
                 if updated:
                     self._save_cache_list(key, data)
@@ -5727,10 +6742,7 @@ class App:
     def _should_check_creator_fund(self, acc: dict, followers) -> bool:
         if followers is None or str(followers).strip() == "":
             followers = acc.get("followers")
-        try:
-            fnum = int(re.sub(r"[^0-9]", "", str(followers or "0")) or "0")
-        except Exception:
-            fnum = 0
+        fnum = self._followers_to_int(followers)
         if fnum < 1000:
             return False
         status = (acc.get("creator_fund_status") or "").strip().upper()
@@ -5787,7 +6799,7 @@ class App:
 
     def _set_payment_status(self, acc: dict, source: str, status: str) -> None:
         try:
-            status = (status or "").strip().upper()
+            status = self._normalize_payment_status(status)
             if not status:
                 return
             acc["payment_status"] = status
@@ -5833,6 +6845,8 @@ class App:
         email = (acc.get("uid") or "").strip()
         if not email:
             return
+        if self.stop_event.is_set():
+            return
         with self._creator_fund_lock:
             if email in self._creator_fund_checked:
                 return
@@ -5847,13 +6861,13 @@ class App:
             return
 
         status = ""
-        apply_attempted = False
-        keep_open = False
         options = webdriver.ChromeOptions()
         options.add_experimental_option("debuggerAddress", remote.strip())
         driver = webdriver.Chrome(service=ChromeService(driver_path), options=options)
         wait = WebDriverWait(driver, 12)
         try:
+            if self.stop_event.is_set():
+                return
             def _close_tutorial_if_any() -> None:
                 # Close "How to apply" or other onboarding modal if it appears
                 try:
@@ -5882,17 +6896,10 @@ class App:
                 except Exception:
                     pass
 
-            try:
-                driver.execute_script("window.open('https://thescoopz.com/creator-fund','_blank');")
-                time.sleep(0.6)
-                try:
-                    driver.switch_to.window(driver.window_handles[-1])
-                except Exception:
-                    pass
-            except Exception:
-                pass
             driver.get("https://thescoopz.com/creator-fund")
             time.sleep(2)
+            if self.stop_event.is_set():
+                return
             _close_tutorial_if_any()
             page = driver.page_source or ""
             status = self._creator_fund_status_from_page(page)
@@ -5909,15 +6916,6 @@ class App:
                     self._log(f"[{email}] CREATOR FUND: saved status={status} to DB")
                 except Exception as e:
                     self._log(f"[{email}] CREATOR FUND: save status failed: {e}")
-                try:
-                    self._close_gpm_profile_for_acc(acc)
-                except Exception:
-                    pass
-                try:
-                    driver.execute_script("window.close();")
-                    driver.quit()
-                except Exception:
-                    pass
                 return
 
             # Try to apply
@@ -5948,7 +6946,6 @@ class App:
             except Exception:
                 return
 
-            apply_attempted = True
             self._log(f"[{email}] CREATOR FUND: apply clicked, opening modal")
 
             # Handle tutorial modal: click Next then Done
@@ -6064,15 +7061,6 @@ class App:
                                 self._log(f"[{email}] CREATOR FUND: saved status=PENDING to DB")
                             except Exception as e:
                                 self._log(f"[{email}] CREATOR FUND: save status failed: {e}")
-                            try:
-                                self._close_gpm_profile_for_acc(acc)
-                            except Exception:
-                                pass
-                            try:
-                                driver.execute_script("window.close();")
-                                driver.quit()
-                            except Exception:
-                                pass
                         except Exception:
                             pass
                     except Exception:
@@ -6087,17 +7075,11 @@ class App:
             if not status:
                 with self._creator_fund_lock:
                     self._creator_fund_checked.discard(email)
-            try:
-                if apply_attempted and keep_open:
-                    self._log(f"[{email}] CREATOR FUND: keep browser open for check")
-                else:
-                    driver.quit()
-            except Exception:
-                pass
+            # Session close is handled by caller cleanup to avoid tab flicker and duplicate close actions.
 
-    def _maybe_check_creator_fund(self, driver_path: str, remote: str, acc: dict, followers, source: str) -> None:
+    def _maybe_check_creator_fund(self, driver_path: str, remote: str, acc: dict, followers, source: str, force_check: bool = False) -> None:
         try:
-            if not self._should_check_creator_fund(acc, followers):
+            if (not force_check) and (not self._should_check_creator_fund(acc, followers)):
                 try:
                     email = (acc.get("uid") or "").strip()
                     self._log(f"[{email}] CREATOR FUND: skip (not eligible or already set)")
@@ -6114,14 +7096,21 @@ class App:
             email = (acc.get("uid") or "").strip()
             self._log(f"[{email}] CREATOR FUND ERR: {e}")
 
-    def _payment_check_worker(self, item_id: str, acc: dict, source: str) -> None:
+    def _payment_check_worker(self, item_id: str, acc: dict, source: str, win_pos: str = "", win_size: str = "") -> None:
         if self.stop_event.is_set():
             return
         profile_id = None
         email = (acc.get("uid") or "").strip()
         try:
-            driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc)
+            driver_path, remote, profile_id = self._ensure_logged_in(
+                item_id,
+                acc,
+                win_pos=win_pos if win_pos else None,
+                win_size=win_size if win_size else None,
+            )
             if not driver_path or not remote:
+                return
+            if self.stop_event.is_set():
                 return
             try:
                 from selenium import webdriver
@@ -6137,6 +7126,8 @@ class App:
             wait = WebDriverWait(driver, 12)
             status = "NOT_SETUP"
             try:
+                if self.stop_event.is_set():
+                    return
                 driver.get("https://thescoopz.com/wallet")
                 try:
                     wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
@@ -6752,39 +7743,35 @@ class App:
     def start_all_jobs_mixed(self, snapshot: dict | None = None) -> None:
         if self.executor is not None:
             return
-        if snapshot is None:
-            if self._repeat_cycle_pending:
-                self._repeat_cycle_pending = False
-                self._increment_cycle()
-            else:
-                self._cycle_count = 1
-                self._set_cycle_label()
-            checked = self._get_checked_all_rows()
-            if not checked:
+        self._runtime_start()
+        ordered_rows = self._build_mixed_ordered_rows()
+        if not ordered_rows and snapshot is not None:
+            ordered_rows = self._build_mixed_ordered_rows(list(snapshot.get("ordered_rows") or []))
+        if not ordered_rows:
+            if snapshot is None:
                 messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
-                return
-            checked_set = {(s, e) for s, e in checked}
-            ordered_rows = []
-            for iid in self.all_tree.get_children():
-                social = (self.all_tree.set(iid, "social") or "").strip().upper()
-                email = (self.all_tree.set(iid, "email") or "").strip()
-                if (social, email) in checked_set:
-                    ordered_rows.append((social, email))
-        else:
-            if self._repeat_cycle_pending:
-                self._repeat_cycle_pending = False
-                self._increment_cycle()
             else:
-                self._cycle_count = 1
-                self._set_cycle_label()
-            ordered_rows = list(snapshot.get("ordered_rows") or [])
-            if not ordered_rows:
-                messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
-                return
-        self._from_all_tab = True
+                self._log("[ALL] Skip repeat cycle: khong co du lieu map moi tu YTB/FB.")
+            self._repeat_cycle_pending = False
+            self._from_all_tab = False
+            return
 
         ytb_emails = [email for social, email in ordered_rows if social == "YTB"]
         fb_emails = [email for social, email in ordered_rows if social == "FB"]
+        if not ytb_emails and not fb_emails:
+            self._repeat_cycle_pending = False
+            self._from_all_tab = False
+            return
+
+        if self._repeat_cycle_pending:
+            self._repeat_cycle_pending = False
+            self._increment_cycle()
+        else:
+            self._cycle_count = 1
+            self._set_cycle_label()
+            self._reset_upload_cycle_stats()
+
+        self._from_all_tab = True
         self._set_checked_by_email(self.tree, set(ytb_emails))
         self._set_checked_by_email(self.fb_tree, set(fb_emails))
 
@@ -6814,12 +7801,6 @@ class App:
                 messagebox.showerror("Loi", "Videos phai > 0")
                 return
 
-        if self._repeat_cycle_pending:
-            self._repeat_cycle_pending = False
-            self._increment_cycle()
-        else:
-            self._cycle_count = 1
-            self._set_cycle_label()
         self._fixed_threads = max_threads
         self.stop_event.clear()
         self._retry_round = 0
@@ -6901,12 +7882,11 @@ class App:
         except Exception:
             delay_min = 0
         self._repeat_delay_sec = delay_min * 60.0
-        if snapshot is None:
-            self._all_repeat_snapshot = {
-                "ordered_rows": list(ordered_rows),
-                "max_threads": max_threads,
-                "max_videos": max_videos,
-            }
+        self._all_repeat_snapshot = {
+            "ordered_rows": list(ordered_rows),
+            "max_threads": max_threads,
+            "max_videos": max_videos,
+        }
 
         def _waiter():
             for f in as_completed(futures):
@@ -6919,17 +7899,17 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._all_retry_round < 2:
+                if self._all_retry_round < self._upload_retry_rounds:
                     self._all_retry_round += 1
                     self._log(
-                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._all_retry_round}/2)..."
+                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._all_retry_round}/{self._upload_retry_rounds})..."
                     )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_all_mixed(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[ALL RETRY] Stop retry after 2 rounds (remaining: {len(failed_list)})")
+                self._log(f"[ALL RETRY] Stop retry after {self._upload_retry_rounds} rounds (remaining: {len(failed_list)})")
             # keep failed log
             self._reset_run("upload")
             self._reset_run("fb")
@@ -7020,17 +8000,17 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._all_retry_round < 2:
+                if self._all_retry_round < self._upload_retry_rounds:
                     self._all_retry_round += 1
                     self._log(
-                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._all_retry_round}/2)..."
+                        f"[ALL RETRY] Retrying {len(failed_list)} failed accounts (round {self._all_retry_round}/{self._upload_retry_rounds})..."
                     )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_all_mixed(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[ALL RETRY] Stop retry after 2 rounds (remaining: {len(failed_list)})")
+                self._log(f"[ALL RETRY] Stop retry after {self._upload_retry_rounds} rounds (remaining: {len(failed_list)})")
             # keep failed log
             self._reset_run("upload")
             self._reset_run("fb")
@@ -7060,6 +8040,7 @@ class App:
     def start_jobs(self) -> None:
         if not self._require_license_or_warn():
             return
+        self._runtime_start()
         self._set_busy(True)
         if self._is_all_tab():
             self.start_all_jobs_mixed()
@@ -7114,6 +8095,7 @@ class App:
         else:
             self._cycle_count = 1
             self._set_cycle_label()
+            self._reset_upload_cycle_stats()
         self._retry_round = 0
         # Use exact number of threads (no extra retry threads)
         self.executor = ThreadPoolExecutor(max_workers=max_threads)
@@ -7220,15 +8202,15 @@ class App:
             
             # If failed accounts exist, retry them immediately (only during run)
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < self._max_retry_rounds:
+                if self._retry_round < self._upload_retry_rounds:
                     self._retry_round += 1
                     self._log(
-                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._upload_retry_rounds})..."
                     )
                     # Don't use the last loop's win_pos/win_size; let _retry_failed_accounts calculate its own layout
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
-                self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
+                self._log(f"[RETRY] Stop retry after {self._upload_retry_rounds} rounds (remaining: {len(failed_list)})")
             # keep failed log
 
             if self._from_all_tab and self._all_pending_fb_emails and not self.stop_event.is_set():
@@ -7266,6 +8248,7 @@ class App:
         """Repeat cycle for smooth continuous upload without recalculating layout"""
         if self.executor is not None:
             return
+        self._runtime_start()
         self._increment_cycle()
         
         try:
@@ -7371,14 +8354,14 @@ class App:
 
             # Retry failed accounts
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < self._max_retry_rounds:
+                if self._retry_round < self._upload_retry_rounds:
                     self._retry_round += 1
                     self._log(
-                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._upload_retry_rounds})..."
                     )
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
-                self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
+                self._log(f"[RETRY] Stop retry after {self._upload_retry_rounds} rounds (remaining: {len(failed_list)})")
 
             # keep failed log
 
@@ -7820,6 +8803,8 @@ class App:
     def start_fb_jobs(self) -> None:
         if self.executor is not None:
             return
+        self._runtime_start()
+        self._reset_upload_cycle_stats()
         self._force_close_all_profiles()
         self._reset_all_statuses()
         try:
@@ -7927,17 +8912,17 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < self._max_retry_rounds:
+                if self._retry_round < self._upload_retry_rounds:
                     self._retry_round += 1
                     self._log(
-                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._upload_retry_rounds})..."
                     )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_fb_accounts(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[FB RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
+                self._log(f"[FB RETRY] Stop retry after {self._upload_retry_rounds} rounds (remaining: {len(failed_list)})")
             # keep failed log
             self._reset_run("fb")
             if self._from_all_tab:
@@ -8038,7 +9023,7 @@ class App:
         self._log(f"[FB RETRY] Retrying {len(failed_accounts)} failed accounts...")
         try:
             for item_id, _acc in failed_accounts:
-                self._set_fb_status(item_id, f"RETRY {self._retry_round}/{self._max_retry_rounds}")
+                self._set_fb_status(item_id, f"RETRY {self._retry_round}/{self._upload_retry_rounds}")
         except Exception:
             pass
 
@@ -8086,17 +9071,17 @@ class App:
                 failed_list = self.failed_accounts.copy()
                 self.failed_accounts = []
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < self._max_retry_rounds:
+                if self._retry_round < self._upload_retry_rounds:
                     self._retry_round += 1
                     self._log(
-                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                        f"[FB RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._upload_retry_rounds})..."
                     )
                     self.root.after(
                         1000,
                         lambda fl=failed_list: self._retry_failed_fb_accounts(fl, max_threads, max_videos),
                     )
                     return
-                self._log(f"[FB RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
+                self._log(f"[FB RETRY] Stop retry after {self._upload_retry_rounds} rounds (remaining: {len(failed_list)})")
             # keep failed log
             self._reset_run("fb")
             if self._from_all_tab:
@@ -8251,7 +9236,6 @@ class App:
                         if posts is not None:
                             self._log(f"[{acc['uid']}] POSTS: {posts}")
                         self._set_fb_profile_info(item_id, profile_url, followers, posts)
-                        self._maybe_check_creator_fund(driver_path, remote, acc, followers, "FB")
                         self._set_fb_status(item_id, "FOLLOW OK")
                     else:
                         self._set_fb_status(item_id, "FOLLOW ERR")
@@ -8344,7 +9328,14 @@ class App:
                 if not ok_dl:
                     err_text = str(path_or_err)
                     lower = err_text.lower()
-                    if "video skipped" in lower or "private" in lower or "isn't available" in lower:
+                    if (
+                        "video skipped" in lower
+                        or "private" in lower
+                        or "isn't available" in lower
+                        or "video unavailable" in lower
+                        or "video is unavailable" in lower
+                        or "watch video on youtube" in lower
+                    ):
                         try:
                             mark_uploaded(acc["uid"], mark_id)
                         except Exception:
@@ -8392,57 +9383,26 @@ class App:
                     except Exception:
                         pass
                 caption = self._build_caption(title, 1000)
-                with self.upload_retry_semaphore:
-                    ok_p = False
-                    drv = None
-                    up_status = ""
-                    up_msg = ""
-                    token = self._enqueue_upload_turn()
-                    if not self._wait_upload_turn(token):
-                        return
-                    try:
-                        for attempt in range(3):
-                            if self.stop_event.is_set():
-                                break
-                            try:
-                                ok_p, drv, up_status, up_msg = upload_prepare(
-                                    driver_path,
-                                    remote,
-                                    path_or_err,
-                                    caption,
-                                    lambda: self.stop_event.is_set(),
-                                    self._log,
-                                    acc.get("uid", ""),
-                                    max_total_s=360,
-                                    file_dialog_semaphore=None,
-                                )
-                            except Exception as e:
-                                up_msg = f"Lock timeout: {e}"
-                            if ok_p:
-                                break
-                            if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error") and attempt < 2:
-                                if up_status == "caption_error":
-                                    caption = self._next_caption_after_error(caption, 1000)
-                                    self._log(f"[{acc['uid']}] Caption error -> switched fallback caption for retry")
-                                time.sleep(2 + attempt)
-                                continue
-                            break
-                    finally:
-                        self._release_upload_turn(token)
+                ok_p, drv, up_status, up_msg, caption = self._prepare_upload_with_retry(
+                    driver_path,
+                    remote,
+                    path_or_err,
+                    caption,
+                    acc.get("uid", ""),
+                    caption_limit=1000,
+                )
     
                 if not ok_p:
-                    self._set_fb_status(item_id, f"UPLOAD ERR: {up_msg or up_status}")
-                    self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
+                    if up_status in ("select_not_found", "select_click_error"):
+                        self._set_fb_status(item_id, f"UPLOAD LOI: {up_status}")
+                        self._record_failed(item_id, acc, f"UPLOAD {up_status}")
+                    else:
+                        self._set_fb_status(item_id, f"UPLOAD ERR: {up_msg or up_status}")
+                        self._record_failed(item_id, acc, f"UPLOAD ERR: {up_msg or up_status}")
                     break
     
                 self._set_fb_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
-                st, msg, _purl, _foll, _posts = upload_post_async(
-                    drv,
-                    self._log,
-                    acc_email=acc.get("uid", ""),
-                    max_total_s=180,
-                    post_button_semaphore=self.post_button_semaphore,
-                )
+                st, msg, _purl, _foll, _posts = self._post_uploaded_video(drv, acc.get("uid", ""))
                 if st == "success":
                     try:
                         mark_uploaded(acc["uid"], mark_id)
@@ -8489,7 +9449,7 @@ class App:
         self._clear_status_tags()
         try:
             for item_id, _acc in failed_accounts:
-                self._set_status(item_id, f"RETRY {self._retry_round}/{self._max_retry_rounds}")
+                self._set_status(item_id, f"RETRY {self._retry_round}/{self._upload_retry_rounds}")
         except Exception:
             pass
         
@@ -8550,14 +9510,14 @@ class App:
             except Exception:
                 pass
             if failed_list and not self.stop_event.is_set():
-                if self._retry_round < self._max_retry_rounds:
+                if self._retry_round < self._upload_retry_rounds:
                     self._retry_round += 1
                     self._log(
-                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._max_retry_rounds})..."
+                        f"[RETRY] Retrying {len(failed_list)} failed accounts (round {self._retry_round}/{self._upload_retry_rounds})..."
                     )
                     self.root.after(1000, lambda fl=failed_list: self._retry_failed_accounts(fl, max_threads, max_videos))
                     return
-                self._log(f"[RETRY] Stop retry after {self._max_retry_rounds} rounds (remaining: {len(failed_list)})")
+                self._log(f"[RETRY] Stop retry after {self._upload_retry_rounds} rounds (remaining: {len(failed_list)})")
             # keep failed log
             if self._repeat_enabled and not self.stop_event.is_set():
                 delay_ms = int(self._repeat_delay_sec * 1000)
@@ -8637,7 +9597,7 @@ class App:
         threading.Thread(target=_retry_waiter, daemon=True).start()
 
 
-    def _ensure_logged_in(self, item_id: str, acc: dict):
+    def _ensure_logged_in(self, item_id: str, acc: dict, win_pos: str | None = None, win_size: str | None = None):
         with self.active_drivers_lock:
             info = self.active_drivers.get(item_id)
         if info and info.get("driver_path") and info.get("remote"):
@@ -8672,7 +9632,10 @@ class App:
         self.created_profiles.add(profile_id)
 
         self._set_status(item_id, "START...", profile_id=profile_id)
-        ok_s, data_s, msg_s = start_profile(profile_id)
+        if win_pos is None:
+            ok_s, data_s, msg_s = start_profile(profile_id)
+        else:
+            ok_s, data_s, msg_s = start_profile(profile_id, win_pos=win_pos, win_size=win_size)
         if not ok_s:
             if self._is_proxy_error(msg_s):
                 try:
@@ -8691,8 +9654,8 @@ class App:
                     "upload",
                     self.tree,
                     lambda s: self._set_status(item_id, s),
-                    win_pos=None,
-                    win_size=None,
+                    win_pos=win_pos,
+                    win_size=win_size,
                     created_set="created_profiles",
                 )
                 if new_id and new_data_s:
@@ -9139,11 +10102,24 @@ class App:
         except Exception:
             pass
 
-    def _fb_follow_only_worker(self, item_id: str, acc: dict, win_pos: str = "", win_size: str = "") -> None:
+    def _fb_follow_only_worker(
+        self,
+        item_id: str,
+        acc: dict,
+        win_pos: str = "",
+        win_size: str = "",
+        perform_creator_fund_check: bool = False,
+        force_creator_fund_check: bool = False,
+        stats_source: str = "",
+        stats_email: str = "",
+        skip_follow_fetch: bool = False,
+    ) -> None:
         if self.stop_event.is_set():
             return
         profile_id = None
         try:
+            if stats_source and stats_email:
+                self._set_stats_row_checking(stats_source, stats_email, True, "CREATE...")
             self._set_fb_status(item_id, "CREATE...")
             ok_c = False
             data_c = {}
@@ -9213,6 +10189,8 @@ class App:
             if not (driver_path and remote):
                 return
 
+            if stats_source and stats_email:
+                self._set_stats_row_checking(stats_source, stats_email, True, "LOGIN...")
             self._set_fb_status(item_id, "LOGIN...")
             ok_login, err_login = login_scoopz(
                 driver_path,
@@ -9228,6 +10206,21 @@ class App:
                 self._set_fb_status(item_id, status)
                 return
 
+            if skip_follow_fetch:
+                if perform_creator_fund_check:
+                    if stats_source and stats_email:
+                        self._set_stats_row_checking(stats_source, stats_email, True, "CHECK APPLY...")
+                    self._maybe_check_creator_fund(
+                        driver_path,
+                        remote,
+                        acc,
+                        acc.get("followers"),
+                        "FB",
+                        force_check=force_creator_fund_check,
+                    )
+                self._set_fb_status(item_id, "CHECK DONE")
+                return
+
             followers = None
             profile_url = ""
             posts = None
@@ -9236,15 +10229,48 @@ class App:
                 if followers is not None or posts is not None:
                     break
                 time.sleep(2 + attempt)
+
+            fnum = self._followers_to_int(followers if followers is not None else acc.get("followers"))
+            if stats_source and stats_email:
+                self._set_stats_row_checking(
+                    stats_source,
+                    stats_email,
+                    True,
+                    "ELIGIBLE" if fnum >= 1000 else "NOT_ELIGIBLE",
+                )
+
             if followers is not None or posts is not None:
                 self._set_fb_profile_info(item_id, profile_url, followers, posts)
-                self._maybe_check_creator_fund(driver_path, remote, acc, followers, "FB")
+                if perform_creator_fund_check:
+                    if stats_source and stats_email:
+                        self._set_stats_row_checking(stats_source, stats_email, True, "CHECK APPLY...")
+                    self._maybe_check_creator_fund(
+                        driver_path,
+                        remote,
+                        acc,
+                        followers,
+                        "FB",
+                        force_check=force_creator_fund_check,
+                    )
                 self._set_fb_status(item_id, "FOLLOW OK")
             else:
+                if perform_creator_fund_check:
+                    if stats_source and stats_email:
+                        self._set_stats_row_checking(stats_source, stats_email, True, "CHECK APPLY...")
+                    self._maybe_check_creator_fund(
+                        driver_path,
+                        remote,
+                        acc,
+                        followers,
+                        "FB",
+                        force_check=force_creator_fund_check,
+                    )
                 self._set_fb_status(item_id, "FOLLOW ERR")
         finally:
             if profile_id:
                 self._cleanup_profile_session(item_id, profile_id)
+            if stats_source and stats_email:
+                self._set_stats_row_checking(stats_source, stats_email, False)
 
     def _upload_only_worker(self, item_id: str, acc: dict) -> None:
         if self.stop_event.is_set():
@@ -9270,7 +10296,6 @@ class App:
                         if posts is not None:
                             self._log(f"[{acc['uid']}] POSTS: {posts}")
                         self._set_profile_info(item_id, profile_url, followers, posts)
-                        self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
                         self._set_status(item_id, "FOLLOW OK")
                     else:
                         self._set_status(item_id, "FOLLOW ERR")
@@ -9338,7 +10363,10 @@ class App:
                     lower = err_text.lower()
                     is_skipped = (
                         "video skipped" in lower
+                        or "video unavailable" in lower
+                        or "video is unavailable" in lower
                         or "private video" in lower
+                        or "watch video on youtube" in lower
                         or "sign in if you've been granted access" in lower
                         or "sign in to confirm your age" in lower
                         or "age-restricted" in lower
@@ -9434,7 +10462,6 @@ class App:
                             if posts is not None:
                                 self._log(f"[{acc['uid']}] POSTS: {posts}")
                             self._set_profile_info(item_id, profile_url, followers, posts)
-                            self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
                         else:
                             self._log(f"[{acc['uid']}] FOLLOW ERR: empty")
                     except Exception as e:
@@ -9452,14 +10479,43 @@ class App:
             if profile_id:
                 self._cleanup_profile_session(item_id, profile_id)
 
-    def _follow_only_worker(self, item_id: str, acc: dict) -> None:
+    def _follow_only_worker(
+        self,
+        item_id: str,
+        acc: dict,
+        perform_creator_fund_check: bool = False,
+        force_creator_fund_check: bool = False,
+        stats_source: str = "",
+        stats_email: str = "",
+        win_pos: str | None = None,
+        win_size: str | None = None,
+        skip_follow_fetch: bool = False,
+    ) -> None:
         if self.stop_event.is_set():
             return
         profile_id = None
         try:
-            driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc)
+            if stats_source and stats_email:
+                self._set_stats_row_checking(stats_source, stats_email, True, "LOGIN...")
+            driver_path, remote, profile_id = self._ensure_logged_in(item_id, acc, win_pos=win_pos, win_size=win_size)
             if not driver_path or not remote:
                 return
+
+            if skip_follow_fetch:
+                if perform_creator_fund_check:
+                    if stats_source and stats_email:
+                        self._set_stats_row_checking(stats_source, stats_email, True, "CHECK APPLY...")
+                    self._maybe_check_creator_fund(
+                        driver_path,
+                        remote,
+                        acc,
+                        acc.get("followers"),
+                        "YTB",
+                        force_check=force_creator_fund_check,
+                    )
+                self._set_status(item_id, "CHECK DONE")
+                return
+
             followers = None
             profile_url = ""
             posts = None
@@ -9468,20 +10524,53 @@ class App:
                 if followers is not None or posts is not None:
                     break
                 time.sleep(2 + attempt)
+
+            fnum = self._followers_to_int(followers if followers is not None else acc.get("followers"))
+            if stats_source and stats_email:
+                self._set_stats_row_checking(
+                    stats_source,
+                    stats_email,
+                    True,
+                    "ELIGIBLE" if fnum >= 1000 else "NOT_ELIGIBLE",
+                )
+
             if followers is not None or posts is not None:
                 if followers is not None:
                     self._log(f"[{acc['uid']}] FOLLOWERS: {followers}")
                 if posts is not None:
                     self._log(f"[{acc['uid']}] POSTS: {posts}")
                 self._set_profile_info(item_id, profile_url, followers, posts)
-                self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
+                if perform_creator_fund_check:
+                    if stats_source and stats_email:
+                        self._set_stats_row_checking(stats_source, stats_email, True, "CHECK APPLY...")
+                    self._maybe_check_creator_fund(
+                        driver_path,
+                        remote,
+                        acc,
+                        followers,
+                        "YTB",
+                        force_check=force_creator_fund_check,
+                    )
                 self._set_status(item_id, "FOLLOW OK")
             else:
+                if perform_creator_fund_check:
+                    if stats_source and stats_email:
+                        self._set_stats_row_checking(stats_source, stats_email, True, "CHECK APPLY...")
+                    self._maybe_check_creator_fund(
+                        driver_path,
+                        remote,
+                        acc,
+                        followers,
+                        "YTB",
+                        force_check=force_creator_fund_check,
+                    )
                 self._set_status(item_id, "FOLLOW ERR")
                 self._log(f"[{acc['uid']}] FOLLOW ERR")
         finally:
             if profile_id:
                 self._cleanup_profile_session(item_id, profile_id)
+            if stats_source and stats_email:
+                self._set_stats_row_checking(stats_source, stats_email, False)
 
     def _profile_open_worker(self, item_id: str, acc: dict, win_pos: str, win_size: str) -> None:
         sem = self.profile_semaphore
@@ -9725,6 +10814,7 @@ class App:
 
     def stop_jobs(self) -> None:
         self.stop_event.set()
+        self._runtime_pause()
         self._set_busy(False)
         self._fixed_threads = None
         self._reset_cycle_count()
@@ -9791,20 +10881,37 @@ class App:
             return
         self._reloading = True
         try:
-            self.stop_jobs()
-            self._reset_all_statuses()
-            self.accounts = self._load_accounts_cache() or self.accounts
-            self._load_rows()
-            self.profile_accounts = self._load_profile_accounts_cache()
-            self._load_profile_rows()
-            self.fb_accounts = self._load_fb_accounts_cache()
-            self._load_fb_rows()
-            self.fb_profile_accounts = self._load_fb_profile_accounts_cache()
-            self._load_fb_profile_rows()
-            self._refresh_stats()
-            self._refresh_manage_emails()
             try:
-                self._log("[RELOAD] Refreshed data.")
+                self._log("[RELOAD] Restarting app process...")
+            except Exception:
+                pass
+            self.stop_jobs()
+
+            # Launch a new process first, then close current one.
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable]
+                cwd = os.path.dirname(sys.executable) or _THIS_DIR
+            else:
+                cmd = [sys.executable, os.path.abspath(__file__)]
+                cwd = _THIS_DIR
+
+            subprocess.Popen(cmd, cwd=cwd)
+
+            try:
+                self._log(f"[RELOAD] Spawned new process: {' '.join(cmd)}")
+            except Exception:
+                pass
+            try:
+                self.root.after(200, self.root.destroy)
+            except Exception:
+                self.root.destroy()
+        except Exception as e:
+            try:
+                self._log(f"[RELOAD] ERR: {e}")
+            except Exception:
+                pass
+            try:
+                messagebox.showerror("Reload Error", f"Restart failed: {e}")
             except Exception:
                 pass
         finally:
@@ -9951,7 +11058,6 @@ class App:
                                 if posts is not None:
                                     self._log(f"[{acc['uid']}] POSTS: {posts}")
                                 self._set_profile_info(item_id, profile_url, followers, posts)
-                                self._maybe_check_creator_fund(driver_path, remote, acc, followers, "YTB")
                                 self._set_status(item_id, "FOLLOW OK")
                             else:
                                 self._set_status(item_id, "FOLLOW ERR")
@@ -10045,7 +11151,10 @@ class App:
                             )
                             is_skipped = (
                                 "video skipped" in lower
+                                or "video unavailable" in lower
+                                or "video is unavailable" in lower
                                 or "private video" in lower
+                                or "watch video on youtube" in lower
                                 or "sign in if you've been granted access" in lower
                                 or "sign in to confirm your age" in lower
                                 or "age-restricted" in lower
@@ -10128,72 +11237,21 @@ class App:
                             self._set_status(item_id, f"DOWNLOAD OK {success_count+1}/{max_videos}")
                             self._log(f"[{acc['uid']}] DOWNLOAD OK")
                             caption = self._build_caption(title, 1000)
-    
-                            # Use semaphore to limit concurrent uploads
-                            with self.upload_retry_semaphore:
-                                ok_p = False
-                                drv = None
-                                up_status = ""
-                                up_msg = ""
-                                token = self._enqueue_upload_turn()
-                                if not self._wait_upload_turn(token):
-                                    return
-                                try:
-                                    # Retry with exponential backoff
-                                    for attempt in range(3):
-                                        if self.stop_event.is_set():
-                                            break
-    
-                                        try:
-                                            ok_p, drv, up_status, up_msg = upload_prepare(
-                                                driver_path,
-                                                remote,
-                                                path_or_err,
-                                                caption,
-                                                lambda: self.stop_event.is_set(),
-                                                self._log,
-                                                acc.get("uid", ""),
-                                                max_total_s=360,
-                                                file_dialog_semaphore=None,
-                                            )
-                                        except Exception as e:
-                                            up_msg = f"Lock timeout: {e}"
-                                            self._log(f"[{acc['uid']}] Upload lock error: {e}")
-    
-                                        if ok_p:
-                                            break
-    
-                                        # Retry by re-opening upload page on certain failures
-                                        if up_status in ("caption_error", "dialog_error", "timeout", "unexpected_error", "error"):
-                                            if attempt < 2:
-                                                if up_status == "caption_error":
-                                                    caption = self._next_caption_after_error(caption, 1000)
-                                                    self._log(f"[{acc['uid']}] Caption error -> switched fallback caption for retry")
-                                                wait_time = 2 + attempt
-                                                self._log(f"[{acc['uid']}] Upload page retry {attempt+1}/2 in {wait_time}s (status={up_status})")
-                                                time.sleep(wait_time)
-                                                continue
-                                            else:
-                                                break
-    
-                                        # Don't retry certain errors
-                                        if up_status not in ("select_not_found", "select_click_error"):
-                                            break
-    
-                                        # Backoff before retry
-                                        if attempt < 2:
-                                            wait_time = min(2 ** attempt, 10)  # 2s, 4s
-                                            self._log(f"[{acc['uid']}] Upload retry in {wait_time}s...")
-                                            time.sleep(wait_time)
-                                finally:
-                                    self._release_upload_turn(token)
-    
-                                if not ok_p and up_status in ("select_not_found", "select_click_error"):
-                                    # Upload select not found - add to retry queue and break
-                                    self._set_status(item_id, f"UPLOAD LOI: {up_status}")
-                                    self._log(f"[{acc['uid']}] Upload {up_status} - retry this account")
-                                    self._record_failed(item_id, acc, f"UPLOAD {up_status}")
-                                    break
+                            ok_p, drv, up_status, up_msg, caption = self._prepare_upload_with_retry(
+                                driver_path,
+                                remote,
+                                path_or_err,
+                                caption,
+                                acc.get("uid", ""),
+                                caption_limit=1000,
+                            )
+
+                            if not ok_p and up_status in ("select_not_found", "select_click_error"):
+                                # Upload select not found - add to retry queue and break
+                                self._set_status(item_id, f"UPLOAD LOI: {up_status}")
+                                self._log(f"[{acc['uid']}] Upload {up_status} - retry this account")
+                                self._record_failed(item_id, acc, f"UPLOAD {up_status}")
+                                break
     
                             if not ok_p:
                                 if up_status == "account_blocked" or "Could not detect Uploading/Uploaded status" in (up_msg or ""):
@@ -10210,23 +11268,13 @@ class App:
                                     break
                             else:
                                 self._set_status(item_id, f"POSTING {success_count+1}/{max_videos}...")
-                                st, msg, purl, foll, posts = upload_post_async(
-                                    drv,
-                                    self._log,
-                                    acc_email=acc.get("uid", ""),
-                                    max_total_s=180,
-                                    post_button_semaphore=self.post_button_semaphore,
-                                )
+                                st, msg, purl, foll, posts = self._post_uploaded_video(drv, acc.get("uid", ""))
                                 if st == "success":
                                     try:
                                         mark_uploaded(acc["uid"], mark_id)
                                     except Exception:
                                         pass
                                     self._set_profile_info(item_id, purl, foll, posts)
-                                    try:
-                                        self._maybe_check_creator_fund(driver_path, remote, acc, foll, "YTB")
-                                    except Exception:
-                                        pass
                                     self._set_status(item_id, "UPLOAD OK")
                                     self._log(f"[{acc['uid']}] UPLOAD OK")
                                     self._delete_uploaded_video(path_or_err, acc["uid"])

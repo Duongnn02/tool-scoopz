@@ -86,17 +86,17 @@ class OperationDelayer:
             self.delay_between_downloads = 8.0    # Wait 8s between downloads
             self.delay_between_uploads = 12.0     # Wait 12s between uploads
             self.delay_between_accounts = 4.0     # Wait 4s between switching accounts
-            self.delay_on_error = 15.0            # Wait 15s on error
+            self.delay_on_error_sec = 15.0        # Wait 15s on error
         elif self.strategy == self.STRATEGY_AGGRESSIVE:
             self.delay_between_downloads = 1.0
             self.delay_between_uploads = 2.0
             self.delay_between_accounts = 0.5
-            self.delay_on_error = 3.0
+            self.delay_on_error_sec = 3.0
         else:  # BALANCED
             self.delay_between_downloads = 3.0
             self.delay_between_uploads = 5.0
             self.delay_between_accounts = 1.5
-            self.delay_on_error = 6.0
+            self.delay_on_error_sec = 6.0
     
     def delay_before_download(self, account_id: str, logger: Optional[Callable] = None):
         """Smart delay before downloading."""
@@ -126,7 +126,7 @@ class OperationDelayer:
     def delay_on_error(self, account_id: str, error_type: str, logger: Optional[Callable] = None):
         """Extended delay on error."""
         self.rate_limiter.record_failure(account_id)
-        wait_time = self.delay_on_error
+        wait_time = self.delay_on_error_sec
         if logger:
             logger(f"[{account_id}] Error ({error_type}). Waiting {wait_time:.1f}s...")
         time.sleep(wait_time)

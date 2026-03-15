@@ -11,6 +11,7 @@ from typing import Callable, Tuple, Optional
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, NoSuchElementException, StaleElementReferenceException
@@ -46,6 +47,14 @@ StopChecker = Callable[[], bool]
 
 DIALOG_WATCHDOG_SEC = 45.0
 DIALOG_WATCHDOG_POLL_SEC = 0.5
+
+DEFAULT_SAMPLE_CAPTIONS = [
+    "Check this out",
+    "Worth watching till the end",
+    "Drop your thoughts below",
+    "This one is too good",
+    "Save this for later",
+]
 
 
 def _log(logger: Logger, msg: str) -> None:
@@ -207,6 +216,13 @@ def _sanitize_bmp(text: str) -> str:
     return "".join(ch for ch in text if ord(ch) <= 0xFFFF)
 
 
+def _pick_sample_caption() -> str:
+    try:
+        return random.choice(DEFAULT_SAMPLE_CAPTIONS).strip()
+    except Exception:
+        return "Check this out"
+
+
 def _set_clipboard(text: str) -> bool:
     try:
         root = Tk()
@@ -220,18 +236,88 @@ def _set_clipboard(text: str) -> bool:
         return False
 
 
-def _set_editor_text(driver, editor, text: str) -> None:
+def _editor_current_text(driver, editor) -> str:
+    try:
+        txt = driver.execute_script(
+            "return (arguments[0].innerText || arguments[0].textContent || '').trim();",
+            editor,
+        )
+        return (txt or "").strip()
+    except Exception:
+        try:
+            return (editor.text or "").strip()
+        except Exception:
+            return ""
+
+
+def _set_editor_text(driver, editor, text: str, logger: Logger = None) -> bool:
+    target = (text or "").strip()
+    if not target:
+        return True
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip())
+
+    def _verify() -> bool:
+        cur = _norm(_editor_current_text(driver, editor))
+        tgt = _norm(target)
+        return cur == tgt or tgt in cur
+
+    # Strategy 1: JS set + input/change events (best for TipTap-like editors)
     try:
         driver.execute_script(
-            "arguments[0].innerText = arguments[1];"
-            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+            """
+            const el = arguments[0];
+            const val = arguments[1];
+            el.focus();
+            el.innerText = val;
+            el.textContent = val;
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: val }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ' ' }));
+            """,
             editor,
-            text,
+            target,
         )
-    except Exception:
+        time.sleep(0.15)
+        if _verify():
+            return True
+        _log(logger, "[UPLOAD] Caption strategy#1 not reflected, fallback...")
+    except Exception as e:
+        _log(logger, f"[UPLOAD] Caption strategy#1 failed: {e}")
+
+    # Strategy 2: clear + send_keys
+    try:
         editor.click()
-        time.sleep(0.1)
-        editor.send_keys(text)
+        time.sleep(0.05)
+        editor.send_keys(Keys.CONTROL, "a")
+        time.sleep(0.03)
+        editor.send_keys(Keys.BACKSPACE)
+        time.sleep(0.05)
+        editor.send_keys(target)
+        time.sleep(0.2)
+        if _verify():
+            return True
+        _log(logger, "[UPLOAD] Caption strategy#2 not reflected, fallback...")
+    except Exception as e:
+        _log(logger, f"[UPLOAD] Caption strategy#2 failed: {e}")
+
+    # Strategy 3: clipboard paste (often reliable with rich-text editors)
+    try:
+        if _set_clipboard(target):
+            editor.click()
+            time.sleep(0.05)
+            editor.send_keys(Keys.CONTROL, "a")
+            time.sleep(0.03)
+            editor.send_keys(Keys.CONTROL, "v")
+            time.sleep(0.2)
+            if _verify():
+                return True
+        _log(logger, "[UPLOAD] Caption strategy#3 not reflected")
+    except Exception as e:
+        _log(logger, f"[UPLOAD] Caption strategy#3 failed: {e}")
+
+    return False
 
 
 
@@ -680,10 +766,14 @@ def _is_post_enabled(el) -> bool:
     except Exception:
         pass
     try:
+        aria_disabled = (el.get_attribute("aria-disabled") or "").strip().lower()
+        if aria_disabled in ("true", "1"):
+            return False
+    except Exception:
+        pass
+    try:
         cls = (el.get_attribute("class") or "").lower()
         if "cursor-not-allowed" in cls:
-            return False
-        if "text-gray-600" in cls and "bg-gray-800" in cls:
             return False
     except Exception:
         pass
@@ -935,9 +1025,10 @@ def upload_prepare(
 
         # Acquire exclusive dialog lock (serial mode)
         orchestrator = get_orchestrator()
-        _log(logger, "[UPLOAD] Dialog: waiting for exclusive lock (timeout=30s)...")
-        if not orchestrator.acquire_dialog_lock(acc_email, timeout=30.0):
-            return False, driver, "dialog_lock_timeout", "Could not acquire dialog lock"
+        dialog_lock_timeout_s = 120.0
+        _log(logger, f"[UPLOAD] Dialog: waiting for exclusive lock (timeout={int(dialog_lock_timeout_s)}s)...")
+        if not orchestrator.acquire_dialog_lock(acc_email, timeout=dialog_lock_timeout_s):
+            return False, driver, "dialog_lock_timeout", "Could not acquire dialog lock (another upload is still using it)"
         
         try:
             _log(logger, "[UPLOAD] Dialog: lock acquired")
@@ -956,16 +1047,59 @@ def upload_prepare(
                 _log(logger, "[UPLOAD] Stage 1: Found button via HTML crawl")
             
             if select_btn is None:
-                # Short wait: only 5s (not 15s) - button should already be there
-                _log(logger, "[UPLOAD] Stage 2: Button not found, quick wait 5s...")
+                # Short wait to handle slow initial render.
+                _log(logger, "[UPLOAD] Stage 2: Button not found, quick wait 8s...")
                 try:
                     if _remaining() <= 0:
                         return False, driver, "timeout", "Upload prepare timeout"
-                    wait_5 = WebDriverWait(driver, max(1, int(min(5, _remaining()))))
-                    select_btn = wait_5.until(lambda d: _crawl_html_find_select_button(d, logger) or _find_select_video(d))
+                    wait_8 = WebDriverWait(driver, max(1, int(min(8, _remaining()))))
+                    select_btn = wait_8.until(lambda d: _crawl_html_find_select_button(d, logger) or _find_select_video(d))
                     _log(logger, "[UPLOAD] Stage 2: Button found after short wait")
                 except TimeoutException:
-                    _log(logger, "[UPLOAD] Stage 2: Button not found after 5s - page may have failed to load")
+                    _log(logger, "[UPLOAD] Stage 2: Button not found after 8s")
+                    select_btn = None
+
+            if select_btn is None:
+                # Deep recovery: capture richer diagnostics + poll loop with minor UI nudge.
+                _log(logger, "[UPLOAD] Stage 3: Deep recovery for Select button...")
+                try:
+                    _save_html_snapshot(driver, acc_email, logger, full_page=True)
+                except Exception:
+                    pass
+                try:
+                    _debug_log_all_buttons(driver, logger)
+                except Exception:
+                    pass
+
+                stage3_deadline = time.time() + max(0.0, min(12.0, _remaining()))
+                while time.time() < stage3_deadline and select_btn is None:
+                    try:
+                        driver.execute_script("window.scrollTo(0, 0);")
+                    except Exception:
+                        pass
+                    try:
+                        select_btn = _crawl_html_find_select_button(driver, logger) or _find_select_video(driver)
+                    except Exception:
+                        select_btn = None
+                    if select_btn is not None:
+                        _log(logger, "[UPLOAD] Stage 3: Button found")
+                        break
+                    time.sleep(0.4)
+
+            if select_btn is None:
+                # Final recovery: one lightweight page reload.
+                _log(logger, "[UPLOAD] Stage 4: Reload upload page once and retry selector...")
+                try:
+                    if _remaining() <= 0:
+                        return False, driver, "timeout", "Upload prepare timeout"
+                    driver.get(upload_url)
+                    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                    time.sleep(0.8)
+                    select_btn = _crawl_html_find_select_button(driver, logger) or _find_select_video(driver)
+                    if select_btn is not None:
+                        _log(logger, "[UPLOAD] Stage 4: Button found after reload")
+                except Exception as e:
+                    _log(logger, f"[UPLOAD] Stage 4 failed: {e}")
                     select_btn = None
             
             if select_btn is None:
@@ -1063,6 +1197,9 @@ def upload_prepare(
             return False, driver, "account_blocked", "Account blocked (caption field not found)"
 
         clean_caption = _sanitize_bmp(caption or "")
+        if not clean_caption.strip():
+            clean_caption = _pick_sample_caption()
+            _log(logger, f"[UPLOAD] Empty caption -> using sample caption: {clean_caption}")
         try:
             if _remaining() <= 0:
                 return False, driver, "timeout", "Upload prepare timeout"
@@ -1071,7 +1208,14 @@ def upload_prepare(
             )
             editor.click()
             time.sleep(0.2)
-            _set_editor_text(driver, editor, clean_caption)
+            if not _set_editor_text(driver, editor, clean_caption, logger):
+                # If first caption cannot be reflected, retry once with another sample caption.
+                retry_caption = _pick_sample_caption()
+                if retry_caption == clean_caption:
+                    retry_caption = "Watch till the end"
+                _log(logger, f"[UPLOAD] Caption reflect failed -> retry with sample caption: {retry_caption}")
+                if not _set_editor_text(driver, editor, retry_caption, logger):
+                    return False, driver, "caption_error", "Caption not reflected in editor"
         except Exception as e:
             return False, driver, "caption_error", f"Caption input error: {e}"
 
@@ -1119,6 +1263,33 @@ def upload_post_async(
         def _remaining() -> float:
             return max(0.0, max_total_s - (time.time() - start_time))
 
+        def _nudge_post_ui() -> None:
+            # Nudge UI state when button exists but remains disabled due delayed frontend updates.
+            try:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                pass
+            try:
+                cap = driver.find_element(By.CSS_SELECTOR, "div.tiptap.ProseMirror[contenteditable='true']")
+                _force_click(driver, cap)
+            except Exception:
+                pass
+            try:
+                driver.execute_script("window.scrollBy(0, -120);")
+            except Exception:
+                pass
+
+        def _post_btn_state() -> str:
+            try:
+                btn = _find_post_btn(driver)
+                if btn is None:
+                    return "missing"
+                if _is_post_enabled(btn):
+                    return "enabled"
+                return "disabled"
+            except Exception:
+                return "unknown"
+
         def _find_enabled_post():
             btn = _find_post_btn(driver)
             if btn is None:
@@ -1128,9 +1299,21 @@ def upload_post_async(
         try:
             if _remaining() <= 0:
                 return "timeout", "Post timeout", "", None, None
-            post_btn = WebDriverWait(driver, max(1, int(_remaining()))).until(lambda d: _find_enabled_post())
+            # Phase 1: normal wait.
+            phase1 = max(1, int(min(90, _remaining())))
+            post_btn = WebDriverWait(driver, phase1).until(lambda d: _find_enabled_post())
         except TimeoutException:
-            return "timeout", "Post button not enabled", "", None, None
+            # Phase 2: nudge UI then wait again.
+            _log(logger, "[UPLOAD-POST] Post button still not enabled after phase 1, nudging UI...")
+            _nudge_post_ui()
+            try:
+                if _remaining() <= 0:
+                    return "timeout", "Post timeout", "", None, None
+                phase2 = max(1, int(min(45, _remaining())))
+                post_btn = WebDriverWait(driver, phase2).until(lambda d: _find_enabled_post())
+            except TimeoutException:
+                state = _post_btn_state()
+                return "timeout", f"Post button not enabled (state={state})", "", None, None
 
         # ⭐ SERIAL POST BUTTON HANDLING: Only 1 thread clicks POST at a time
         acquired = False

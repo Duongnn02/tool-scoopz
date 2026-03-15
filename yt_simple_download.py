@@ -108,6 +108,35 @@ def looks_like_need_cookie(err: str) -> bool:
     return any(k in e for k in keywords)
 
 
+def _is_access_restricted_or_unavailable(err: str) -> bool:
+    err_low = (err or "").lower()
+    is_access_restricted = any([
+        "members-only" in err_low,
+        "members only" in err_low,
+        "join this channel" in err_low,
+        "this video is available to channel members" in err_low,
+        "premium only" in err_low,
+        "membership required" in err_low,
+        "you need to be a member" in err_low,
+        "access denied" in err_low,
+    ])
+    is_unavailable = any([
+        "video unavailable" in err_low,
+        "video is unavailable" in err_low,
+        "has been removed by the uploader" in err_low,
+        "no longer available" in err_low,
+        "account associated with this video has been terminated" in err_low,
+        "this video has been removed" in err_low,
+        "private video" in err_low,
+        "restricted" in err_low,
+        "sign in to confirm your age" in err_low,
+        "age-restricted" in err_low,
+        "age restricted" in err_low,
+        "watch video on youtube" in err_low,
+    ])
+    return is_access_restricted or is_unavailable
+
+
 def _download_once(url: str, out_dir: str, logger: Logger, email: str, timeout_s: int, cookie_file: str = "") -> Tuple[bool, str, str, str]:
     js_runtimes = pick_js_runtimes_dict()
     if not js_runtimes:
@@ -231,6 +260,8 @@ def download_one(
             )
             if ok:
                 return True, path, vid, title
+            if _is_access_restricted_or_unavailable(path):
+                return False, f"VIDEO SKIPPED: {path}", vid, title
             return False, path, vid, title
         except Exception as e:
             err_str = str(e)
@@ -251,31 +282,7 @@ def download_one(
                             continue
                         raise
             # Detect members-only and similar access restriction errors
-            err_low = err_str.lower()
-            is_access_restricted = any([
-                "members-only" in err_low,
-                "members only" in err_low,
-                "join this channel" in err_low,
-                "this video is available to channel members" in err_low,
-                "premium only" in err_low,
-                "membership required" in err_low,
-                "you need to be a member" in err_low,
-                "access denied" in err_low,
-            ])
-            # Detect video unavailable / age restricted (removed, terminated account, private, etc)
-            is_unavailable = any([
-                "video unavailable" in err_low,
-                "has been removed by the uploader" in err_low,
-                "no longer available" in err_low,
-                "account associated with this video has been terminated" in err_low,
-                "this video has been removed" in err_low,
-                "private video" in err_low,
-                "restricted" in err_low,
-                "sign in to confirm your age" in err_low,
-                "age-restricted" in err_low,
-                "age restricted" in err_low,
-            ])
-            if is_access_restricted or is_unavailable:
+            if _is_access_restricted_or_unavailable(err_str):
                 return False, f"VIDEO SKIPPED: {e}", "", ""
             return False, f"yt-dlp loi: {e}", "", ""
     finally:
