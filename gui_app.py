@@ -985,9 +985,12 @@ class App:
             self.fb_tree.yview(*args)
 
         fb_scroll = ttk.Scrollbar(fb_table, orient="vertical", command=_on_fb_scroll)
+        all_scroll_x = ttk.Scrollbar(all_table, orient="horizontal", command=self.all_tree.xview)
         fb_scroll_x = ttk.Scrollbar(fb_table, orient="horizontal", command=self.fb_tree.xview)
+        self.all_tree.configure(xscrollcommand=all_scroll_x.set)
         self.fb_tree.configure(yscrollcommand=fb_scroll.set, xscrollcommand=fb_scroll_x.set)
         self.fb_tree.grid(row=0, column=0, sticky="nsew")
+        all_scroll_x.grid(row=1, column=0, sticky="ew")
         fb_scroll.grid(row=0, column=1, sticky="ns")
         fb_scroll_x.grid(row=1, column=0, sticky="ew")
         fb_table.grid_rowconfigure(0, weight=1)
@@ -3740,9 +3743,10 @@ class App:
             uid = (acc.get("uid") or "").strip()
             if not uid:
                 continue
-            if uid in seen:
+            uid_key = uid.lower()
+            if uid_key in seen:
                 continue
-            seen.add(uid)
+            seen.add(uid_key)
             out.append(acc)
         return out
 
@@ -4414,6 +4418,8 @@ class App:
         return
 
     def _toggle_followers_sort_all(self) -> None:
+        if self.executor is not None or self._busy:
+            return
         if self._is_all_tab():
             self._sort_state["followers_all"] = "desc"
             self._sort_tree_by_column(self.all_tree, "followers", descending=True)
@@ -4560,6 +4566,8 @@ class App:
         )
 
     def _schedule_follow_sort(self) -> None:
+        if self.executor is not None or self._busy:
+            return
         if self._follow_sort_after_id:
             try:
                 self.root.after_cancel(self._follow_sort_after_id)
@@ -4574,6 +4582,8 @@ class App:
         self._follow_sort_after_id = self.root.after(300, _run)
 
     def _apply_follow_sort(self) -> None:
+        if self.executor is not None or self._busy:
+            return
         def _to_num(val) -> int:
             if val is None or val == "":
                 return -1
@@ -4599,6 +4609,8 @@ class App:
             pass
 
     def _sort_tree_by_column(self, tree: ttk.Treeview, col: str, descending: bool = True) -> None:
+        if self.executor is not None or self._busy:
+            return
         def _to_num(val) -> int:
             if val is None or val == "":
                 return -1
@@ -4632,6 +4644,8 @@ class App:
         self._rebuild_tree_from_accounts()
 
     def _toggle_upload_sort(self, col: str) -> None:
+        if self.executor is not None or self._busy:
+            return
         # Cycle: desc -> asc -> reset
         state = self._sort_state.get(col)
         if state is None:
@@ -4652,6 +4666,8 @@ class App:
             pass
 
     def _toggle_fb_sort(self, col: str) -> None:
+        if self.executor is not None or self._busy:
+            return
         key = f"fb_{col}"
         state = self._sort_state.get(key)
         if state is None:
@@ -4672,6 +4688,8 @@ class App:
             pass
 
     def _toggle_all_sort(self, col: str) -> None:
+        if self.executor is not None or self._busy:
+            return
         key = f"all_{col}"
         state = self._sort_state.get(key)
         if state is None:
@@ -4778,8 +4796,8 @@ class App:
     def _build_mixed_ordered_rows(self, base_rows: list | None = None) -> list:
         rows = []
         try:
-            ytb_exists = {str(a.get("uid") or "").strip() for a in self.accounts}
-            fb_exists = {str(a.get("uid") or "").strip() for a in self.fb_accounts}
+            ytb_exists = {str(a.get("uid") or "").strip().lower() for a in self.accounts}
+            fb_exists = {str(a.get("uid") or "").strip().lower() for a in self.fb_accounts}
 
             if base_rows is None:
                 checked = self._get_checked_all_rows()
@@ -4798,12 +4816,19 @@ class App:
                     for s, e in (base_rows or [])
                 ]
 
+            seen_rows = set()
             for social, email in source_rows:
                 if not social or not email:
                     continue
-                if social == "YTB" and email in ytb_exists:
+                email_key = email.lower()
+                row_key = (social, email_key)
+                if row_key in seen_rows:
+                    continue
+                if social == "YTB" and email_key in ytb_exists:
+                    seen_rows.add(row_key)
                     rows.append((social, email))
-                elif social == "FB" and email in fb_exists:
+                elif social == "FB" and email_key in fb_exists:
+                    seen_rows.add(row_key)
                     rows.append((social, email))
         except Exception:
             return []
@@ -8875,18 +8900,25 @@ class App:
         slot_idx = 0
         max_slots = cols * rows_layout
         email_to_iid = self._map_email_to_item_id(self.fb_tree)
-        acc_by_email = {str(a.get("uid") or "").strip(): a for a in self.fb_accounts}
+        acc_by_email = {str(a.get("uid") or "").strip().lower(): a for a in self.fb_accounts}
         ordered_emails = []
+        seen_email_keys = set()
         try:
             for iid in self.fb_tree.get_children():
                 email = (self.fb_tree.set(iid, "email") or "").strip()
-                if email and email in checked_emails:
+                email_key = email.lower()
+                if email and email in checked_emails and email_key not in seen_email_keys:
+                    seen_email_keys.add(email_key)
                     ordered_emails.append(email)
         except Exception:
-            ordered_emails = [e for e in checked_emails]
+            for e in checked_emails:
+                ek = (e or "").strip().lower()
+                if ek and ek not in seen_email_keys:
+                    seen_email_keys.add(ek)
+                    ordered_emails.append(e)
 
         for email in ordered_emails:
-            acc = acc_by_email.get(email)
+            acc = acc_by_email.get((email or "").strip().lower())
             item_id = email_to_iid.get(email)
             if not acc or not item_id:
                 continue
@@ -9879,66 +9911,99 @@ class App:
                 pass
 
         def _worker() -> None:
-            ids = []
-            try:
-                page = 1
-                per_page = 5000
-                group = ""
-                while True:
-                    url = f"http://127.0.0.1:19995/api/v3/profiles?page={page}&per_page={per_page}"
-                    resp = requests.get(url, timeout=30)
-                    resp.raise_for_status()
-                    payload = resp.json() if resp.content else {}
-                    items = []
-                    if isinstance(payload, dict):
-                        data = payload.get("data")
-                        if isinstance(data, dict):
-                            items = data.get("data") or data.get("items") or []
-                        elif isinstance(data, list):
-                            items = data
-                    if not items:
-                        break
-                    for item in items:
-                        pid = (item.get("id") or item.get("profile_id") or "").strip()
-                        if pid:
-                            ids.append(pid)
-                    if len(items) < per_page:
-                        break
-                    time.sleep(0.2)
-                    page += 1
-            except Exception as e:
-                self._log(f"[GPM] List profiles error: {e}")
-                self.root.after(0, _set_label, f"List profiles error: {e}")
-                return
+            # For very large datasets, avoid loading all IDs into memory at once.
+            # Strategy: always fetch page=1 in small chunks, delete that chunk, repeat until empty.
+            per_page = 500
+            max_workers = 8
+            deleted_count = 0
+            list_retry_limit = 5
+            session = requests.Session()
+            estimate_total = None
 
-            total = len(ids)
-            if total == 0:
-                self._log("[GPM] No profile IDs found to delete")
-                self.root.after(0, _set_label, "No profiles found")
-                return
+            def _extract_items(payload) -> list:
+                items = []
+                if isinstance(payload, dict):
+                    data = payload.get("data")
+                    if isinstance(data, dict):
+                        items = data.get("data") or data.get("items") or []
+                    elif isinstance(data, list):
+                        items = data
+                return items if isinstance(items, list) else []
 
-            self._log(f"[GPM] Deleting {total} profiles...")
-            self.root.after(0, _set_label, f"Deleting 0/{total} profiles...")
-            completed = 0
-            try:
-                with ThreadPoolExecutor(max_workers=10) as ex:
-                    futures = [ex.submit(delete_profile, pid, 10) for pid in ids]
-                    for _f in as_completed(futures):
-                        completed += 1
-                        if completed % 500 == 0 or completed == total:
-                            self.root.after(0, _set_label, f"Deleting {completed}/{total} profiles...")
-            except Exception:
-                # Fallback to sequential delete if executor fails
-                for idx, pid in enumerate(ids, start=1):
+            while True:
+                items = []
+                last_err = ""
+                for attempt in range(1, list_retry_limit + 1):
                     try:
-                        delete_profile(pid, 10)
-                    except Exception:
-                        pass
-                    if idx % 500 == 0 or idx == total:
-                        self.root.after(0, _set_label, f"Deleting {idx}/{total} profiles...")
+                        url = f"http://127.0.0.1:19995/api/v3/profiles?page=1&per_page={per_page}"
+                        resp = session.get(url, timeout=45)
+                        resp.raise_for_status()
+                        payload = resp.json() if resp.content else {}
+                        items = _extract_items(payload)
+                        if estimate_total is None and isinstance(payload, dict):
+                            pg = payload.get("pagination") or {}
+                            if isinstance(pg, dict):
+                                total_val = pg.get("total")
+                                if isinstance(total_val, int) and total_val >= 0:
+                                    estimate_total = total_val
+                        break
+                    except Exception as e:
+                        last_err = str(e)
+                        if attempt < list_retry_limit:
+                            wait_s = min(8, attempt * 2)
+                            self._log(f"[GPM] List retry {attempt}/{list_retry_limit} in {wait_s}s: {e}")
+                            time.sleep(wait_s)
+                        else:
+                            self._log(f"[GPM] List profiles error: {e}")
 
-            self.root.after(0, _set_label, "Done")
-            self._log("[GPM] Delete all profiles done")
+                if not items and last_err:
+                    self.root.after(0, _set_label, f"List profiles error: {last_err}")
+                    return
+
+                if not items:
+                    if deleted_count == 0:
+                        self._log("[GPM] No profile IDs found to delete")
+                        self.root.after(0, _set_label, "No profiles found")
+                    else:
+                        self.root.after(0, _set_label, f"Done ({deleted_count})")
+                        self._log(f"[GPM] Delete all profiles done ({deleted_count})")
+                    break
+
+                ids = []
+                for item in items:
+                    pid = (item.get("id") or item.get("profile_id") or "").strip()
+                    if pid:
+                        ids.append(pid)
+
+                if not ids:
+                    self.root.after(0, _set_label, f"Done ({deleted_count})")
+                    self._log(f"[GPM] No valid profile IDs in current page, stop ({deleted_count})")
+                    break
+
+                if estimate_total is not None:
+                    self.root.after(
+                        0,
+                        _set_label,
+                        f"Deleting {deleted_count}/{estimate_total}... (batch {len(ids)})",
+                    )
+                else:
+                    self.root.after(0, _set_label, f"Deleting {deleted_count}... (batch {len(ids)})")
+
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = [ex.submit(delete_profile, pid, 12) for pid in ids]
+                    batch_done = 0
+                    for _f in as_completed(futures):
+                        batch_done += 1
+                        deleted_count += 1
+                        if batch_done % 100 == 0 or batch_done == len(ids):
+                            if estimate_total is not None:
+                                self.root.after(0, _set_label, f"Deleting {deleted_count}/{estimate_total}...")
+                            else:
+                                self.root.after(0, _set_label, f"Deleting {deleted_count}...")
+
+                # Small pause to reduce pressure on local GPM API between batches.
+                time.sleep(0.15)
+
             try:
                 time.sleep(0.6)
             except Exception:
