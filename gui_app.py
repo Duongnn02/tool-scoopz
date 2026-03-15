@@ -3878,6 +3878,13 @@ class App:
         self._set_runtime_label()
         self._update_perf_label()
 
+    def _runtime_reset(self) -> None:
+        self._runtime_pause()
+        self._runtime_accum_sec = 0.0
+        self._runtime_started_at = None
+        self._set_runtime_label()
+        self._update_perf_label()
+
     def _reset_upload_cycle_stats(self) -> None:
         try:
             with self._upload_stats_lock:
@@ -7768,7 +7775,6 @@ class App:
     def start_all_jobs_mixed(self, snapshot: dict | None = None) -> None:
         if self.executor is not None:
             return
-        self._runtime_start()
         ordered_rows = self._build_mixed_ordered_rows()
         if not ordered_rows and snapshot is not None:
             ordered_rows = self._build_mixed_ordered_rows(list(snapshot.get("ordered_rows") or []))
@@ -7795,6 +7801,8 @@ class App:
             self._cycle_count = 1
             self._set_cycle_label()
             self._reset_upload_cycle_stats()
+        self._runtime_reset()
+        self._runtime_start()
 
         self._from_all_tab = True
         self._set_checked_by_email(self.tree, set(ytb_emails))
@@ -8065,7 +8073,6 @@ class App:
     def start_jobs(self) -> None:
         if not self._require_license_or_warn():
             return
-        self._runtime_start()
         self._set_busy(True)
         if self._is_all_tab():
             self.start_all_jobs_mixed()
@@ -8121,6 +8128,8 @@ class App:
             self._cycle_count = 1
             self._set_cycle_label()
             self._reset_upload_cycle_stats()
+        self._runtime_reset()
+        self._runtime_start()
         self._retry_round = 0
         # Use exact number of threads (no extra retry threads)
         self.executor = ThreadPoolExecutor(max_workers=max_threads)
@@ -8828,7 +8837,18 @@ class App:
     def start_fb_jobs(self) -> None:
         if self.executor is not None:
             return
-        self._runtime_start()
+        if not self._from_all_tab:
+            if self._repeat_cycle_pending:
+                self._repeat_cycle_pending = False
+                self._increment_cycle()
+            else:
+                self._cycle_count = 1
+                self._set_cycle_label()
+                self._reset_upload_cycle_stats()
+            self._runtime_reset()
+            self._runtime_start()
+        else:
+            self._runtime_start()
         self._reset_upload_cycle_stats()
         self._force_close_all_profiles()
         self._reset_all_statuses()
@@ -9840,6 +9860,64 @@ class App:
         except Exception:
             return ""
 
+    def _repair_gpm_clipboard_extension(self, profile_path: str) -> None:
+        if not profile_path:
+            return
+        try:
+            base = os.path.abspath(profile_path)
+        except Exception:
+            base = profile_path
+        ext_dir = os.path.join(base, "Default", "GPMSoft", "Extensions", "clipboard-ext")
+        manifest_path = os.path.join(ext_dir, "manifest.json")
+        script_path = os.path.join(ext_dir, "contentscript.js")
+
+        try:
+            os.makedirs(ext_dir, exist_ok=True)
+        except Exception:
+            return
+
+        manifest_ok = False
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    manifest_ok = True
+            except Exception:
+                manifest_ok = False
+
+        if not manifest_ok:
+            manifest = {
+                "manifest_version": 3,
+                "name": "GPM Clipboard",
+                "version": "1.0.0",
+                "description": "Auto-repaired placeholder extension.",
+                "content_scripts": [
+                    {
+                        "matches": ["<all_urls>"],
+                        "js": ["contentscript.js"],
+                        "run_at": "document_start",
+                    }
+                ],
+            }
+            try:
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        if not os.path.exists(script_path):
+            try:
+                with open(script_path, "w", encoding="utf-8") as f:
+                    f.write("// Auto-repaired placeholder script for GPM clipboard extension.\n")
+            except Exception:
+                pass
+
+        try:
+            self._log(f"[GPM] clipboard-ext checked: {ext_dir}")
+        except Exception:
+            pass
+
     def _remember_profile_path(self, profile_id: str, data: dict) -> None:
         if not profile_id:
             return
@@ -9859,6 +9937,10 @@ class App:
         with self.profile_paths_lock:
             self.profile_paths[profile_id] = path
             self.profile_paths_used.add(path)
+        try:
+            self._repair_gpm_clipboard_extension(path)
+        except Exception:
+            pass
         try:
             self._log(f"[GPM] profile_path for {profile_id}: {path}")
         except Exception:
