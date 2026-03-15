@@ -9919,6 +9919,8 @@ class App:
             list_retry_limit = 5
             session = requests.Session()
             estimate_total = None
+            overall_t0 = time.time()
+            batch_index = 0
 
             def _extract_items(payload) -> list:
                 items = []
@@ -9933,6 +9935,7 @@ class App:
             while True:
                 items = []
                 last_err = ""
+                list_t0 = time.time()
                 for attempt in range(1, list_retry_limit + 1):
                     try:
                         url = f"http://127.0.0.1:19995/api/v3/profiles?page=1&per_page={per_page}"
@@ -9959,6 +9962,13 @@ class App:
                 if not items and last_err:
                     self.root.after(0, _set_label, f"List profiles error: {last_err}")
                     return
+
+                list_elapsed = max(0.001, time.time() - list_t0)
+                if items:
+                    list_rate = len(items) / list_elapsed
+                    self._log(
+                        f"[GPM] Batch {batch_index + 1}: list fetched {len(items)} profiles in {list_elapsed:.2f}s ({list_rate:.2f} profiles/s)"
+                    )
 
                 if not items:
                     if deleted_count == 0:
@@ -9989,6 +9999,8 @@ class App:
                 else:
                     self.root.after(0, _set_label, f"Deleting {deleted_count}... (batch {len(ids)})")
 
+                batch_index += 1
+                batch_t0 = time.time()
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = [ex.submit(delete_profile, pid, 12) for pid in ids]
                     batch_done = 0
@@ -10000,6 +10012,15 @@ class App:
                                 self.root.after(0, _set_label, f"Deleting {deleted_count}/{estimate_total}...")
                             else:
                                 self.root.after(0, _set_label, f"Deleting {deleted_count}...")
+
+                batch_elapsed = max(0.001, time.time() - batch_t0)
+                batch_rate = batch_done / batch_elapsed if batch_done else 0.0
+                overall_elapsed = max(0.001, time.time() - overall_t0)
+                overall_rate = deleted_count / overall_elapsed if deleted_count else 0.0
+                self._log(
+                    f"[GPM] Batch {batch_index}: deleted {batch_done} profiles in {batch_elapsed:.2f}s "
+                    f"({batch_rate:.2f} profiles/s) | total {deleted_count} in {overall_elapsed:.2f}s ({overall_rate:.2f} profiles/s)"
+                )
 
                 # Small pause to reduce pressure on local GPM API between batches.
                 time.sleep(0.15)
