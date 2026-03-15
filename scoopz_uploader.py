@@ -1296,24 +1296,33 @@ def upload_post_async(
                 return None
             return btn if _is_post_enabled(btn) else None
 
-        try:
-            if _remaining() <= 0:
-                return "timeout", "Post timeout", "", None, None
-            # Phase 1: normal wait.
-            phase1 = max(1, int(min(90, _remaining())))
-            post_btn = WebDriverWait(driver, phase1).until(lambda d: _find_enabled_post())
-        except TimeoutException:
-            # Phase 2: nudge UI then wait again.
-            _log(logger, "[UPLOAD-POST] Post button still not enabled after phase 1, nudging UI...")
-            _nudge_post_ui()
+        post_btn = None
+        wait_logged = False
+        next_nudge_at = 0.0
+        while _remaining() > 0:
             try:
-                if _remaining() <= 0:
-                    return "timeout", "Post timeout", "", None, None
-                phase2 = max(1, int(min(45, _remaining())))
-                post_btn = WebDriverWait(driver, phase2).until(lambda d: _find_enabled_post())
-            except TimeoutException:
-                state = _post_btn_state()
-                return "timeout", f"Post button not enabled (state={state})", "", None, None
+                post_btn = _find_enabled_post()
+            except Exception:
+                post_btn = None
+            if post_btn is not None:
+                break
+
+            state = _post_btn_state()
+            now = time.time()
+            if not wait_logged:
+                _log(logger, f"[UPLOAD-POST] Waiting for Post button to enable (state={state})...")
+                wait_logged = True
+                next_nudge_at = now + 6.0
+            elif now >= next_nudge_at:
+                _log(logger, f"[UPLOAD-POST] Post still disabled (state={state}), keep waiting...")
+                _nudge_post_ui()
+                next_nudge_at = now + 6.0
+
+            time.sleep(min(1.0, max(0.2, _remaining())))
+
+        if post_btn is None:
+            state = _post_btn_state()
+            return "timeout", f"Post button not enabled (state={state})", "", None, None
 
         # ⭐ SERIAL POST BUTTON HANDLING: Only 1 thread clicks POST at a time
         acquired = False

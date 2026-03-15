@@ -4555,7 +4555,7 @@ class App:
             drv,
             self._log,
             acc_email=acc_email,
-            max_total_s=180,
+            max_total_s=420,
             post_button_semaphore=self.post_button_semaphore,
         )
 
@@ -10434,7 +10434,7 @@ class App:
                     drv,
                     self._log,
                     acc_email=acc.get("uid", ""),
-                    max_total_s=180,
+                    max_total_s=420,
                     post_button_semaphore=self.post_button_semaphore,
                 )
                 if st == "success":
