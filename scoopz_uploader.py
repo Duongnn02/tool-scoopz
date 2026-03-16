@@ -1328,13 +1328,20 @@ def upload_post_async(
         acquired = False
         if post_button_semaphore:
             _log(logger, f"[UPLOAD-POST] Waiting for POST button slot (semaphore)...")
-            acquired = post_button_semaphore.acquire(timeout=30)
+            slot_timeout = int(max(60, min(300, max_total_s * 0.8)))
+            acquired = post_button_semaphore.acquire(timeout=slot_timeout)
             if not acquired:
-                _log(logger, f"[UPLOAD-POST] ✗ Timeout waiting for POST button slot (30s) - other thread using button")
-                return "error", "POST button slot timeout", "", None, None
-            _log(logger, f"[UPLOAD-POST] ✓ Got POST button slot, proceeding...")
+                # Do not fail hard on slot contention; continue with best-effort click.
+                _log(logger, f"[UPLOAD-POST] ! Timeout waiting for POST button slot ({slot_timeout}s), continue without lock")
+            else:
+                _log(logger, f"[UPLOAD-POST] ✓ Got POST button slot, proceeding...")
 
         try:
+            # Re-resolve Post button after waiting for slot to avoid stale references.
+            post_btn = _find_enabled_post() or _find_post_btn(driver)
+            if post_btn is None:
+                return "timeout", "Post button missing before click", "", None, None
+
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", post_btn)
             except Exception:
@@ -1342,7 +1349,8 @@ def upload_post_async(
 
             try:
                 _log(logger, f"[UPLOAD-POST] Clicking POST button...")
-                post_btn.click()
+                if not _force_click(driver, post_btn):
+                    raise RuntimeError("All click methods failed")
                 _log(logger, f"[UPLOAD-POST] ✓ POST button clicked")
             except Exception:
                 try:

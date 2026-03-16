@@ -42,16 +42,54 @@ def _extract_video_id(href: str) -> str:
     return ""
 
 
-def _scrape_shorts(driver, channel_shorts_url: str, stop_check: StopChecker, max_scroll: int = 60) -> List[Dict[str, str]]:
+def _collect_visible_shorts(driver) -> List[Dict[str, str]]:
+    elems = driver.find_elements(By.XPATH, "//a[@href and contains(@href, '/shorts/')]")
+    result = []
+    for el in elems:
+        href = el.get_attribute("href") or ""
+        vid = _extract_video_id(href)
+        if vid:
+            result.append({"href": href, "vid": vid})
+    return result
+
+
+def _scrape_shorts(
+    driver,
+    channel_shorts_url: str,
+    stop_check: StopChecker,
+    max_scroll: int = 60,
+    existing_ids: set | None = None,
+) -> List[Dict[str, str]]:
     driver.get(channel_shorts_url)
     time.sleep(2)
 
+    existing_ids = existing_ids or set()
+    rows: List[Dict[str, str]] = []
+    seen_ids: set = set()
     last_height = 0
     same_count = 0
+    stop_on_existing = False
 
     for _ in range(max_scroll):
         if stop_check():
             break
+
+        # Collect and check existing after each scroll
+        for item in _collect_visible_shorts(driver):
+            vid = item["vid"]
+            if vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+            if vid in existing_ids:
+                stop_on_existing = True
+                continue
+            href = item["href"]
+            title = ""
+            rows.append({"video_id": vid, "title": title, "url": href})
+
+        if stop_on_existing:
+            break
+
         driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
         time.sleep(2)
         new_height = driver.execute_script("return document.documentElement.scrollHeight;")
@@ -63,27 +101,29 @@ def _scrape_shorts(driver, channel_shorts_url: str, stop_check: StopChecker, max
             same_count = 0
         last_height = new_height
 
-    elems = driver.find_elements(By.XPATH, "//a[@href and contains(@href, '/shorts/')]")
-    videos: List[Dict[str, str]] = []
-    seen_ids = set()
-    for el in elems:
-        if stop_check():
-            break
-        href = el.get_attribute("href")
-        vid = _extract_video_id(href)
-        if not vid or vid in seen_ids:
-            continue
-        seen_ids.add(vid)
-        title = (el.get_attribute("title") or el.text or "").strip()
-        if not title:
-            try:
-                parent = el.find_element(By.XPATH, ".//ancestor::ytd-rich-grid-media[1]")
-                title_el = parent.find_element(By.ID, "video-title")
-                title = (title_el.get_attribute("title") or title_el.text or "").strip()
-            except Exception:
-                title = ""
-        videos.append({"video_id": vid, "title": title, "url": href})
-    return videos
+    # Enrich titles for collected videos
+    if rows:
+        elems = driver.find_elements(By.XPATH, "//a[@href and contains(@href, '/shorts/')]")
+        title_map: Dict[str, str] = {}
+        for el in elems:
+            href = el.get_attribute("href") or ""
+            vid = _extract_video_id(href)
+            if not vid:
+                continue
+            title = (el.get_attribute("title") or el.text or "").strip()
+            if not title:
+                try:
+                    parent = el.find_element(By.XPATH, ".//ancestor::ytd-rich-grid-media[1]")
+                    title_el = parent.find_element(By.ID, "video-title")
+                    title = (title_el.get_attribute("title") or title_el.text or "").strip()
+                except Exception:
+                    title = ""
+            if title:
+                title_map[vid] = title
+        for row in rows:
+            row["title"] = title_map.get(row["video_id"], "")
+
+    return rows
 
 
 def scan_shorts_for_email(
@@ -98,15 +138,9 @@ def scan_shorts_for_email(
     try:
         existing = load_shorts(email)
         existing_ids = {row.get("video_id") for row in existing if row.get("video_id")}
-        videos = _scrape_shorts(driver, channel_shorts_url, stop_check)
-        new_videos: List[Dict[str, str]] = []
-        for v in videos:
-            if stop_check():
-                break
-            vid = v.get("video_id")
-            if vid in existing_ids:
-                break
-            new_videos.append(v)
+        new_videos = _scrape_shorts(driver, channel_shorts_url, stop_check, existing_ids=existing_ids)
+        if stop_check():
+            return 0, 0
         total, added = prepend_new_shorts(email, new_videos)
         if logger:
             logger(f"[{email}] SCAN OK: added {added}, total {total}")
