@@ -528,23 +528,30 @@ def update_profile_from_assets(
             try:
                 time.sleep(0.5)
                 _log(logger, "[PROFILE] Uploading avatar...")
-                pic_btns = driver.find_elements(
+                avatar_abs = os.path.abspath(avatar_path)
+                file_inputs = driver.find_elements(
                     By.XPATH,
-                    "//button[.//span[normalize-space()='Change picture']] | //button[.//input[@type='file' and @accept]]",
+                    "//input[@type='file' and contains(@accept,'image')]",
                 )
-                if pic_btns:
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", pic_btns[0])
-                    driver.execute_script("arguments[0].click();", pic_btns[0])
-                    _log(logger, "[PROFILE] Change picture clicked")
-                    if not _select_file_in_dialog(avatar_path, logger):
-                        try:
-                            file_inputs = driver.find_elements(By.XPATH, "//input[@type='file' and @accept]")
-                            if file_inputs:
-                                file_inputs[0].send_keys(avatar_path)
-                        except Exception:
-                            pass
+                if file_inputs:
+                    try:
+                        file_inputs[0].send_keys(avatar_abs)
+                    except Exception:
+                        # Input may be too hidden for send_keys — unhide then retry
+                        driver.execute_script(
+                            "arguments[0].style.display='block';"
+                            "arguments[0].style.visibility='visible';"
+                            "arguments[0].style.opacity=1;"
+                            "arguments[0].style.height='1px';"
+                            "arguments[0].style.width='1px';",
+                            file_inputs[0],
+                        )
+                        time.sleep(0.05)
+                        file_inputs[0].send_keys(avatar_abs)
                     time.sleep(0.8)
                     _log(logger, "[PROFILE] Avatar uploaded")
+                else:
+                    _log(logger, "[PROFILE] Image file input not found")
             except Exception as e:
                 _log(logger, f"[PROFILE] Upload avatar err: {e}")
 

@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XnowTrader LLC | Digital Content & Scoopz Creator Services</title>
+  <meta name="description" content="XnowTrader LLC provides digital content creation and online media services with monetization heavily focused on the Scoopz network.">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #050505;
+      --bg-surface: #0f0f11;
+      --bg-glass: rgba(15, 15, 17, 0.7);
+      --border: #222222;
+      --border-hover: #333333;
+      --text-main: #ffffff;
+      --text-muted: #a1a1aa;
+      --primary: #8b5cf6;
+      --primary-glow: rgba(139, 92, 246, 0.5);
+      --scoopz-brand: #00ffaa;
+      --scoopz-glow: rgba(0, 255, 170, 0.4);
+      --accent: #10b981;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    .bg-elements {
+      position: fixed; inset: 0; z-index: -1; pointer-events: none;
+      background:
+        radial-gradient(circle at 10% 10%, rgba(139, 92, 246, 0.15), transparent 40%),
+        radial-gradient(circle at 90% 90%, rgba(0, 255, 170, 0.15), transparent 40%),
+        radial-gradient(circle at 80% 20%, rgba(139, 92, 246, 0.08), transparent 30%);
+    }
+    .grid-overlay {
+      position: absolute; inset: 0;
+      background-image: linear-gradient(var(--border) 1px, transparent 1px), linear-gradient(90deg, var(--border) 1px, transparent 1px);
+      background-size: 50px 50px; opacity: 0.3;
+      mask-image: linear-gradient(to bottom, #000 20%, transparent 100%);
+      -webkit-mask-image: linear-gradient(to bottom, #000 20%, transparent 100%);
+    }
+
+    .container { max-width: 1140px; margin: 0 auto; padding: 0 24px; }
+
+    /* Header */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: var(--bg-glass); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 0;
+    }
+    .header-inner { display: flex; align-items: center; justify-content: space-between; }
+    .logo-area { display: flex; align-items: center; gap: 14px; }
+    .logo-icon {
+      width: 44px; height: 44px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--primary), #8b5cf6);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 18px; color: #fff;
+      box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+    }
+    .logo-text h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+    .logo-text p { font-size: 12px; color: var(--text-muted); }
+
+    /* Lang Toggle */
+    .lang-toggle { display: flex; background: #111; border: 1px solid var(--border); border-radius: 40px; padding: 4px; }
+    .lang-toggle button {
+      background: transparent; border: none; color: var(--text-muted); padding: 6px 16px;
+      font-size: 13px; font-weight: 600; border-radius: 30px; cursor: pointer; transition: 0.3s;
+    }
+    .lang-toggle button.active { background: #fff; color: #000; }
+
+    /* Hero */
+    .hero { padding: 90px 0 60px; text-align: center; position: relative; }
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px; padding: 6px 16px; border-radius: 30px;
+      background: rgba(255, 42, 95, 0.1); border: 1px solid rgba(255, 42, 95, 0.2);
+      color: #ff4d79; font-size: 14px; font-weight: 600; margin-bottom: 24px;
+    }
+    .hero-badge svg { width: 16px; height: 16px; fill: currentColor; }
+    .hero h2 {
+      font-size: clamp(40px, 6vw, 68px); font-weight: 800; line-height: 1.1; letter-spacing: -1.5px; margin-bottom: 24px;
+    }
+    .text-gradient { background: linear-gradient(180deg, #fff, #a1a1aa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .hero p { font-size: 20px; color: var(--text-muted); max-width: 680px; margin: 0 auto 40px; font-weight: 400; }
+    
+    .hero-ctas { display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 14px 28px;
+      border-radius: 12px; font-size: 15px; font-weight: 600; text-decoration: none; transition: 0.3s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--scoopz-brand), #ff7e40); color: #fff;
+      box-shadow: 0 10px 30px var(--scoopz-glow); border: 1px solid rgba(255,255,255,0.1);
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 15px 40px rgba(255, 42, 95, 0.5); }
+    .btn-secondary { background: var(--bg-surface); color: var(--text-main); border: 1px solid var(--border); }
+    .btn-secondary:hover { background: #1a1a1a; border-color: #444; }
+
+    /* Scoopz Banner */
+    .scoopz-banner {
+      margin: 20px auto 80px; max-width: 960px;
+      background: linear-gradient(135deg, #180911, #0f0a14);
+      border: 1px solid #3d1b28; border-radius: 24px; padding: 36px 40px;
+      display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap;
+      position: relative; overflow: hidden;
+    }
+    .scoopz-banner::before {
+      content: ''; position: absolute; top: -50px; left: -50px; width: 100px; height: 100px;
+      background: var(--scoopz-brand); filter: blur(80px); opacity: 0.5;
+    }
+    .scoopz-info h3 { font-size: 26px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
+    .scoopz-info h3 svg { width: 28px; height: 28px; fill: var(--scoopz-brand); }
+    .scoopz-info p { color: #d1d5db; font-size: 16px; max-width: 400px; line-height: 1.5; }
+    .scoopz-stats { display: flex; gap: 32px; background: rgba(0,0,0,0.3); padding: 20px 30px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.05); }
+    .s-stat { text-align: center; }
+    .s-stat strong { display: block; font-size: 28px; font-weight: 800; color: #fff; margin-bottom: 4px; }
+    .s-stat span { font-size: 13px; color: var(--scoopz-brand); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    /* Services Section */
+    .section-head { text-align: center; margin-bottom: 48px; }
+    .section-head h2 { font-size: 32px; font-weight: 700; letter-spacing: -1px; margin-bottom: 12px; }
+    .section-head p { color: var(--text-muted); font-size: 18px; max-width: 600px; margin: 0 auto; }
+
+    .services-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; margin-bottom: 80px; }
+    .card {
+      background: var(--bg-surface); border: 1px solid var(--border); border-radius: 20px; padding: 32px;
+      transition: all 0.3s ease; position: relative; overflow: hidden;
+    }
+    .card::after {
+      content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, transparent, rgba(255,255,255,0.02)); pointer-events: none;
+    }
+    .card:hover { border-color: #444; transform: translateY(-4px); box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+    .card-icon {
+      width: 54px; height: 54px; border-radius: 14px; background: #1a1a1a; border: 1px solid #333;
+      display: flex; align-items: center; justify-content: center; margin-bottom: 24px; color: #fff;
+    }
+    .card-icon svg { width: 26px; height: 26px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .card h3 { font-size: 20px; margin-bottom: 12px; font-weight: 600; }
+    .card p { color: var(--text-muted); font-size: 15px; }
+
+    
+    /* Creator Grid */
+    .creator-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .creator-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      transition: 0.3s;
+      text-decoration: none;
+      color: var(--text-main);
+    }
+    .creator-card:hover {
+      background: rgba(255, 42, 95, 0.08);
+      border-color: rgba(255, 42, 95, 0.3);
+      transform: translateY(-2px);
+    }
+    .c-avatar {
+      width: 48px; height: 48px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--scoopz-brand), #ff7e40);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: bold; font-size: 18px; color: #fff;
+    }
+    .c-info h4 { font-size: 15px; margin-bottom: 2px; }
+    .c-info p { font-size: 12px; color: var(--scoopz-brand); }
+
+    .image-vibe-gallery {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin: 80px 0;
+    }
+    .vibe-img {
+      width: 100%;
+      height: 240px;
+      object-fit: cover;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      transition: 0.4s;
+    }
+    .vibe-img:hover {
+      transform: scale(1.02);
+      box-shadow: 0 10px 30px rgba(255, 42, 95, 0.2);
+      border-color: var(--scoopz-brand);
+    }
+    
+    @media (max-width: 768px) {
+      .image-vibe-gallery { grid-template-columns: 1fr; }
+    }
+
+    /* Info Split */
+    .info-split { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 80px; }
+    .info-box { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 20px; padding: 32px; }
+    .info-box h3 { font-size: 20px; margin-bottom: 24px; display: flex; align-items: center; gap: 10px; }
+    .info-box h3::before { content: ""; display: block; width: 4px; height: 20px; background: var(--primary); border-radius: 4px; }
+    .info-list { list-style: none; }
+    .info-list li { margin-bottom: 16px; font-size: 15px; color: #d1d5db; display: flex; align-items: flex-start; gap: 12px; }
+    .info-list li svg { flex-shrink: 0; width: 20px; height: 20px; color: var(--text-muted); margin-top: 2px; }
+    .link-highlight { color: var(--primary); text-decoration: none; border-bottom: 1px dashed var(--primary); transition: 0.2s; }
+    .link-highlight:hover { color: #60a5fa; border-bottom-style: solid; }
+
+    .tips-box { border-color: rgba(16, 185, 129, 0.3); background: rgba(16, 185, 129, 0.03); }
+    .tips-box h3::before { background: var(--accent); }
+
+    /* Footer */
+    footer { border-top: 1px solid var(--border); padding: 40px 0; text-align: center; color: var(--text-muted); font-size: 14px; }
+
+    @media (max-width: 900px) {
+      .scoopz-banner { flex-direction: column; text-align: center; padding: 32px 24px; }
+      .scoopz-info h3 { justify-content: center; }
+      .scoopz-info p { margin: 0 auto; }
+      .scoopz-stats { width: 100%; justify-content: center; gap: 20px; }
+    }
+    @media (max-width: 768px) {
+      .hero { padding: 60px 0 40px; }
+      .hero h2 { font-size: 34px; }
+      .info-split { grid-template-columns: 1fr; }
+      .header-inner { flex-wrap: wrap; justify-content: center; gap: 16px; }
+      .logo-text p { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="bg-elements"></div>
+  <div class="grid-overlay"></div>
+
+  <header>
+    <div class="container header-inner">
+      <div class="logo-area">
+        <div class="logo-icon">XN</div>
+        <div class="logo-text">
+          <h1>XnowTrader LLC</h1>
+          <p data-i18n="topline">Professional Media & Creator Operations</p>
+        </div>
+      </div>
+      <div class="lang-toggle" aria-label="Language switch">
+        <button id="lang-en" class="active" type="button">EN</button>
+        <button id="lang-vi" type="button">VI</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    
+    <section class="hero" style="padding: 100px 0 60px;">
+      <!-- Creator Landing Style Slogan -->
+      <h2 style="font-size: clamp(48px, 8vw, 84px); font-weight: 800; line-height: 1.1; letter-spacing: -2px; margin-bottom: 24px;">
+        <span style="color: #fff;">Create. Impact.</span> 
+        <span style="color: #00ffaa; text-shadow: 0 0 40px rgba(0, 255, 170, 0.4);">Earn</span>
+      </h2>
+      <p data-i18n="heroDesc" style="font-size: 18px; color: #d1d5db; max-width: 760px; margin: 0 auto 16px; font-weight: 400; line-height: 1.6;">
+        XnowTrader LLC is a digital media company focused on content creation and creator operations. We produce and publish original short-form video content and monetize through creator platforms and brand collaborations.
+      </p>
+      
+
+      
+      <!-- Vibe Gallery Section (Scoopz App Style) -->
+      <div style="text-align: center; margin-bottom: 60px; margin-top: 40px;">
+        <h2 style="font-size: clamp(32px, 6vw, 42px); font-weight: 800; margin-bottom: 12px; color: #fff;">Share Life <span style="background: linear-gradient(135deg, #ff4d79, #ff7e40); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Unscripted</span></h2>
+        <h3 style="font-size: clamp(20px, 4vw, 28px); font-weight: 600; color: #9ca3af;">Where <span style="color: #ff4d79;">Real</span> Stories Unfold</h3>
+      </div>
+      
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 24px; max-width: 1100px; margin: 0 auto;">
+        
+        <!-- Card 1 -->
+        <div style="display: flex; flex-direction: column; align-items: center; text-align: center; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 32px; padding: 32px 24px;">
+          <h4 style="font-size: 22px; margin-bottom: 32px; font-weight: 700; color: #e5e7eb; min-height: 60px; line-height: 1.4;">Real and relatable<br>stories worth <span style="color: #60a5fa;">sharing</span></h4>
+          <img src="assets/image_3.png" alt="Real Stories" style="width: 100%; max-width: 280px; object-fit: contain; filter: drop-shadow(0 20px 40px rgba(0,0,0,0.5)); transition: transform 0.3s; transform-origin: bottom;" onmouseover="this.style.transform='translateY(-10px)'" onmouseout="this.style.transform='translateY(0)'">
+        </div>
+        
+        <!-- Card 2 -->
+        <div style="display: flex; flex-direction: column; align-items: center; text-align: center; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 32px; padding: 32px 24px;">
+          <h4 style="font-size: 22px; margin-bottom: 32px; font-weight: 700; color: #e5e7eb; min-height: 60px; line-height: 1.4;">Unscripted life, made<br><span style="color: #10b981;">extraordinary</span></h4>
+          <img src="assets/image_2.png" alt="Unscripted Life" style="width: 100%; max-width: 280px; object-fit: contain; filter: drop-shadow(0 20px 40px rgba(0,0,0,0.5)); transition: transform 0.3s; transform-origin: bottom;" onmouseover="this.style.transform='translateY(-10px)'" onmouseout="this.style.transform='translateY(0)'">
+        </div>
+
+        <!-- Card 3 -->
+        <div style="display: flex; flex-direction: column; align-items: center; text-align: center; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 32px; padding: 32px 24px;">
+          <h4 style="font-size: 22px; margin-bottom: 32px; font-weight: 700; color: #e5e7eb; min-height: 60px; line-height: 1.4;">Authentic videos that<br>make an <span style="color: #a855f7;">impact</span></h4>
+          <img src="assets/image_0.png" alt="Authentic Videos" style="width: 100%; max-width: 280px; object-fit: contain; filter: drop-shadow(0 20px 40px rgba(0,0,0,0.5)); transition: transform 0.3s; transform-origin: bottom;" onmouseover="this.style.transform='translateY(-10px)'" onmouseout="this.style.transform='translateY(0)'">
+        </div>
+
+      </div>
+
+    </section>
+
+
+    
+    <!-- Highlighted Scoopz Section -->
+    <section class="scoopz-banner">
+      <div class="scoopz-info">
+        <h3 style="font-size: 32px;">
+          <img src="https://thescoopz.com/assets/images/logo.png" style="height: 38px; border-radius: 6px;" alt="Scoopz" onerror="this.style.display='none'">
+          <span data-i18n="sBannerTitle">Monetized via Scoopz</span>
+        </h3>
+        <p data-i18n="sBannerDesc" style="font-size: 18px;">We publish content on Scoopz and generate revenue through platform monetization programs and promotional collaborations.</p>
+      </div>
+      <div class="scoopz-stats">
+        <div class="s-stat">
+          <strong data-i18n="sStat1Value">100%</strong>
+          <span data-i18n="sStat1Label">Focus</span>
+        </div>
+        <div class="s-stat">
+          <strong data-i18n="sStat2Value">Top Tier</strong>
+          <span data-i18n="sStat2Label">Creator</span>
+        </div>
+      </div>
+    </section>
+
+
+    <!-- Services Grid -->
+    <div class="section-head">
+      <h2 class="text-gradient" data-i18n="servicesTitle">What we do</h2>
+      <p data-i18n="servicesSubtitle">End-to-end media operations designed for modern digital audiences.</p>
+    </div>
+
+    <section class="services-grid">
+      <article class="card">
+        <div class="card-icon">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+        </div>
+        <h3 data-i18n="service1Title">Content Production</h3>
+        <p data-i18n="service1Desc">Content ideation, production, and publishing (short-form & long-form)</p>
+      </article>
+
+      <article class="card">
+        <div class="card-icon">
+          <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        </div>
+        <h3 data-i18n="service2Title">Audience Engineering</h3>
+        <p data-i18n="service2Desc">Community engagement and audience growth</p>
+      </article>
+
+      <article class="card">
+        <div class="card-icon">
+          <svg viewBox="0 0 24 24"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        </div>
+        <h3 data-i18n="service3Title">Commercial Monetization</h3>
+        <p data-i18n="service3Desc">Online media & creator services</p>
+      </article>
+    </section>
+
+    
+    
+
+
+    <!-- Info Sections -->
+    <section class="info-split" style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));">
+      
+      <!-- Where we publish -->
+      <div class="info-box tips-box" style="border-color: rgba(255, 42, 95, 0.3); background: rgba(255, 42, 95, 0.03); display: flex; flex-direction: column;">
+        <h3 data-i18n="publishHeading" style="align-items:flex-start;">
+          <svg style="width:28px; height:28px; fill:var(--scoopz-brand); flex-shrink:0; margin-right: 8px;" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          Where we publish / Revenue sources
+        </h3>
+        <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 8px;" data-i18n="scoopzLabel">Our official Creator Network on Scoopz:</p>
+        
+        <div class="creator-grid">
+          <a href="https://thescoopz.com/@rubylee_5cb11-361093526" target="_blank" class="creator-card">
+            <div class="c-avatar" style="background: linear-gradient(135deg, #FF9A9E, #FECFEF); color: #333;">RL</div>
+            <div class="c-info">
+              <h4>Ruby Lee</h4>
+              <p>@rubylee_5cb11</p>
+            </div>
+          </a>
+          <a href="https://thescoopz.com/@smol-358072602" target="_blank" class="creator-card">
+            <div class="c-avatar" style="background: linear-gradient(135deg, #a18cd1, #fbc2eb); color: #fff;">SM</div>
+            <div class="c-info">
+              <h4>Smol</h4>
+              <p>@smol-358072602</p>
+            </div>
+          </a>
+          <a href="https://thescoopz.com/@stephenstanle-360121013" target="_blank" class="creator-card">
+            <div class="c-avatar" style="background: linear-gradient(135deg, #84fab0, #8fd3f4); color: #333;">SS</div>
+            <div class="c-info">
+              <h4>Stephen Stanle</h4>
+              <p>@stephenstanle</p>
+            </div>
+          </a>
+          <a href="https://thescoopz.com/@oliviabro_4fe2d-361129822" target="_blank" class="creator-card">
+            <div class="c-avatar" style="background: linear-gradient(135deg, #fccb90, #d57eeb); color: #fff;">OB</div>
+            <div class="c-info">
+              <h4>Olivia Bro</h4>
+              <p>@oliviabro_4fe2d</p>
+            </div>
+          </a>
+          <div class="creator-card" style="background: transparent; border: 1px dashed rgba(255, 255, 255, 0.15); justify-content: center; align-items: center; box-shadow: none;">
+              <span style="color: var(--text-muted); font-size: 14px; font-weight: 500; font-style: italic;" data-i18n="moreChannels">...and 20+ more channels</span>
+            </div>
+          </div>
+      </div>
+
+      <div style="display:flex; flex-direction:column; gap:24px;">
+        <!-- Business Info -->
+        <div class="info-box">
+          <h3 data-i18n="businessHeading">Business information</h3>
+          <ul class="info-list">
+            <li>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+              <span data-i18n="bizLegal">Legal entity: XnowTrader LLC (Wyoming, USA)</span>
+            </li>
+            <li>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+              <span data-i18n="bizType">Business type: Media / Content Creation</span>
+            </li>
+            <li>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M2 10h20"/></svg>
+              <span data-i18n="bizEin">EIN: 98-1920950</span>
+            </li>
+          </ul>
+        </div>
+
+        <!-- Contact Info -->
+        <div class="info-box">
+          <h3 data-i18n="contactHeading">Contact</h3>
+          <ul class="info-list">
+            <li>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+              <span>
+                <strong data-i18n="contactEmailLabel" style="color:#fff;">Email:</strong> <br/><a class="link-highlight" href="mailto:devsp2023@gmail.com" style="margin-top: 4px; display: inline-block;">devsp2023@gmail.com</a>
+              </span>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+</main>
+
+    <footer>
+    <div class="container">
+      <p data-i18n="footerText">© 2026 XnowTrader LLC. All rights reserved.</p>
+    </div>
+  </footer>
+
+  <script>
+    const translations = {
+      en: {
+        topline: "Professional Media & Creator Operations",
+        badgeTitle: "Digital Media & Content Creator",
+        heroTitlePart1: "World-Class Content",
+        heroTitlePart2: "For The",
+        heroTitlePart3: "Scoopz",
+        heroTitlePart4: "Era",
+        heroDesc: "XnowTrader LLC is a digital media company focused on content creation and creator operations. We produce and publish original short-form video content and monetize through creator platforms and brand collaborations.",
+        btnScoopz: "Open Scoopz Profile",
+        btnContact: "Partner With Us",
+        replaceNote: "Note: Replace https://... with your official Scoopz link",
+          moreChannels: "...and 20+ more channels",
+        sBannerTitle: "Monetized via Scoopz",
+        sBannerDesc: "We publish content on Scoopz and generate revenue through platform monetization programs and promotional collaborations.",
+        sStat1Value: "100%",
+        sStat1Label: "Focus",
+        sStat2Value: "Top Tier",
+        sStat2Label: "Creator",
+        servicesTitle: "Our Capabilities",
+        servicesSubtitle: "End-to-end media operations designed for modern digital audiences.",
+        service1Title: "Content Production",
+        service1Desc: "High-end video creation, editing, and publishing tailored for short-form algorithms and high retention formats.",
+        service2Title: "Audience Engineering",
+        service2Desc: "Data-driven community building, engagement loops, and robust retention strategies to build loyal fanbases.",
+        service3Title: "Commercial Monetization",
+        service3Desc: "Optimizing creator payouts through Scoopz platform revenues and facilitating direct brand integrations.",
+        businessHeading: "Business information",
+        bizLegal: "Legal entity: XnowTrader LLC (Wyoming, USA)",
+        bizType: "Business type: Media / Content Creation",
+        bizEin: "EIN: 98-1920950",
+        footerText: "© 2026 XnowTrader LLC. All rights reserved.",
+        publishHeading: "Where we publish / Revenue sources",
+        scoopzLabel: "Our official Creator Network on Scoopz:",
+                contactHeading: "Contact",
+        contactEmailLabel: "Email:",
+                bizEmailLabel: "Corporate Email:",
+        tipsHeading: "Checklist For Platform / B2B Payouts",
+        tip1: "Ensure landing page URL is strictly public (no auth required).",
+        tip2: "Company name matches Payoneer documents exactly (XnowTrader LLC).",
+        tip3: "Clear business model outlining content creation/social media focus.",
+        tip4: "Valid contact email displayed aligns with account registration details.",
+        tip5: "Contains direct links to external monetization proofs (like Scoopz profile)."
+      },
+      vi: {
+        topline: "Vận hành Truyền thông & Creator Chuyên nghiệp",
+        badgeTitle: "Nhà Sáng Tạo Nội Dung Số",
+        heroTitlePart1: "Nội Dung Đẳng Cấp",
+        heroTitlePart2: "Trong Kỷ Nguyên",
+        heroTitlePart3: "Scoopz",
+        heroTitlePart4: "",
+        heroDesc: "XnowTrader LLC là một công ty truyền thông kỹ thuật số tập trung vào sáng tạo nội dung và hệ thống vận hành. Chúng tôi sản xuất và xuất bản các nội dung video ngắn nguyên bản, tạo ra doanh thu thông qua các nền tảng creator và hợp tác thương hiệu.",
+        btnScoopz: "Mở Hồ Sơ Scoopz",
+        btnContact: "Hợp Tác Cùng Chúng Tôi",
+        replaceNote: "Lưu ý: Thay https://... bằng liên kết Scoopz chính thức của bạn",
+          moreChannels: "...và hơn 20+ kênh khác",
+        sBannerTitle: "Kiếm tiền qua Scoopz",
+        sBannerDesc: "Chúng tôi xuất bản nội dung trên Scoopz và tạo doanh thu thông qua các chương trình kiếm tiền của nền tảng và hợp tác quảng cáo.",
+        sStat1Value: "100%",
+        sStat1Label: "Tập Trung",
+        sStat2Value: "Top Đầu",
+        sStat2Label: "Creator",
+        servicesTitle: "Dịch Vụ Của Chúng Tôi",
+        servicesSubtitle: "Khép kín quy trình vận hành truyền thông thiết kế dành riêng cho khán giả số hiện đại.",
+        service1Title: "Sản Xuất Nội Dung",
+        service1Desc: "Sáng tạo, biên tập và xuất bản video chất lượng cao, tối ưu tuyệt đối cho các thuật toán short-form và định dạng giữ chân người xem.",
+        service2Title: "Xây Dựng Khán Giả",
+        service2Desc: "Phát triển cộng đồng dựa trên dữ liệu thật, tạo các vòng lặp tương tác và chiến lược giữ chân để xây dựng lượng fan hùng hậu.",
+        service3Title: "Thương Mại Hóa",
+        service3Desc: "Tối ưu hóa các khoản thanh toán cho creator qua doanh thu từ nền tảng Scoopz và xúc tiến hợp tác trực tiếp với các nhãn hàng.",
+        businessHeading: "Thông tin doanh nghiệp",
+        bizLegal: "Pháp nhân: XnowTrader LLC (Wyoming, USA)",
+        bizType: "Loại hình kinh doanh: Media / Content Creation",
+        bizEin: "Mã số thuế (EIN): 98-1920950",
+        footerText: "© 2026 XnowTrader LLC. All rights reserved.",
+        publishHeading: "Nơi xuất bản / Nguồn doanh thu",
+        scoopzLabel: "Our official Creator Network on Scoopz:",
+                contactHeading: "Liên Hệ",
+        contactEmailLabel: "Email:",
+                bizEmailLabel: "Email Doanh Nghiệp:",
+        tipsHeading: "Checklist Để Duyệt Cổng Thanh Toán",
+        tip1: "Đảm bảo URL landing page vào được công khai (không cần đăng nhập).",
+        tip2: "Tên công ty trùng khớp chính xác với giấy tờ (XnowTrader LLC).",
+        tip3: "Mô hình kinh doanh thể hiện rõ tập trung vào sáng tạo nội dung/mạng xã hội.",
+        tip4: "Email liên hệ chính xác và khớp với thông tin đăng ký tài khoản.",
+        tip5: "Có chứa các link trực tiếp chứng minh nguồn doanh thu (như hồ sơ Scoopz)."
+      }
+    };
+
+    const nodes = document.querySelectorAll("[data-i18n]");
+    const enBtn = document.getElementById("lang-en");
+    const viBtn = document.getElementById("lang-vi");
+
+    function setLanguage(lang) {
+      document.documentElement.lang = lang;
+      const t = translations[lang];
+      nodes.forEach((node) => {
+        const key = node.getAttribute("data-i18n");
+        if (t[key]) {
+          node.innerHTML = t[key];
+        }
+      });
+      enBtn.classList.toggle("active", lang === "en");
+      viBtn.classList.toggle("active", lang === "vi");
+    }
+
+    enBtn.addEventListener("click", () => setLanguage("en"));
+    viBtn.addEventListener("click", () => setLanguage("vi"));
+    // Initialize
+    setLanguage("en");
+  </script>
+</body>
+</html>

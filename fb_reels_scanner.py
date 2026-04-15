@@ -27,12 +27,23 @@ MAX_IDLE_ROUNDS = 12
 SCROLL_DELAY_SECONDS = 3.0
 CHECKPOINT_WAIT_SECONDS = 1800
 CHECKPOINT_POLL_SECONDS = 3
-SCAN_MULTI_PROFILE_DIRS = [
-    str((Path.cwd() / "chrome_automation_user_data").resolve()),
-    str((Path.cwd() / "chrome_automation_user_data_2").resolve()),
-    str((Path.cwd() / "chrome_automation_user_data_3").resolve()),
-    str((Path.cwd() / "chrome_automation_user_data_4").resolve()),
-]
+
+# Use AppData/ScoopzToolData/chrome_profiles for Chrome user data
+def _get_appdata_profiles():
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        base = Path(appdata) / "ScoopzToolData" / "chrome_profiles"
+    else:
+        # fallback: next to script
+        base = Path(__file__).parent / "chrome_profiles"
+    return [
+        str((base / "chrome_automation_user_data").resolve()),
+        str((base / "chrome_automation_user_data_2").resolve()),
+        str((base / "chrome_automation_user_data_3").resolve()),
+        str((base / "chrome_automation_user_data_4").resolve()),
+    ]
+
+SCAN_MULTI_PROFILE_DIRS = _get_appdata_profiles()
 ENV_FILE = Path.cwd() / ".env"
 
 

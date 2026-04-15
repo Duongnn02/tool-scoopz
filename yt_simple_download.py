@@ -3,6 +3,7 @@
 import os
 import shutil
 import multiprocessing as mp
+import sys
 from typing import Callable, Tuple
 
 import yt_dlp
@@ -195,31 +196,63 @@ def _download_once_with_timeout(
     timeout_s: int,
     cookie_file: str = "",
 ) -> Tuple[bool, str, str, str]:
+    main_file = str(getattr(sys.modules.get("__main__"), "__file__", "") or "")
+    if (not main_file) or ("<stdin>" in main_file):
+        try:
+            return _download_once(
+                url,
+                out_dir,
+                _silent_logger,
+                email,
+                timeout_s,
+                cookie_file=cookie_file,
+            )
+        except Exception as e:
+            return False, str(e), "", ""
+
     ctx = mp.get_context("spawn")
     q: "mp.Queue" = ctx.Queue()
-    p = ctx.Process(
-        target=_download_once_worker,
-        args=(q, url, out_dir, email, timeout_s, cookie_file),
-    )
-    p.daemon = True
-    p.start()
-    p.join(timeout_s)
-    if p.is_alive():
-        try:
-            p.terminate()
-        except Exception:
-            pass
-        try:
-            p.join(5)
-        except Exception:
-            pass
-        return False, f"timeout after {timeout_s}s", "", ""
+    p = None
     try:
-        if not q.empty():
-            return q.get_nowait()
-    except Exception:
-        pass
-    return False, "download failed", "", ""
+        p = ctx.Process(
+            target=_download_once_worker,
+            args=(q, url, out_dir, email, timeout_s, cookie_file),
+        )
+        p.daemon = True
+        p.start()
+        p.join(timeout_s)
+        if p.is_alive():
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            try:
+                p.join(5)
+            except Exception:
+                pass
+            return False, f"timeout after {timeout_s}s", "", ""
+        try:
+            if not q.empty():
+                return q.get_nowait()
+        except Exception:
+            pass
+        if p is not None and p.exitcode not in (0, None):
+            return False, f"download worker crashed (exitcode={p.exitcode})", "", ""
+        return False, "download failed", "", ""
+    except OSError as e:
+        if getattr(e, "errno", None) == 22:
+            try:
+                return _download_once(
+                    url,
+                    out_dir,
+                    _silent_logger,
+                    email,
+                    timeout_s,
+                    cookie_file=cookie_file,
+                )
+            except Exception as e2:
+                return False, f"{e} | fallback direct failed: {e2}", "", ""
+        return False, str(e), "", ""
 
 
 def download_one(

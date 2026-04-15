@@ -168,6 +168,11 @@ class App:
         self._cache_db = os.path.join(DATA_DIR, "cache.db")
         self._cache_db_lock = threading.Lock()
         self._extra_proxy_file = os.path.join(DATA_DIR, "extra_proxies.txt")
+        self._default_gpm_root = os.path.join(DATA_DIR, "gpm_profiles")
+        try:
+            os.makedirs(self._default_gpm_root, exist_ok=True)
+        except Exception:
+            pass
         
         # Initialize logger
         log_dir = os.path.join(DATA_DIR, "logs")
@@ -544,7 +549,7 @@ class App:
 
         ttk.Label(path_frame, text="GPM Path:").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
         self.entry_gpm_path = ttk.Entry(path_frame, width=28)
-        self.entry_gpm_path.insert(0, r"C:\GPM")
+        self.entry_gpm_path.insert(0, self._default_gpm_root)
         self.entry_gpm_path.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 4))
 
         self._search_placeholder = "Search email..."
@@ -854,6 +859,7 @@ class App:
         profile_top.pack(fill="x", padx=8, pady=(8, 0))
         self.btn_import_profile = ttk.Button(profile_top, text="IMPORT PROFILE", command=self._import_active_profile_accounts)
         self.btn_import_profile.pack(side="left")
+        ttk.Button(profile_top, text="CHUYEN DU LIEU", command=self._transfer_active_profile_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(profile_top, text="Select All", command=self._select_all_active_profile_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(profile_top, text="Deselect All", command=self._deselect_all_active_profile_accounts).pack(side="left")
         ttk.Label(profile_top, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
@@ -1015,6 +1021,7 @@ class App:
         fb_profile_top.pack(fill="x", padx=8, pady=(8, 0))
         self.btn_import_fb_profile = ttk.Button(fb_profile_top, text="IMPORT PROFILE", command=self._import_active_profile_accounts)
         self.btn_import_fb_profile.pack(side="left")
+        ttk.Button(fb_profile_top, text="CHUYEN DU LIEU", command=self._transfer_active_profile_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(fb_profile_top, text="Select All", command=self._select_all_active_profile_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(fb_profile_top, text="Deselect All", command=self._deselect_all_active_profile_accounts).pack(side="left")
         ttk.Label(fb_profile_top, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
@@ -3750,6 +3757,68 @@ class App:
             out.append(acc)
         return out
 
+    def _transfer_accounts_to_upload(
+        self,
+        source_accounts: list,
+        target_accounts: list,
+        checked_emails: set,
+        link_field: str,
+        reload_rows: bool = True,
+    ) -> int:
+        if not isinstance(source_accounts, list) or not source_accounts or not checked_emails:
+            return 0
+
+        changed = 0
+        existing_by_uid = {
+            (acc.get("uid") or "").strip().lower(): acc
+            for acc in target_accounts
+            if (acc.get("uid") or "").strip()
+        }
+
+        checked_keys = {str(email or "").strip().lower() for email in checked_emails if str(email or "").strip()}
+        for src in source_accounts:
+            uid = (src.get("uid") or "").strip()
+            if not uid:
+                continue
+            uid_key = uid.lower()
+            if uid_key not in checked_keys:
+                continue
+            dst = existing_by_uid.get(uid_key)
+            if dst is None:
+                merged = {
+                    "uid": uid,
+                    "pass": src.get("pass", ""),
+                    "proxy": src.get("proxy", ""),
+                    link_field: src.get(link_field, ""),
+                    "status": "READY",
+                }
+                target_accounts.append(merged)
+                existing_by_uid[uid_key] = merged
+                changed += 1
+                continue
+
+            updated = False
+            for field in ("pass", "proxy", link_field):
+                src_val = (src.get(field) or "").strip()
+                dst_val = (dst.get(field) or "").strip()
+                if src_val and src_val != dst_val:
+                    dst[field] = src_val
+                    updated = True
+            if updated:
+                changed += 1
+
+        if changed:
+            target_accounts[:] = self._dedupe_accounts(target_accounts)
+            if reload_rows and target_accounts is self.accounts:
+                self._load_rows()
+            elif reload_rows and target_accounts is self.fb_accounts:
+                self._load_fb_rows()
+            elif target_accounts is self.accounts:
+                self._save_accounts_cache()
+            elif target_accounts is self.fb_accounts:
+                self._save_fb_accounts_cache()
+        return changed
+
     def _format_total_with_run(
         self,
         label: str,
@@ -5711,6 +5780,7 @@ class App:
         col_name = editor.get("col_name")
         if not tree or not item_id or not col_name:
             return
+        old_value = tree.set(item_id, col_name)
         tree.set(item_id, col_name, new_value)
         try:
             idx = int(item_id) - 1
@@ -5751,55 +5821,48 @@ class App:
         elif tree == self.all_tree:
             social = (self.all_tree.set(item_id, "social") or "").strip().upper()
             email = (self.all_tree.set(item_id, "email") or "").strip()
-            if social and email:
-                if col_name == "proxy":
-                    if social == "YTB":
-                        for acc in self.accounts:
-                            if acc.get("uid") == email:
-                                acc["proxy"] = new_value
-                                break
-                        self._save_accounts_cache()
-                        try:
-                            iid = self._map_email_to_item_id(self.tree).get(email)
-                            if iid:
-                                self.tree.set(iid, "proxy", new_value)
-                        except Exception:
-                            pass
-                    elif social == "FB":
-                        for acc in self.fb_accounts:
-                            if acc.get("uid") == email:
-                                acc["proxy"] = new_value
-                                break
-                        self._save_fb_accounts_cache()
-                        try:
-                            iid = self._map_email_to_item_id(self.fb_tree).get(email)
-                            if iid:
-                                self.fb_tree.set(iid, "proxy", new_value)
-                        except Exception:
-                            pass
-                elif col_name == "link":
-                    if social == "YTB":
-                        for acc in self.accounts:
-                            if acc.get("uid") == email:
+            old_email = (old_value if col_name == "email" else email).strip()
+            if social and old_email:
+                if social == "YTB":
+                    updated = False
+                    for acc in self.accounts:
+                        if (acc.get("uid") or "").strip() == old_email:
+                            if col_name == "email":
+                                acc["uid"] = new_value
+                            elif col_name in {"pass", "proxy"}:
+                                acc[col_name] = new_value
+                            elif col_name == "link":
                                 acc["youtube"] = new_value
-                                break
+                            updated = True
+                            break
+                    if updated:
                         self._save_accounts_cache()
                         try:
-                            iid = self._map_email_to_item_id(self.tree).get(email)
+                            iid = self._map_email_to_item_id(self.tree).get(old_email)
                             if iid:
-                                self.tree.set(iid, "youtube", new_value)
+                                target_col = "youtube" if col_name == "link" else col_name
+                                self.tree.set(iid, target_col, new_value)
                         except Exception:
                             pass
-                    elif social == "FB":
-                        for acc in self.fb_accounts:
-                            if acc.get("uid") == email:
+                elif social == "FB":
+                    updated = False
+                    for acc in self.fb_accounts:
+                        if (acc.get("uid") or "").strip() == old_email:
+                            if col_name == "email":
+                                acc["uid"] = new_value
+                            elif col_name in {"pass", "proxy"}:
+                                acc[col_name] = new_value
+                            elif col_name == "link":
                                 acc["facebook"] = new_value
-                                break
+                            updated = True
+                            break
+                    if updated:
                         self._save_fb_accounts_cache()
                         try:
-                            iid = self._map_email_to_item_id(self.fb_tree).get(email)
+                            iid = self._map_email_to_item_id(self.fb_tree).get(old_email)
                             if iid:
-                                self.fb_tree.set(iid, "facebook", new_value)
+                                target_col = "facebook" if col_name == "link" else col_name
+                                self.fb_tree.set(iid, target_col, new_value)
                         except Exception:
                             pass
         elif tree == self.manage_tree:
@@ -5898,7 +5961,7 @@ class App:
                 col_name = self.all_tree["columns"][col_idx]
             except Exception:
                 col_name = ""
-            if col_name in {"proxy", "link"}:
+            if col_name in {"email", "pass", "proxy", "link"}:
                 self._begin_cell_edit(self.all_tree, row, col_name)
                 return "break"
         if column == "#1":
@@ -7632,6 +7695,43 @@ class App:
         except Exception:
             return False
 
+    def _transfer_active_profile_accounts(self) -> None:
+        if self._is_fb_profile_tab():
+            tree = self.fb_profile_tree
+            source_accounts = self.fb_profile_accounts
+            target_accounts = self.fb_accounts
+            link_field = "facebook"
+            target_tab = self.tab_fb
+            label = "FB"
+        else:
+            tree = self.profile_tree
+            source_accounts = self.profile_accounts
+            target_accounts = self.accounts
+            link_field = "youtube"
+            target_tab = self.tab_upload
+            label = "YTB"
+
+        checked_emails = self._get_checked_email_set(tree)
+        if not checked_emails:
+            messagebox.showinfo("Chuyen du lieu", "Hay tick cac dong profile can chuyen.")
+            return
+
+        moved = self._transfer_accounts_to_upload(
+            source_accounts=source_accounts,
+            target_accounts=target_accounts,
+            checked_emails=checked_emails,
+            link_field=link_field,
+            reload_rows=True,
+        )
+        if moved <= 0:
+            messagebox.showinfo("Chuyen du lieu", f"Khong co du lieu {label} nao can cap nhat sang Upload.")
+            return
+
+        self._set_sidebar_active("upvideo")
+        self._select_tab(target_tab)
+        self._log(f"[TRANSFER {label}] moved {moved} account(s) from Profile -> Upload")
+        messagebox.showinfo("Chuyen du lieu", f"Da chuyen {moved} tai khoan {label} sang man Upload.")
+
     def start_profile_jobs(self) -> None:
         if self._profile_batch_running or self.executor is not None:
             return
@@ -8786,36 +8886,33 @@ class App:
             self._save_profile_assets(acc["uid"], fb_name, fb_username, avatar_path)
 
             self._set_fb_profile_status(item_id, "OPEN PROFILE...")
-            self._set_fb_profile_status(item_id, "WAIT UPDATE...")
             ok_pf = False
             err_pf = ""
-            with self.profile_update_lock:
-                for attempt in range(1, 4):
-                    if self.stop_event.is_set():
-                        return
-                    self._set_fb_profile_status(item_id, f"OPEN PROFILE... ({attempt}/3)")
-                    ok_pf, err_pf = open_profile_in_scoopz(
-                        driver_path,
-                        remote,
-                        avatar_path,
-                        fb_name,
-                        fb_username,
-                        logger=self._log,
-                        max_retries=3,
-                    )
-                    if ok_pf:
-                        break
-                    retryable = (
-                        "cannot connect to chrome" in (err_pf or "").lower()
-                        or "profile link not found" in (err_pf or "").lower()
-                        or "profile page load timeout" in (err_pf or "").lower()
-                        or "dialog busy" in (err_pf or "").lower()
-                    )
-                    if not retryable:
-                        break
-                    wait_s = 2 + attempt * 2
-                    self._log(f"[{acc['uid']}] FB PROFILE RETRY {attempt}/3 in {wait_s}s: {err_pf}")
-                    time.sleep(wait_s)
+            for attempt in range(1, 4):
+                if self.stop_event.is_set():
+                    return
+                self._set_fb_profile_status(item_id, f"OPEN PROFILE... ({attempt}/3)")
+                ok_pf, err_pf = open_profile_in_scoopz(
+                    driver_path,
+                    remote,
+                    avatar_path,
+                    fb_name,
+                    fb_username,
+                    logger=self._log,
+                    max_retries=3,
+                )
+                if ok_pf:
+                    break
+                retryable = (
+                    "cannot connect to chrome" in (err_pf or "").lower()
+                    or "profile link not found" in (err_pf or "").lower()
+                    or "profile page load timeout" in (err_pf or "").lower()
+                )
+                if not retryable:
+                    break
+                wait_s = 2 + attempt * 2
+                self._log(f"[{acc['uid']}] FB PROFILE RETRY {attempt}/3 in {wait_s}s: {err_pf}")
+                time.sleep(wait_s)
             if not ok_pf:
                 self._set_fb_profile_status(item_id, f"PROFILE ERR: {err_pf}")
                 return
@@ -9838,11 +9935,43 @@ class App:
         except Exception:
             raw = ""
         if not raw:
-            return ""
+            raw = self._default_gpm_root
         try:
-            return os.path.abspath(os.path.expanduser(raw))
+            path = os.path.abspath(os.path.expanduser(raw))
         except Exception:
-            return raw
+            path = raw
+        if self._is_unsafe_gpm_root(path):
+            fallback = self._default_gpm_root
+            try:
+                os.makedirs(fallback, exist_ok=True)
+            except Exception:
+                pass
+            try:
+                self.entry_gpm_path.delete(0, tk.END)
+                self.entry_gpm_path.insert(0, fallback)
+            except Exception:
+                pass
+            try:
+                self._log(f"[GPM] Unsafe root blocked: {path} -> {fallback}")
+            except Exception:
+                pass
+            return fallback
+        return path
+
+    def _is_unsafe_gpm_root(self, path: str) -> bool:
+        try:
+            norm = os.path.normcase(os.path.abspath(path))
+        except Exception:
+            norm = os.path.normcase(str(path or ""))
+        blocked = set()
+        for candidate in (_THIS_DIR, _BASE_DIR, os.getcwd()):
+            if not candidate:
+                continue
+            try:
+                blocked.add(os.path.normcase(os.path.abspath(candidate)))
+            except Exception:
+                blocked.add(os.path.normcase(candidate))
+        return norm in blocked
 
     def _guess_profile_path(self) -> str:
         gpm_root = self._get_gpm_root()
@@ -10892,35 +11021,33 @@ class App:
             self._log(f"[{acc['uid']}] LOGIN OK (PROFILE)")
 
             self._set_profile_status(item_id, "OPEN PROFILE...")
-            self._set_profile_status(item_id, "WAIT UPDATE...")
             ok_p = False
             err_p = ""
-            with self.profile_update_lock:
-                for attempt in range(1, 4):
-                    if self.stop_event.is_set():
-                        return
-                    self._set_profile_status(item_id, f"OPEN PROFILE... ({attempt}/3)")
-                    ok_p, err_p = open_profile_in_scoopz(
-                        driver_path,
-                        remote,
-                        avatar_path,
-                        name,
-                        username,
-                        logger=self._log,
-                        max_retries=3,
-                    )
-                    if ok_p:
-                        break
-                    retryable = (
-                        "cannot connect to chrome" in (err_p or "").lower()
-                        or "profile link not found" in (err_p or "").lower()
-                        or "profile page load timeout" in (err_p or "").lower()
-                    )
-                    if not retryable:
-                        break
-                    wait_s = 2 + attempt * 2
-                    self._log(f"[{acc['uid']}] PROFILE RETRY {attempt}/3 in {wait_s}s: {err_p}")
-                    time.sleep(wait_s)
+            for attempt in range(1, 4):
+                if self.stop_event.is_set():
+                    return
+                self._set_profile_status(item_id, f"OPEN PROFILE... ({attempt}/3)")
+                ok_p, err_p = open_profile_in_scoopz(
+                    driver_path,
+                    remote,
+                    avatar_path,
+                    name,
+                    username,
+                    logger=self._log,
+                    max_retries=3,
+                )
+                if ok_p:
+                    break
+                retryable = (
+                    "cannot connect to chrome" in (err_p or "").lower()
+                    or "profile link not found" in (err_p or "").lower()
+                    or "profile page load timeout" in (err_p or "").lower()
+                )
+                if not retryable:
+                    break
+                wait_s = 2 + attempt * 2
+                self._log(f"[{acc['uid']}] PROFILE RETRY {attempt}/3 in {wait_s}s: {err_p}")
+                time.sleep(wait_s)
             if not ok_p:
                 self._set_profile_status(item_id, f"PROFILE ERR: {err_p}")
                 self._log(f"[{acc['uid']}] PROFILE ERR: {err_p}")

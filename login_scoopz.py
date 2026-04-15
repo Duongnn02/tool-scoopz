@@ -488,31 +488,27 @@ def open_profile_in_scoopz(
             if not os.path.exists(avatar_path):
                 return False, f"Avatar file not found: {avatar_path}"
 
-            acquired = _dialog_lock.acquire(timeout=15)
-            if not acquired:
-                return False, "Dialog busy"
+            # Direct file input — no OS dialog, no lock needed
+            avatar_abs = os.path.abspath(avatar_path)
+            file_inputs = driver.find_elements(
+                _By.XPATH, "//input[@type='file' and contains(@accept,'image')]"
+            )
+            if not file_inputs:
+                return False, "Image file input not found"
             try:
-                try:
-                    pic_btn.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", pic_btn)
-                _log("[PROFILE] Change picture clicked")
-                time.sleep(0.15)
-                if not _select_file_in_dialog(avatar_path, logger, timeout=15):
-                    if _set_clipboard(avatar_path):
-                        try:
-                            driver.switch_to.active_element.send_keys(_Keys.CONTROL, "v")
-                            driver.switch_to.active_element.send_keys(_Keys.ENTER)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            driver.switch_to.active_element.send_keys(avatar_path)
-                            driver.switch_to.active_element.send_keys(_Keys.ENTER)
-                        except Exception:
-                            pass
-            finally:
-                _dialog_lock.release()
+                file_inputs[0].send_keys(avatar_abs)
+            except Exception:
+                driver.execute_script(
+                    "arguments[0].style.display='block';"
+                    "arguments[0].style.visibility='visible';"
+                    "arguments[0].style.opacity=1;"
+                    "arguments[0].style.height='1px';"
+                    "arguments[0].style.width='1px';",
+                    file_inputs[0],
+                )
+                time.sleep(0.05)
+                file_inputs[0].send_keys(avatar_abs)
+            _log("[PROFILE] Change picture set via direct input")
 
             time.sleep(0.5)
             _log("[PROFILE] Avatar uploaded, waiting for Edit Profile button...")
