@@ -14,24 +14,35 @@ UPDATE_ENDPOINT = f"{API_BASE}/profiles"
 COOKIES_FILE = "cookies.txt"
 COOKIES_FILE_FALLBACK = "cookies_alt.txt"
 
-# App data directory (per-user, with fallback if APPDATA is blocked)
+# App data directory (prefer local repo/exe folder, with APPDATA fallback)
 def _pick_data_dir() -> str:
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
+    local_path = os.path.join(base, "ScoopzToolData")
+    try:
+        os.makedirs(local_path, exist_ok=True)
+        test_file = os.path.join(local_path, ".__write_test__")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test_file)
+        return local_path
+    except Exception:
+        pass
+
     appdata = os.getenv("APPDATA")
     if appdata:
-        path = os.path.join(appdata, "ScoopzToolData")
+        appdata_path = os.path.join(appdata, "ScoopzToolData")
         try:
-            os.makedirs(path, exist_ok=True)
-            test_file = os.path.join(path, ".__write_test__")
+            os.makedirs(appdata_path, exist_ok=True)
+            test_file = os.path.join(appdata_path, ".__write_test__")
             with open(test_file, "w", encoding="utf-8") as f:
                 f.write("ok")
             os.remove(test_file)
-            return path
+            return appdata_path
         except Exception:
             pass
-    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
-    path = os.path.join(base, "ScoopzToolData")
-    os.makedirs(path, exist_ok=True)
-    return path
+
+    os.makedirs(local_path, exist_ok=True)
+    return local_path
 
 DATA_DIR = _pick_data_dir()
 

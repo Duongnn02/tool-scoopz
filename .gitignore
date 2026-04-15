@@ -1,6 +1,7 @@
 # Large files and folders
 video/
-ScoopzToolData/
+ScoopzToolData/*
+!ScoopzToolData/license.db
 ScoopzSync/
 accounts_cache.json
 cookies.txt

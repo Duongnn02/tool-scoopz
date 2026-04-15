@@ -1601,6 +1601,9 @@ class App:
                 return False
 
         legacy_candidates = [_THIS_DIR, os.getcwd()]
+        appdata = os.getenv("APPDATA")
+        if appdata:
+            legacy_candidates.insert(0, os.path.join(appdata, "ScoopzToolData"))
         files_to_copy = [
             "cache.db",
             "license.db",
