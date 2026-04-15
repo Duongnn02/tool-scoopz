@@ -1625,7 +1625,13 @@ class App:
                         continue
                 if name == "license.db":
                     dst_ok = _db_has_any_rows(dst, "keys")
-                    if dst_ok:
+                    try:
+                        src_mtime = os.path.getmtime(src)
+                        dst_mtime = os.path.getmtime(dst) if os.path.exists(dst) else -1
+                    except Exception:
+                        src_mtime = -1
+                        dst_mtime = -1
+                    if dst_ok and dst_mtime >= src_mtime:
                         continue
                 if os.path.exists(src):
                     try:
