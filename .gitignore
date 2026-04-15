@@ -67,6 +67,7 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+!license.db
 .pytest_cache/
 
 # Temporary files
