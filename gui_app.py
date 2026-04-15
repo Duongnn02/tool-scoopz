@@ -6270,6 +6270,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_accounts() or self._get_selected_accounts() or self._get_checked_accounts()
         if not selected:
             return
@@ -6283,6 +6284,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_accounts() or self._get_selected_accounts() or self._get_checked_accounts()
         if not selected:
             return
@@ -6296,6 +6298,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_accounts() or self._get_selected_accounts() or self._get_checked_accounts()
         if not selected:
             return
@@ -6309,6 +6312,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_fb_accounts() or self._get_selected_fb_accounts() or self._get_checked_fb_accounts()
         if not selected:
             return
@@ -6345,6 +6349,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_fb_accounts() or self._get_selected_fb_accounts() or self._get_checked_fb_accounts()
         if not selected:
             return
@@ -6388,6 +6393,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_fb_accounts() or self._get_selected_fb_accounts() or self._get_checked_fb_accounts()
         if not selected:
             return
@@ -6424,6 +6430,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_all_rows() or self._get_selected_all_rows() or self._get_checked_all_rows()
         if not selected:
             return
@@ -6477,6 +6484,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_all_rows() or self._get_selected_all_rows() or self._get_checked_all_rows()
         if not selected:
             return
@@ -6501,6 +6509,7 @@ class App:
         if self.executor is not None:
             self._log("[MENU] Dang chay job, hay STOP truoc.")
             return
+        self.stop_event.clear()
         selected = self._get_context_all_rows() or self._get_selected_all_rows() or self._get_checked_all_rows()
         if not selected:
             return
@@ -8284,6 +8293,7 @@ class App:
             return
         self._runtime_start()
         self._increment_cycle()
+        self._reset_all_statuses()
         
         try:
             max_threads = int(self._fixed_threads or int(self.entry_threads.get()))
