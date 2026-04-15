@@ -776,7 +776,7 @@ class App:
         ttk.Button(btn_frame_upload, text="IMPORT", command=self._import_active_upload_accounts).pack(side="left")
         ttk.Button(btn_frame_upload, text="Select All", command=self._select_all_active_upload_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(btn_frame_upload, text="Deselect All", command=self._deselect_all_active_upload_accounts).pack(side="left")
-        ttk.Button(btn_frame_upload, text="EXPORT", command=self._export_active_upload_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(btn_frame_upload, text="EXPORT EXCEL", command=self._export_active_upload_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(btn_frame_upload, text="SCAN", command=self._scan_active_upload_accounts).pack(side="left")
         ttk.Label(btn_frame_upload, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
         ttk.Radiobutton(
@@ -935,7 +935,7 @@ class App:
         self.btn_import_fb.pack(side="left")
         ttk.Button(fb_top, text="Select All", command=self._select_all_active_upload_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(fb_top, text="Deselect All", command=self._deselect_all_active_upload_accounts).pack(side="left")
-        ttk.Button(fb_top, text="EXPORT", command=self._export_active_upload_accounts).pack(side="left", padx=(8, 4))
+        ttk.Button(fb_top, text="EXPORT EXCEL", command=self._export_active_upload_accounts).pack(side="left", padx=(8, 4))
         ttk.Button(fb_top, text="SCAN", command=self._scan_active_upload_accounts).pack(side="left")
         ttk.Label(fb_top, text="Channel:", style="Subtle.TLabel").pack(side="left", padx=(14, 6))
         ttk.Radiobutton(
@@ -1761,8 +1761,7 @@ class App:
             messagebox.showerror("Export", "Can phai cai dat openpyxl de xuat file .xlsx")
             return
 
-        channel = self._channel()
-        default_name = "fb_accounts_export.xlsx" if channel == "fb" else "ytb_accounts_export.xlsx"
+        default_name = "ytb_fb_accounts_export.xlsx"
         path = filedialog.asksaveasfilename(
             title="Export accounts to Excel",
             defaultextension=".xlsx",
@@ -1777,50 +1776,37 @@ class App:
                 return ""
             return str(v)
 
+        def _write_sheet(ws, tree, link_field: str) -> int:
+            ws.append(["EMAIL", "PASS", "PROXY", "LINK"])
+            if tree is None:
+                return 0
+            rows = 0
+            for iid in list(tree.get_children()):
+                email = _to_text(tree.set(iid, "email")).strip()
+                password = _to_text(tree.set(iid, "pass")).strip()
+                proxy = _to_text(tree.set(iid, "proxy")).strip()
+                link = _to_text(tree.set(iid, link_field)).strip()
+                if not link:
+                    link = _to_text(tree.set(iid, "profile_url")).strip()
+                ws.append([email, password, proxy, link])
+                rows += 1
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 80)
+            return rows
+
         try:
             wb = openpyxl.Workbook()
             ws = wb.active
-            if channel == "fb":
-                ws.title = "FACEBOOK"
-                headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "FACEBOOK", "PROFILE_URL", "PROFILE_ID"]
-                ws.append(headers)
-                items = list(self.fb_tree.get_children()) if hasattr(self, "fb_tree") else []
-                for idx, iid in enumerate(items, start=1):
-                    ws.append(
-                        [
-                            idx,
-                            _to_text(self.fb_tree.set(iid, "email")),
-                            _to_text(self.fb_tree.set(iid, "pass")),
-                            _to_text(self.fb_tree.set(iid, "posts")),
-                            _to_text(self.fb_tree.set(iid, "followers")),
-                            _to_text(self.fb_tree.set(iid, "proxy")),
-                            _to_text(self.fb_tree.set(iid, "facebook")),
-                            _to_text(self.fb_tree.set(iid, "profile_url")),
-                            _to_text(self.fb_tree.set(iid, "profile_id")),
-                        ]
-                    )
-            else:
-                ws.title = "YOUTUBE"
-                headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "YOUTUBE", "PROFILE_URL", "PROFILE_ID"]
-                ws.append(headers)
-                items = list(self.tree.get_children()) if hasattr(self, "tree") else []
-                for idx, iid in enumerate(items, start=1):
-                    ws.append(
-                        [
-                            idx,
-                            _to_text(self.tree.set(iid, "email")),
-                            _to_text(self.tree.set(iid, "pass")),
-                            _to_text(self.tree.set(iid, "posts")),
-                            _to_text(self.tree.set(iid, "followers")),
-                            _to_text(self.tree.set(iid, "proxy")),
-                            _to_text(self.tree.set(iid, "youtube")),
-                            _to_text(self.tree.set(iid, "profile_url")),
-                            _to_text(self.tree.set(iid, "profile_id")),
-                        ]
-                    )
+            ws.title = "YTB"
+            ytb_rows = _write_sheet(ws, getattr(self, "tree", None), "youtube")
+            fb_ws = wb.create_sheet("FB")
+            fb_rows = _write_sheet(fb_ws, getattr(self, "fb_tree", None), "facebook")
 
             wb.save(path)
-            self._log(f"[EXPORT] Saved {len(items)} {channel.upper()} accounts -> {path}")
+            self._log(
+                f"[EXPORT] Saved YTB={ytb_rows} rows, FB={fb_rows} rows -> {path}"
+            )
             messagebox.showinfo("Export", f"Da xuat xong file:\n{path}")
         except Exception as e:
             messagebox.showerror("Export", f"Loi xuat file: {e}")
@@ -7380,75 +7366,7 @@ class App:
         self._log(f"[IMPORT] Loaded {len(new_accounts)} accounts")
 
     def export_accounts_excel(self) -> None:
-        try:
-            import openpyxl  # type: ignore
-        except Exception:
-            messagebox.showerror("Export", "Can phai cai dat openpyxl de xuat file .xlsx")
-            return
-
-        path = filedialog.asksaveasfilename(
-            title="Export accounts to Excel",
-            defaultextension=".xlsx",
-            initialfile="accounts_export.xlsx",
-            filetypes=[("Excel", "*.xlsx")],
-        )
-        if not path:
-            return
-
-        def _to_text(v):
-            if v is None:
-                return ""
-            return str(v)
-
-        yt_headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "YOUTUBE", "PROFILE_URL", "PROFILE_ID"]
-        fb_headers = ["STT", "EMAIL", "PASS", "POSTS", "FOLLOWERS", "PROXY", "FACEBOOK", "PROFILE_URL", "PROFILE_ID"]
-
-        try:
-            wb = openpyxl.Workbook()
-            ws_yt = wb.active
-            ws_yt.title = "YOUTUBE"
-            ws_yt.append(yt_headers)
-            yt_items = list(self.tree.get_children()) if hasattr(self, "tree") else []
-            for idx, iid in enumerate(yt_items, start=1):
-                ws_yt.append(
-                    [
-                        idx,
-                        _to_text(self.tree.set(iid, "email")),
-                        _to_text(self.tree.set(iid, "pass")),
-                        _to_text(self.tree.set(iid, "posts")),
-                        _to_text(self.tree.set(iid, "followers")),
-                        _to_text(self.tree.set(iid, "proxy")),
-                        _to_text(self.tree.set(iid, "youtube")),
-                        _to_text(self.tree.set(iid, "profile_url")),
-                        _to_text(self.tree.set(iid, "profile_id")),
-                    ]
-                )
-
-            ws_fb = wb.create_sheet("FACEBOOK")
-            ws_fb.append(fb_headers)
-            fb_items = list(self.fb_tree.get_children()) if hasattr(self, "fb_tree") else []
-            for idx, iid in enumerate(fb_items, start=1):
-                ws_fb.append(
-                    [
-                        idx,
-                        _to_text(self.fb_tree.set(iid, "email")),
-                        _to_text(self.fb_tree.set(iid, "pass")),
-                        _to_text(self.fb_tree.set(iid, "posts")),
-                        _to_text(self.fb_tree.set(iid, "followers")),
-                        _to_text(self.fb_tree.set(iid, "proxy")),
-                        _to_text(self.fb_tree.set(iid, "facebook")),
-                        _to_text(self.fb_tree.set(iid, "profile_url")),
-                        _to_text(self.fb_tree.set(iid, "profile_id")),
-                    ]
-                )
-
-            wb.save(path)
-            self._log(
-                f"[EXPORT] Saved {len(yt_items)} YTB + {len(fb_items)} FB accounts -> {path}"
-            )
-            messagebox.showinfo("Export", f"Da xuat xong file:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Export", f"Loi xuat file: {e}")
+        self._export_active_upload_accounts()
 
     def import_proxy_list(self) -> None:
         path = self._extra_proxy_file
