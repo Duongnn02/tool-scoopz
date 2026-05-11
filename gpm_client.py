@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
-from config import CREATE_ENDPOINT, START_ENDPOINT, CLOSE_ENDPOINT, DELETE_ENDPOINT
+from config import CREATE_ENDPOINT, START_ENDPOINT, CLOSE_ENDPOINT, DELETE_ENDPOINT, SHARED_PROXY
 
 
 def build_raw_proxy(proxy: str) -> Dict[str, Any]:
@@ -87,10 +87,19 @@ def create_profile(
     proxy: str = "",
     startup_urls: str = "",
     logger=None,
+    force_proxy: str = "",
 ) -> Tuple[bool, Dict[str, Any], str]:
+    # By default the project uses one shared proxy for every create request.
+    # When `force_proxy` is supplied (e.g. by the interact worker pulling a
+    # unique IP from proxy_pool.txt), it bypasses the shared default so each
+    # profile can run under a distinct egress IP.
+    if force_proxy:
+        effective_proxy = force_proxy.strip()
+    else:
+        effective_proxy = (SHARED_PROXY or proxy or "").strip()
     payload = {
         "profile_name": profile_name,
-        "raw_proxy": proxy or "",
+        "raw_proxy": effective_proxy,
         "startup_urls": startup_urls or "",
         "note": "",
     }
@@ -224,7 +233,7 @@ def extract_driver_info(data: Dict[str, Any], logger=None) -> Tuple[Optional[str
 
 
 if __name__ == "__main__":
-    test_proxy = "154.6.83.85:6556:uvsmvbyr:6d9c706mwyge"
+    test_proxy = SHARED_PROXY
     num_profiles = 5
     created_ids: List[str] = []
     start_results = []

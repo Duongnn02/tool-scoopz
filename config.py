@@ -13,6 +13,7 @@ SCOOPZ_UPLOAD_URL = "https://thescoopz.com/upload"
 UPDATE_ENDPOINT = f"{API_BASE}/profiles"
 COOKIES_FILE = "cookies.txt"
 COOKIES_FILE_FALLBACK = "cookies_alt.txt"
+SHARED_PROXY = "proxy.flyproxy.com:1212:fly-l4wc4k67knpn:uh4AIbcAx6RzCEkC"
 
 # App data directory (prefer local repo/exe folder, with APPDATA fallback)
 def _pick_data_dir() -> str:

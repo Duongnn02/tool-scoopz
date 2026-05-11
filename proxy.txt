@@ -1,0 +1,10 @@
+# Each non-empty, non-comment line is one upstream proxy.
+# Format: host:port:user:pass  (HTTP, basic auth)
+#
+# Gateway-template entries support a {sid} placeholder in user/pass. When
+# proxy_pool.take() picks a template line, it substitutes a fresh random
+# session id, so a single rotating-gateway entry serves many parallel
+# profiles with sticky-but-distinct IPs.
+#
+# Active gateway: flyproxy US — _session-{sid} gives a sticky US IP per call.
+us.flyproxy.com:1212:fly-l4wc4k67knpn_area-US_session-{sid}:uh4AIbcAx6RzCEkC

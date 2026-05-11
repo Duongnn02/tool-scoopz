@@ -1,7 +1,0 @@
-  HOTMAIL.txt: 376 lines (0 invalid)
-  mail chuan.txt: 25 lines (0 invalid)
-  mail kênh v2.txt: 109 lines (0 invalid)
-  mail goc.txt: 103 lines (0 invalid)
-  data.txt: 25 lines (0 invalid)
-
-Total unique (by email): 425

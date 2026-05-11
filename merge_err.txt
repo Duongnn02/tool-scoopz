@@ -1,6 +1,0 @@
-Traceback (most recent call last):
-  File "C:\Users\Admin\Desktop\tool_rewrite\tool_rewrite\merge_tokens.py", line 52, in <module>
-    print(f"Written \u2192 {OUT}")
-  File "C:\Users\Admin\AppData\Local\Programs\Python\Python310\lib\encodings\cp1252.py", line 19, in encode
-    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
-UnicodeEncodeError: 'charmap' codec can't encode character '\u2192' in position 8: character maps to <undefined>

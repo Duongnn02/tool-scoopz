@@ -1,6 +1,0 @@
-YTB accounts : 191
-FB  accounts : 281
-Tool total   : 472 unique emails
-Token file   : 425 entries
-
-Matched      : 178

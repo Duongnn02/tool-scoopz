@@ -47,6 +47,7 @@ from config import (
     COOKIES_FILE,
     COOKIES_FILE_FALLBACK,
     DATA_DIR,
+    SHARED_PROXY,
     LICENSE_SERVER_ENABLED,
     LICENSE_SERVER_HOST,
     LICENSE_SERVER_PORT,
@@ -253,7 +254,7 @@ class App:
         self._fallback_caption_lock = threading.Lock()
         self._creator_fund_checked = set()
         self._creator_fund_lock = threading.Lock()
-        self._extra_proxies = []
+        self._extra_proxies = [SHARED_PROXY] if SHARED_PROXY else []
         self._extra_proxy_idx = 0
         self._extra_proxy_lock = threading.Lock()
         self._cell_editor = None
@@ -1101,7 +1102,8 @@ class App:
         self.entry_like_max = ttk.Entry(interact_top, width=4)
         self.entry_like_max.insert(0, "10")
         self.entry_like_max.pack(side="left", padx=(5, 15))
-        self.chk_reply = ttk.Checkbutton(interact_top, text="Reply", variable=tk.BooleanVar(value=True))
+        self.var_reply = tk.BooleanVar(value=True)
+        self.chk_reply = ttk.Checkbutton(interact_top, text="Reply", variable=self.var_reply)
         self.chk_reply.pack(side="left", padx=(0, 10))
         ttk.Label(interact_top, text="Watch videos:").pack(side="left")
         self.entry_watch_min = ttk.Entry(interact_top, width=4)
@@ -1115,7 +1117,7 @@ class App:
         self.entry_join_max = ttk.Entry(interact_top, width=4)
         self.entry_join_max.insert(0, "10")
         self.entry_join_max.pack(side="left", padx=(5, 15))
-        self.btn_start_interact = ttk.Button(interact_top, text="START INTERACT", command=self._interact_not_ready)
+        self.btn_start_interact = ttk.Button(interact_top, text="START INTERACT", command=self.start_interact)
         self.btn_start_interact.pack(side="left")
         self.btn_start_join = ttk.Button(interact_top, text="START JOIN", command=self.start_join_circles)
         self.btn_start_join.pack(side="left", padx=(8, 0))
@@ -1650,8 +1652,54 @@ class App:
                     except Exception:
                         pass
 
-    def _interact_not_ready(self) -> None:
-        self._log("[INTERACT] UI ready. Logic will be added next step.")
+    def _get_watch_range(self) -> tuple[int, int]:
+        try:
+            mn = int(self.entry_watch_min.get())
+        except Exception:
+            mn = 1
+        try:
+            mx = int(self.entry_watch_max.get())
+        except Exception:
+            mx = 3
+        mn = max(0, mn)
+        mx = max(mn, mx)
+        return mn, mx
+
+    def _get_like_range(self) -> tuple[int, int]:
+        try:
+            mn = int(self.entry_like_min.get())
+        except Exception:
+            mn = 0
+        try:
+            mx = int(self.entry_like_max.get())
+        except Exception:
+            mx = 0
+        mn = max(0, mn)
+        mx = max(mn, mx)
+        return mn, mx
+
+    def _get_interact_urls(self) -> list:
+        try:
+            raw = self.interact_urls.get("1.0", "end")
+        except Exception:
+            return []
+        urls = []
+        for line in (raw or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if not s.lower().startswith("http"):
+                continue
+            if s in urls:
+                continue
+            urls.append(s)
+        return urls
+
+    def _get_reply_flag(self) -> bool:
+        try:
+            return bool(self.var_reply.get())
+        except Exception:
+            return False
 
     def _get_join_max(self) -> int:
         try:
@@ -3482,6 +3530,197 @@ class App:
                     self.active_profiles.pop(item_id, None)
             except Exception:
                 pass
+
+    def start_interact(self) -> None:
+        """Native-API view-spam dispatcher.
+
+        For each ticked account, fire one Scoopz `videoEnd` event per
+        target URL. No GPM/Selenium needed — userid is parsed from the
+        account's profile_url, docId is fetched once via plain HTTP per
+        URL, and view counts increment on the uploader's profile within
+        ~60s of the burst.
+        """
+        if self.executor is not None:
+            return
+        urls = self._get_interact_urls()
+        if not urls:
+            messagebox.showinfo("Thong bao", "Hay paste it nhat 1 URL video Scoopz vao o ben duoi.")
+            return
+        watch_mn, watch_mx = self._get_watch_range()
+        if watch_mx <= 0:
+            messagebox.showerror("Loi", "Watch videos: max phai > 0")
+            return
+        like_mn, like_mx = self._get_like_range()
+        reply_flag = self._get_reply_flag()
+
+        try:
+            max_threads = int(self.entry_threads.get())
+            if max_threads <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Loi", "So luong phai > 0")
+            return
+
+        self.stop_event.clear()
+        checked_emails = self._get_checked_email_set(self.tree)
+        if not checked_emails:
+            messagebox.showinfo("Thong bao", "Khong co profile nao duoc tick.")
+            return
+
+        # Pre-resolve docId for each URL (one shared HTTP fetch per URL).
+        try:
+            from scoopz_native import extract_doc_id_from_video_url
+            from proxy_pool import get_pool as _get_pool
+        except Exception as e:
+            messagebox.showerror("Loi", f"Native client import error: {e}")
+            return
+
+        self._log(f"[INTERACT] resolving docId for {len(urls)} url(s) ...")
+        pool = _get_pool()
+        urls_with_docs: list = []
+        proxy_str = pool.take()
+        proxy_url = ""
+        if proxy_str:
+            parts = proxy_str.split(":")
+            if len(parts) == 4:
+                h, p, u, w = parts
+                proxy_url = f"http://{u}:{w}@{h}:{p}"
+        for u in urls:
+            doc_id = extract_doc_id_from_video_url(u, proxy=proxy_url)
+            urls_with_docs.append((u, doc_id))
+            self._log(f"[INTERACT]   {u} -> docId={doc_id or '(failed)'}")
+        if not any(d for _, d in urls_with_docs):
+            messagebox.showerror("Loi", "Khong resolve duoc docId cho URL nao. Check URL + proxy.")
+            return
+
+        self.executor = ThreadPoolExecutor(max_workers=max_threads)
+        email_to_iid = self._map_email_to_item_id(self.tree)
+        for acc in self.accounts:
+            email = (acc.get("uid") or "").strip()
+            if email not in checked_emails:
+                continue
+            item_id = email_to_iid.get(email)
+            if not item_id:
+                continue
+            self.executor.submit(
+                self._interact_worker,
+                item_id, acc, "", "",
+                list(urls_with_docs), watch_mn, watch_mx, like_mn, like_mx, reply_flag,
+            )
+
+        def _waiter():
+            try:
+                self.executor.shutdown(wait=True)
+            except Exception:
+                pass
+            self.executor = None
+
+        threading.Thread(target=_waiter, daemon=True).start()
+
+    def _interact_worker(
+        self,
+        item_id: str,
+        acc: dict,
+        win_pos: str,
+        win_size: str,
+        urls_with_docs: list,
+        watch_mn: int,
+        watch_mx: int,
+        like_mn: int,
+        like_mx: int,
+        reply_flag: bool,
+    ) -> None:
+        """Native-API view-spam worker.
+
+        For each (url, docId) in `urls_with_docs`, fire one Scoopz-native
+        `videoEnd` event using the account's userid (parsed from its
+        profile_url, no web login needed). Each successful event = +1 view
+        on the uploader's profile-grid counter.
+        """
+        if self.stop_event.is_set():
+            return
+        try:
+            from scoopz_native import (
+                ScoopzNativeClient, extract_userid_from_profile_url,
+            )
+            from proxy_pool import get_pool
+        except Exception as e:
+            self._set_status(item_id, f"IMPORT ERR: {e}")
+            self._record_failed(item_id, acc, f"IMPORT ERR: {e}")
+            return
+
+        userid = extract_userid_from_profile_url(acc.get("profile_url") or "")
+        if not userid:
+            self._set_status(item_id, "NO USERID")
+            self._log(f"[{acc['uid']}] no userid in profile_url; profile_url={acc.get('profile_url')!r}")
+            self._record_failed(item_id, acc, "NO USERID")
+            return
+
+        pool = get_pool()
+        picked_proxy = pool.take()
+        proxy_url = ""
+        if picked_proxy:
+            parts = picked_proxy.split(":")
+            if len(parts) == 4:
+                h, p, u, w = parts
+                proxy_url = f"http://{u}:{w}@{h}:{p}"
+            elif len(parts) == 2:
+                proxy_url = f"http://{parts[0]}:{parts[1]}"
+
+        try:
+            pick = random.randint(max(1, watch_mn), max(watch_mn, watch_mx))
+            order = list(urls_with_docs)
+            random.shuffle(order)
+            target = [t for t in order if t[1]][:pick]
+            if not target:
+                self._set_status(item_id, "NO DOCID")
+                self._log(f"[{acc['uid']}] none of the URLs resolved to a docId")
+                return
+
+            self._set_status(item_id, f"VIEW 0/{len(target)}")
+            self._log(
+                f"[{acc['uid']}] VIEW plan: uid={userid} {len(target)} url(s) via {picked_proxy.split(':')[0] if picked_proxy else 'no proxy'}"
+            )
+
+            client = ScoopzNativeClient(userid=userid, proxy=proxy_url)
+            try:
+                client.init_session()
+            except Exception:
+                pass
+
+            ok_count = 0
+            for idx, (url, doc_id) in enumerate(target, 1):
+                if self.stop_event.is_set():
+                    break
+                self._set_status(item_id, f"VIEW {idx}/{len(target)}")
+                try:
+                    res = client.send_video_end(
+                        doc_id, duration=15, progress=0.95, time_elapsed=14, source="bot",
+                    )
+                except Exception as e:
+                    self._log(f"[{acc['uid']}] view err on {url}: {e}")
+                    continue
+                if res.get("ok"):
+                    ok_count += 1
+                self._log(
+                    f"[{acc['uid']}] {idx}/{len(target)} {url} doc={doc_id} -> "
+                    f"{res.get('status')} {'OK' if res.get('ok') else 'FAIL'}"
+                )
+            # One bulk checkedView for everything (some servers count this as
+            # a fallback signal):
+            try:
+                doc_ids = [d for _, d in target if d]
+                if doc_ids:
+                    client.send_checked_view(doc_ids)
+            except Exception:
+                pass
+
+            self._set_status(item_id, f"VIEW OK ({ok_count}/{len(target)})")
+            self._log(f"[{acc['uid']}] VIEW DONE: {ok_count}/{len(target)} fired")
+        except Exception as e:
+            self._set_status(item_id, f"VIEW ERR: {e}")
+            self._record_failed(item_id, acc, f"VIEW ERR: {e}")
+
     def _toggle_advanced(self) -> None:
         if self._advanced_var.get():
             self._advanced_frame.grid()
@@ -5156,12 +5395,22 @@ class App:
             pass
 
     def _next_proxy(self) -> str:
-        with self._extra_proxy_lock:
-            if not self._extra_proxies:
-                return ""
-            proxy = self._extra_proxies[self._extra_proxy_idx % len(self._extra_proxies)]
-            self._extra_proxy_idx += 1
-            return proxy
+        return (SHARED_PROXY or "").strip()
+
+    def _shared_proxy(self) -> str:
+        return (SHARED_PROXY or "").strip()
+
+    def _apply_shared_proxy(self, acc: dict) -> None:
+        if isinstance(acc, dict):
+            proxy = self._shared_proxy()
+            if proxy:
+                acc["proxy"] = proxy
+
+    def _apply_shared_proxy_to_rows(self, rows: list) -> list:
+        if isinstance(rows, list):
+            for acc in rows:
+                self._apply_shared_proxy(acc)
+        return rows
 
     def _is_proxy_error(self, msg: str) -> bool:
         text = (msg or "").lower()
@@ -5199,45 +5448,26 @@ class App:
 
     def _load_extra_proxy_list(self) -> None:
         try:
-            if not os.path.exists(self._extra_proxy_file):
-                return
-            with open(self._extra_proxy_file, "r", encoding="utf-8") as f:
-                content = f.read()
+            proxy = self._shared_proxy()
+            with self._extra_proxy_lock:
+                self._extra_proxies = [proxy] if proxy else []
+                self._extra_proxy_idx = 0
         except Exception:
             return
-        proxies = []
-        for raw in content.splitlines():
-            line = (raw or "").strip()
-            if not line:
-                continue
-            for sep in (",", "\t", ";", " "):
-                if sep in line:
-                    line = line.split(sep, 1)[0].strip()
-                    break
-            if line:
-                proxies.append(line)
-        if not proxies:
-            return
-        with self._extra_proxy_lock:
-            self._extra_proxies = proxies
-            self._extra_proxy_idx = 0
+        self._save_extra_proxy_list()
 
     def _save_extra_proxy_list(self) -> None:
         try:
-            with self._extra_proxy_lock:
-                proxies = list(self._extra_proxies)
-        except Exception:
-            return
-        try:
+            proxy = self._shared_proxy()
             with open(self._extra_proxy_file, "w", encoding="utf-8") as f:
-                f.write("\n".join(proxies))
+                f.write((proxy + "\n") if proxy else "")
         except Exception:
             pass
 
     def _replace_proxy_for_account(self, acc: dict, item_id: str, kind: str, tree: ttk.Treeview) -> bool:
-        new_proxy = self._next_proxy()
+        new_proxy = self._shared_proxy()
         if not new_proxy:
-            self._log("[PROXY] No extra proxies available")
+            self._log("[PROXY] Shared proxy is not configured")
             return False
         acc["proxy"] = new_proxy
         self._set_proxy_cell(tree, item_id, new_proxy)
@@ -5249,9 +5479,6 @@ class App:
         return True
 
     def _replace_proxy_errors(self, kind: str) -> None:
-        if not self._extra_proxies:
-            messagebox.showinfo("Proxy", "Danh sach proxy rong. Hay IMPORT PROXY truoc.")
-            return
         if kind == "fb":
             tree = self.fb_tree
             accounts = self.fb_accounts
@@ -5776,7 +6003,8 @@ class App:
         if not tree or not item_id or not col_name:
             return
         old_value = tree.set(item_id, col_name)
-        tree.set(item_id, col_name, new_value)
+        effective_value = self._shared_proxy() if col_name == "proxy" else new_value
+        tree.set(item_id, col_name, effective_value)
         try:
             idx = int(item_id) - 1
         except Exception:
@@ -5785,33 +6013,33 @@ class App:
             if idx is None or idx >= len(self.accounts):
                 return
             if col_name == "email":
-                self.accounts[idx]["uid"] = new_value
+                self.accounts[idx]["uid"] = effective_value
             elif col_name in ("pass", "proxy", "youtube"):
-                self.accounts[idx][col_name] = new_value
+                self.accounts[idx][col_name] = effective_value
             self._save_accounts_cache()
         elif tree == self.profile_tree:
             if idx is None or idx >= len(self.profile_accounts):
                 return
             if col_name == "email":
-                self.profile_accounts[idx]["uid"] = new_value
+                self.profile_accounts[idx]["uid"] = effective_value
             elif col_name in ("pass", "proxy", "youtube"):
-                self.profile_accounts[idx][col_name] = new_value
+                self.profile_accounts[idx][col_name] = effective_value
             self._save_profile_accounts_cache()
         elif tree == self.fb_tree:
             if idx is None or idx >= len(self.fb_accounts):
                 return
             if col_name == "email":
-                self.fb_accounts[idx]["uid"] = new_value
+                self.fb_accounts[idx]["uid"] = effective_value
             elif col_name in ("pass", "proxy", "facebook"):
-                self.fb_accounts[idx][col_name] = new_value
+                self.fb_accounts[idx][col_name] = effective_value
             self._save_fb_accounts_cache()
         elif tree == self.fb_profile_tree:
             if idx is None or idx >= len(self.fb_profile_accounts):
                 return
             if col_name == "email":
-                self.fb_profile_accounts[idx]["uid"] = new_value
+                self.fb_profile_accounts[idx]["uid"] = effective_value
             elif col_name in ("pass", "proxy", "facebook"):
-                self.fb_profile_accounts[idx][col_name] = new_value
+                self.fb_profile_accounts[idx][col_name] = effective_value
             self._save_fb_profile_accounts_cache()
         elif tree == self.all_tree:
             social = (self.all_tree.set(item_id, "social") or "").strip().upper()
@@ -5823,11 +6051,11 @@ class App:
                     for acc in self.accounts:
                         if (acc.get("uid") or "").strip() == old_email:
                             if col_name == "email":
-                                acc["uid"] = new_value
+                                acc["uid"] = effective_value
                             elif col_name in {"pass", "proxy"}:
-                                acc[col_name] = new_value
+                                acc[col_name] = effective_value
                             elif col_name == "link":
-                                acc["youtube"] = new_value
+                                acc["youtube"] = effective_value
                             updated = True
                             break
                     if updated:
@@ -5836,7 +6064,7 @@ class App:
                             iid = self._map_email_to_item_id(self.tree).get(old_email)
                             if iid:
                                 target_col = "youtube" if col_name == "link" else col_name
-                                self.tree.set(iid, target_col, new_value)
+                                self.tree.set(iid, target_col, effective_value)
                         except Exception:
                             pass
                 elif social == "FB":
@@ -5844,11 +6072,11 @@ class App:
                     for acc in self.fb_accounts:
                         if (acc.get("uid") or "").strip() == old_email:
                             if col_name == "email":
-                                acc["uid"] = new_value
+                                acc["uid"] = effective_value
                             elif col_name in {"pass", "proxy"}:
-                                acc[col_name] = new_value
+                                acc[col_name] = effective_value
                             elif col_name == "link":
-                                acc["facebook"] = new_value
+                                acc["facebook"] = effective_value
                             updated = True
                             break
                     if updated:
@@ -5857,7 +6085,7 @@ class App:
                             iid = self._map_email_to_item_id(self.fb_tree).get(old_email)
                             if iid:
                                 target_col = "facebook" if col_name == "link" else col_name
-                                self.fb_tree.set(iid, target_col, new_value)
+                                self.fb_tree.set(iid, target_col, effective_value)
                         except Exception:
                             pass
         elif tree == self.manage_tree:
@@ -6672,6 +6900,7 @@ class App:
         if isinstance(data, list):
             # Normalize specific YouTube URLs that should always point to Shorts.
             try:
+                self._apply_shared_proxy_to_rows(data)
                 for acc in data:
                     acc["payment_status"] = self._normalize_payment_status(acc.get("payment_status"))
                     if acc.get("uid") == "opendauria@hotmail.com":
@@ -6686,7 +6915,8 @@ class App:
         self._save_cache_list("accounts", self.accounts)
 
     def _load_profile_accounts_cache(self) -> list:
-        return self._load_cache_list("profile_accounts")
+        data = self._load_cache_list("profile_accounts")
+        return self._apply_shared_proxy_to_rows(data) if isinstance(data, list) else data
 
     def _save_profile_accounts_cache(self) -> None:
         self._save_cache_list("profile_accounts", self.profile_accounts)
@@ -6695,6 +6925,7 @@ class App:
         data = self._load_cache_list("fb_accounts")
         if isinstance(data, list):
             try:
+                self._apply_shared_proxy_to_rows(data)
                 for acc in data:
                     acc["payment_status"] = self._normalize_payment_status(acc.get("payment_status"))
             except Exception:
@@ -6705,7 +6936,8 @@ class App:
         self._save_cache_list("fb_accounts", self.fb_accounts)
 
     def _load_fb_profile_accounts_cache(self) -> list:
-        return self._load_cache_list("fb_profile_accounts")
+        data = self._load_cache_list("fb_profile_accounts")
+        return self._apply_shared_proxy_to_rows(data) if isinstance(data, list) else data
 
     def _save_fb_profile_accounts_cache(self) -> None:
         self._save_cache_list("fb_profile_accounts", self.fb_profile_accounts)
@@ -6831,7 +7063,7 @@ class App:
                         if row and row[0]:
                             loaded = json.loads(row[0])
                             if isinstance(loaded, list):
-                                data = loaded
+                                data = self._apply_shared_proxy_to_rows(loaded)
                                 return data
                     finally:
                         conn.close()
@@ -7261,7 +7493,7 @@ class App:
 
     def _save_cache_list(self, key: str, data: list) -> None:
         try:
-            payload = json.dumps(data or [], ensure_ascii=False)
+            payload = json.dumps(self._apply_shared_proxy_to_rows(data or []), ensure_ascii=False)
             with self._cache_db_lock:
                 conn = self._open_cache_db()
                 if conn:
@@ -7340,13 +7572,13 @@ class App:
                 continue
             uid = (row[0] or "").strip()
             pwd = (row[1] or "").strip()
-            proxy = (row[2] or "").strip()
+            proxy_label = (row[2] or "").strip()
             yt = (row[3] or "").strip()
-            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy.lower() in ("proxy", "raw_proxy"):
+            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy_label.lower() in ("proxy", "raw_proxy"):
                 continue
             if not uid:
                 continue
-            acc = {"uid": uid, "pass": pwd, "proxy": proxy, "youtube": yt}
+            acc = {"uid": uid, "pass": pwd, "proxy": self._shared_proxy(), "youtube": yt}
             old = existing_by_uid.get(uid)
             if old:
                 acc["followers"] = old.get("followers")
@@ -7370,47 +7602,22 @@ class App:
 
     def import_proxy_list(self) -> None:
         path = self._extra_proxy_file
-        try:
-            if not os.path.exists(path):
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("")
-        except Exception as e:
-            messagebox.showerror("Import Proxy", f"Loi tao file proxy: {e}")
+        proxy = self._shared_proxy()
+        if not proxy:
+            messagebox.showerror("Import Proxy", "Shared proxy is not configured.")
             return
         try:
-            os.startfile(path)
-        except Exception:
-            pass
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(proxy + "\n")
         except Exception as e:
-            messagebox.showerror("Import Proxy", f"Loi doc file: {e}")
-            return
-        proxies = []
-        for raw in content.splitlines():
-            line = (raw or "").strip()
-            if not line:
-                continue
-            # Accept first field if CSV/TSV
-            for sep in (",", "\t", ";", " "):
-                if sep in line:
-                    line = line.split(sep, 1)[0].strip()
-                    break
-            if line:
-                proxies.append(line)
-        if not proxies:
-            messagebox.showinfo(
-                "Import Proxy",
-                "Da tao/mo file proxy. Hay dan proxy vao file roi bam IMPORT PROXY lai.",
-            )
+            messagebox.showerror("Import Proxy", f"Loi luu file proxy: {e}")
             return
         with self._extra_proxy_lock:
-            self._extra_proxies = proxies
+            self._extra_proxies = [proxy]
             self._extra_proxy_idx = 0
         self._save_extra_proxy_list()
-        self._log(f"[PROXY] Loaded {len(proxies)} proxies")
+        self._log(f"[PROXY] Loaded shared proxy: {proxy}")
 
     def import_profile_accounts(self) -> None:
         path = filedialog.askopenfilename(
@@ -7454,13 +7661,13 @@ class App:
                 continue
             uid = (row[0] or "").strip()
             pwd = (row[1] or "").strip()
-            proxy = (row[2] or "").strip()
+            proxy_label = (row[2] or "").strip()
             yt = (row[3] or "").strip()
-            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy.lower() in ("proxy", "raw_proxy"):
+            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy_label.lower() in ("proxy", "raw_proxy"):
                 continue
             if not uid:
                 continue
-            new_accounts.append({"uid": uid, "pass": pwd, "proxy": proxy, "youtube": yt})
+            new_accounts.append({"uid": uid, "pass": pwd, "proxy": self._shared_proxy(), "youtube": yt})
 
         if not new_accounts:
             messagebox.showinfo("Import", "Khong tim thay dong du lieu hop le.")
@@ -7514,13 +7721,13 @@ class App:
                 continue
             uid = (row[0] or "").strip()
             pwd = (row[1] or "").strip()
-            proxy = (row[2] or "").strip()
+            proxy_label = (row[2] or "").strip()
             fb_link = (row[3] or "").strip()
-            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy.lower() in ("proxy", "raw_proxy"):
+            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy_label.lower() in ("proxy", "raw_proxy"):
                 continue
             if not uid:
                 continue
-            acc = {"uid": uid, "pass": pwd, "proxy": proxy, "facebook": fb_link}
+            acc = {"uid": uid, "pass": pwd, "proxy": self._shared_proxy(), "facebook": fb_link}
             old = existing_by_uid.get(uid)
             if old:
                 acc["followers"] = old.get("followers")
@@ -7581,13 +7788,13 @@ class App:
                 continue
             uid = (row[0] or "").strip()
             pwd = (row[1] or "").strip()
-            proxy = (row[2] or "").strip()
+            proxy_label = (row[2] or "").strip()
             fb_link = (row[3] or "").strip()
-            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy.lower() in ("proxy", "raw_proxy"):
+            if uid.lower() in ("email", "uid") and pwd.lower() in ("pass", "password") and proxy_label.lower() in ("proxy", "raw_proxy"):
                 continue
             if not uid:
                 continue
-            new_accounts.append({"uid": uid, "pass": pwd, "proxy": proxy, "facebook": fb_link})
+            new_accounts.append({"uid": uid, "pass": pwd, "proxy": self._shared_proxy(), "facebook": fb_link})
 
         if not new_accounts:
             messagebox.showinfo("Import", "Khong tim thay dong du lieu hop le.")

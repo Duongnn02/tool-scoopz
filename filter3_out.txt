@@ -1,7 +1,0 @@
-Tool emails   : 472
-Token emails  : 425
-No-token list : 103
-
-File 1 (tool + co token)      : 178
-File 2 (ngoai tool + ko token): 90
-File 3 (ngoai tool + co token): 247

@@ -1,2 +1,0 @@
-Saved: C:\Users\Admin\Desktop\tool_rewrite\tool_rewrite\result.xlsx
-Rows: 100 (email/pass: 90, ytb: 100)
